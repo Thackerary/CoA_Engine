@@ -1,0 +1,206 @@
+#pragma once
+#include <glad/glad.h>
+#include <cstdint>
+#include <cstddef>
+#include <span>
+#include <string_view>
+#include <vector>
+#include <algorithm>
+
+namespace coa::rhi {
+
+// ==================== 1. 显存缓冲区 (VBO / IBO / UBO / SSBO) ====================
+class GlBuffer {
+public:
+    GlBuffer() = default;
+    GlBuffer(std::size_t sizeBytes, const void* initialData = nullptr, GLbitfield storageFlags = GL_DYNAMIC_STORAGE_BIT)
+        : m_size(sizeBytes) {
+        glCreateBuffers(1, &m_handle);
+        // DSA 不可变显存分配：比传统的 glBufferData 更高效，驱动可固定显存页
+        glNamedBufferStorage(m_handle, static_cast<GLsizeiptr>(sizeBytes), initialData, storageFlags);
+    }
+
+    ~GlBuffer() {
+        if (m_handle) glDeleteBuffers(1, &m_handle);
+    }
+
+    GlBuffer(const GlBuffer&) = delete;
+    GlBuffer& operator=(const GlBuffer&) = delete;
+
+    GlBuffer(GlBuffer&& other) noexcept : m_handle(other.m_handle), m_size(other.m_size) {
+        other.m_handle = 0;
+        other.m_size   = 0;
+    }
+    GlBuffer& operator=(GlBuffer&& other) noexcept {
+        if (this != &other) {
+            if (m_handle) glDeleteBuffers(1, &m_handle);
+            m_handle       = other.m_handle;
+            m_size         = other.m_size;
+            other.m_handle = 0;
+            other.m_size   = 0;
+        }
+        return *this;
+    }
+
+    void UpdateSubData(std::size_t offset, std::size_t sizeBytes, const void* data) const {
+        glNamedBufferSubData(m_handle, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(sizeBytes), data);
+    }
+
+    void BindAsUniformBuffer(uint32_t bindingSlot) const {
+        glBindBufferBase(GL_UNIFORM_BUFFER, bindingSlot, m_handle);
+    }
+
+    void BindAsStorageBuffer(uint32_t bindingSlot) const {
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, bindingSlot, m_handle);
+    }
+
+    [[nodiscard]] GLuint Handle() const noexcept { return m_handle; }
+    [[nodiscard]] std::size_t Size() const noexcept { return m_size; }
+
+private:
+    GLuint      m_handle = 0;
+    std::size_t m_size   = 0;
+};
+
+// ==================== 2. 2D 纹理与 BLP 压缩纹理直传封装 ====================
+enum class PixelFormat : GLenum {
+    RGBA8    = GL_RGBA8,
+    BC1_RGBA = GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, // 对应 BLP DXT1 (无透明或 1-bit Alpha)
+    BC2_RGBA = GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, // 对应 BLP DXT3 (显式 4-bit Alpha)
+    BC3_RGBA = GL_COMPRESSED_RGBA_S3TC_DXT5_EXT  // 对应 BLP DXT5 (插值平滑 Alpha)
+};
+
+class GlTexture2D {
+public:
+    GlTexture2D() = default;
+    GlTexture2D(uint32_t width, uint32_t height, uint32_t mipLevels, PixelFormat format, bool repeatWrap = true)
+        : m_width(width), m_height(height), m_mipLevels(mipLevels), m_format(format) {
+        glCreateTextures(GL_TEXTURE_2D, 1, &m_handle);
+        glTextureStorage2D(m_handle, static_cast<GLsizei>(mipLevels), static_cast<GLenum>(format),
+                           static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+
+        // 默认开启三线性过滤 + 8x 各向异性过滤 (对 GTX 1050 几乎零开销，大幅提升魔兽地面斜视清晰度)
+        glTextureParameteri(m_handle, GL_TEXTURE_MIN_FILTER, mipLevels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+        glTextureParameteri(m_handle, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        GLint wrapMode = repeatWrap ? GL_REPEAT : GL_CLAMP_TO_EDGE;
+        glTextureParameteri(m_handle, GL_TEXTURE_WRAP_S, wrapMode);
+        glTextureParameteri(m_handle, GL_TEXTURE_WRAP_T, wrapMode);
+        glTextureParameterf(m_handle, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
+    }
+
+    ~GlTexture2D() {
+        if (m_handle) glDeleteTextures(1, &m_handle);
+    }
+
+    GlTexture2D(const GlTexture2D&) = delete;
+    GlTexture2D& operator=(const GlTexture2D&) = delete;
+
+    GlTexture2D(GlTexture2D&& other) noexcept
+        : m_handle(other.m_handle), m_width(other.m_width), m_height(other.m_height),
+          m_mipLevels(other.m_mipLevels), m_format(other.m_format) {
+        other.m_handle = 0;
+    }
+    GlTexture2D& operator=(GlTexture2D&& other) noexcept {
+        if (this != &other) {
+            if (m_handle) glDeleteTextures(1, &m_handle);
+            m_handle       = other.m_handle;
+            m_width        = other.m_width;
+            m_height       = other.m_height;
+            m_mipLevels    = other.m_mipLevels;
+            m_format       = other.m_format;
+            other.m_handle = 0;
+        }
+        return *this;
+    }
+
+    // 直接将 MPQ 中 BLP 文件的某个 Mipmap 层级的 BC1/BC2/BC3 压缩字节流灌入显存，零 CPU 解压开销
+    void UploadCompressedMip(uint32_t mipLevel, uint32_t mipW, uint32_t mipH, std::span<const uint8_t> compressedBytes) const {
+        glCompressedTextureSubImage2D(
+            m_handle,
+            static_cast<GLint>(mipLevel),
+            0, 0,
+            static_cast<GLsizei>(mipW),
+            static_cast<GLsizei>(mipH),
+            static_cast<GLenum>(m_format),
+            static_cast<GLsizei>(compressedBytes.size()),
+            compressedBytes.data()
+        );
+    }
+
+    void BindToUnit(uint32_t unit) const {
+        glBindTextureUnit(unit, m_handle);
+    }
+
+    [[nodiscard]] GLuint Handle() const noexcept { return m_handle; }
+
+private:
+    GLuint      m_handle    = 0;
+    uint32_t    m_width     = 0;
+    uint32_t    m_height    = 0;
+    uint32_t    m_mipLevels = 1;
+    PixelFormat m_format    = PixelFormat::RGBA8;
+};
+
+// ==================== 3. 64 位 Sort-Key 渲染队列指令 ====================
+struct DrawCommand {
+    // 64 位排序键布局：
+    // [63..60] 4 bits : Pass ID (0=Shadow, 1=ZPrepass, 2=Opaque, 3=AlphaCutout, 4=Transparent)
+    // [59..48] 12 bits: Shader Program ID
+    // [47..32] 16 bits: Primary Texture ID (合并相同贴图的 M2/WMO 批次)
+    // [31..0]  32 bits: 量化后的视图深度 (不透明物体从近到远排，半透明物体从远到近排)
+    uint64_t sortKey = 0;
+
+    GLuint   program     = 0;
+    GLuint   vao         = 0;
+    GLuint   vbo         = 0;
+    GLuint   ibo         = 0;
+    GLsizei  stride      = 0;
+    GLuint   texAlbedo   = 0;
+    uint32_t indexCount  = 0;
+    uint32_t firstIndex  = 0;
+    int32_t  baseVertex  = 0;
+
+    static uint64_t MakeKey(uint8_t pass, uint16_t progId, uint16_t texId, uint32_t depthBits) noexcept {
+        return (static_cast<uint64_t>(pass & 0xF) << 60) |
+               (static_cast<uint64_t>(progId & 0xFFF) << 48) |
+               (static_cast<uint64_t>(texId & 0xFFFF) << 32) |
+               static_cast<uint64_t>(depthBits);
+    }
+};
+
+// 状态去重执行器：消除冗余的驱动状态切换
+inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
+    std::sort(cmds.begin(), cmds.end(), [](const DrawCommand& a, const DrawCommand& b) {
+        return a.sortKey < b.sortKey;
+    });
+
+    GLuint lastProg = 0, lastVao = 0, lastVbo = 0, lastIbo = 0, lastTex0 = 0;
+    for (const auto& c : cmds) {
+        if (c.program != lastProg) {
+            glUseProgram(c.program);
+            lastProg = c.program;
+        }
+        if (c.vao != lastVao) {
+            glBindVertexArray(c.vao);
+            lastVao = c.vao;
+            lastVbo = 0;
+            lastIbo = 0;
+        }
+        if (c.vbo != lastVbo) {
+            glVertexArrayVertexBuffer(c.vao, 0, c.vbo, 0, c.stride);
+            lastVbo = c.vbo;
+        }
+        if (c.ibo != lastIbo) {
+            glVertexArrayElementBuffer(c.vao, c.ibo);
+            lastIbo = c.ibo;
+        }
+        if (c.texAlbedo != lastTex0) {
+            glBindTextureUnit(0, c.texAlbedo);
+            lastTex0 = c.texAlbedo;
+        }
+        const void* indexOffsetPtr = reinterpret_cast<const void*>(static_cast<uintptr_t>(c.firstIndex) * sizeof(uint16_t));
+        glDrawElementsBaseVertex(GL_TRIANGLES, static_cast<GLsizei>(c.indexCount), GL_UNSIGNED_SHORT, indexOffsetPtr, c.baseVertex);
+    }
+}
+
+} // namespace coa::rhi

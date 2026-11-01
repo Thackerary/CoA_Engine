@@ -1,0 +1,22 @@
+CoA_Engine/
+├── CMakeLists.txt
+├── third_party/
+│   ├── glad/               # OpenGL 4.6 Core Profile Loader
+│   ├── glm/                # 纯头文件数学库 (需定义 GLM_FORCE_DEPTH_ZERO_TO_ONE)
+│   ├── StormLib/           # MPQ 归档读取库
+│   └── imgui/              # Dear ImGui 调试面板
+└── src/
+    ├── main.cpp            # SDL3 窗口、GL 4.6 上下文与主循环
+    ├── rhi/
+    │   ├── rhi_types.hpp   # 基础枚举、顶点格式与 64 位 SortKey 定义
+    │   ├── rhi_gl.hpp      # GlBuffer / GlTexture / GlShader / GlPipeline 封装
+    │   └── render_queue.hpp# 渲染指令排序与状态去重提交器
+    ├── mpq/
+    │   └── mpq_archive.hpp # StormLib 虚拟文件系统封装 (挂载 common/patch.MPQ)
+    ├── assets/
+    │   ├── blp_loader.hpp  # 解析 BLP 头并提取 BC1/BC2/BC3 原始字节流
+    │   ├── m2_loader.hpp   # 解析 M2 顶点、子网格与骨骼
+    │   └── adt_loader.hpp  # 解析 ADT 16x16 MCNK 地形块
+    └── shaders/
+        ├── terrain.vert
+        └── terrain.frag
