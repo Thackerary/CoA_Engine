@@ -126,7 +126,20 @@ public:
             compressedBytes.data()
         );
     }
-
+	// 补充在 GlTexture2D 类内：用于上传 compression == 1 (调色板) 或 compression == 3 (未压缩) 的 RGBA8 数据
+    void UploadUncompressedMip(uint32_t mipLevel, uint32_t mipW, uint32_t mipH, std::span<const uint8_t> rgbaBytes) const {
+        glTextureSubImage2D(
+            m_handle,
+            static_cast<GLint>(mipLevel),
+            0, 0,
+            static_cast<GLsizei>(mipW),
+            static_cast<GLsizei>(mipH),
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            rgbaBytes.data()
+        );
+    }
+	
     void BindToUnit(uint32_t unit) const {
         glBindTextureUnit(unit, m_handle);
     }
