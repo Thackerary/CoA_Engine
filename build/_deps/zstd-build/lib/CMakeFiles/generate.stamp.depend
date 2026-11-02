@@ -1,5 +1,0 @@
-# CMake generation dependency list for this directory.
-D:/GitHub/CoA_Engine/build/_deps/zstd-src/build/cmake/CMakeModules/JoinPaths.cmake
-D:/GitHub/CoA_Engine/build/_deps/zstd-src/build/cmake/lib/CMakeLists.txt
-D:/GitHub/CoA_Engine/build/_deps/zstd-src/build/cmake/lib/cmake_uninstall.cmake.in
-D:/GitHub/CoA_Engine/build/_deps/zstd-src/lib/libzstd.pc.in

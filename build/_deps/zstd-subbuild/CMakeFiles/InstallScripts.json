@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
