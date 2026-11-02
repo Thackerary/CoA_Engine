@@ -1,0 +1,150 @@
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-MKDIR.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -Dcfgdir=/Debug -P D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/tmp/sdl3-populate-mkdirs.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-mkdir
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-DOWNLOAD.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/tmp/sdl3-populate-gitclone.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-download
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-UPDATE.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\sdl3-src
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -Dcan_fetch=YES -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/tmp/sdl3-populate-gitupdate.cmake
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-PATCH.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-patch
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-CONFIGURE.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\sdl3-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-configure
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-BUILD.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\sdl3-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-build
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-INSTALL.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\sdl3-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-install
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\6E270C53D37493E1BE0F20B2FF580A39\SDL3-POPULATE-TEST.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\sdl3-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-test
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\B0DDA4EA2009EAC470EA98192488BE0D\SDL3-POPULATE-COMPLETE.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E make_directory D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/CMakeFiles/Debug
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/CMakeFiles/Debug/sdl3-populate-complete
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/sdl3-populate-prefix/src/sdl3-populate-stamp/Debug/sdl3-populate-done
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKEFILES\63BE461B56C1621E22E2EB2A6E93F80D\SDL3-POPULATE.RULE
+setlocal
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\SDL3-SUBBUILD\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild -BD:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild --check-stamp-file D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -1,0 +1,10 @@
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\2FA0DCA2729BD6FBF0D513A86BB1A67C\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/GitHub/CoA_Engine/build/_deps/zstd-subbuild -BD:/GitHub/CoA_Engine/build/_deps/zstd-subbuild --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

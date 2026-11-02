@@ -20,3 +20,22 @@ CoA_Engine/
     └── shaders/
         ├── terrain.vert
         └── terrain.frag
+
+CoA_Engine/
+├── CMakeLists.txt
+├── tools/
+│   ├── extract_mpq_to_loose.py # 一次性工具：将飞升服 MPQ 按优先级解压为全小写散文件目录
+│   └── pack_coa_pak.py         # 发布期工具：将散文件目录打包为 LZ4 压缩的 .pak 文件
+├── third_party/
+│   ├── glad/                   # OpenGL 4.6 Core Profile Loader
+│   ├── glm/                    # 数学库
+│   └── lz4/                    # (可选) 仅 lz4.h + lz4.c 两个文件，用于发布期解压 .pak
+└── src/
+    ├── main.cpp                # 【改 2 行】挂载本地散文件目录或 .pak
+    ├── rhi/
+    │   └── rhi_gl.hpp          # 【零改动】
+    ├── vfs/
+    │   └── vfs.hpp             # 【新增，替代 mpq_archive.hpp】同时支持散文件目录与 .pak 挂载
+    └── assets/
+        ├── blp_loader.hpp      # 【零改动】
+        └── asset_manager.hpp   # 【改 2 行】将 MpqFileSystem 替换为 VirtualFileSystem

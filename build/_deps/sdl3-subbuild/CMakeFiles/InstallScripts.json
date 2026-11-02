@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/GitHub/CoA_Engine/build/_deps/sdl3-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

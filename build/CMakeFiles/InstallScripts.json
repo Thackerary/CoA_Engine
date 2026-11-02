@@ -1,0 +1,13 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/GitHub/CoA_Engine/build/cmake_install.cmake",
+		"D:/GitHub/CoA_Engine/build/_deps/sdl3-build/cmake_install.cmake",
+		"D:/GitHub/CoA_Engine/build/_deps/glm-build/cmake_install.cmake",
+		"D:/GitHub/CoA_Engine/build/_deps/glm-build/glm/cmake_install.cmake",
+		"D:/GitHub/CoA_Engine/build/_deps/lz4-build/cmake_install.cmake",
+		"D:/GitHub/CoA_Engine/build/_deps/zstd-build/cmake_install.cmake",
+		"D:/GitHub/CoA_Engine/build/_deps/zstd-build/lib/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

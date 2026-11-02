@@ -180,7 +180,78 @@ struct DrawCommand {
                static_cast<uint64_t>(depthBits);
     }
 };
+// ==================== 4. GLSL 4.60 着色器程序封装 (补充在 rhi_gl.hpp 中) ====================
+class GlShaderProgram {
+public:
+    GlShaderProgram() = default;
+    GlShaderProgram(std::string_view vertSrc, std::string_view fragSrc) {
+        GLuint vs = CompileStage(GL_VERTEX_SHADER, vertSrc);
+        GLuint fs = CompileStage(GL_FRAGMENT_SHADER, fragSrc);
+        if (vs && fs) {
+            m_handle = glCreateProgram();
+            glAttachShader(m_handle, vs);
+            glAttachShader(m_handle, fs);
+            glLinkProgram(m_handle);
 
+            GLint linked = GL_FALSE;
+            glGetProgramiv(m_handle, GL_LINK_STATUS, &linked);
+            if (linked == GL_FALSE) {
+                char log[1024]{};
+                glGetProgramInfoLog(m_handle, sizeof(log), nullptr, log);
+                std::fprintf(stderr, "[Shader Link Error] %s\n", log);
+                glDeleteProgram(m_handle);
+                m_handle = 0;
+            }
+            glDetachShader(m_handle, vs);
+            glDetachShader(m_handle, fs);
+        }
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+    }
+
+    ~GlShaderProgram() {
+        if (m_handle) glDeleteProgram(m_handle);
+    }
+
+    GlShaderProgram(const GlShaderProgram&) = delete;
+    GlShaderProgram& operator=(const GlShaderProgram&) = delete;
+
+    GlShaderProgram(GlShaderProgram&& other) noexcept : m_handle(other.m_handle) {
+        other.m_handle = 0;
+    }
+    GlShaderProgram& operator=(GlShaderProgram&& other) noexcept {
+        if (this != &other) {
+            if (m_handle) glDeleteProgram(m_handle);
+            m_handle = other.m_handle;
+            other.m_handle = 0;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] GLuint Handle() const noexcept { return m_handle; }
+
+private:
+    GLuint m_handle = 0;
+
+    static GLuint CompileStage(GLenum type, std::string_view src) {
+        GLuint s = glCreateShader(type);
+        const char* ptr = src.data();
+        auto len = static_cast<GLint>(src.size());
+        glShaderSource(s, 1, &ptr, &len);
+        glCompileShader(s);
+
+        GLint compiled = GL_FALSE;
+        glGetShaderiv(s, GL_COMPILE_STATUS, &compiled);
+        if (compiled == GL_FALSE) {
+            char log[1024]{};
+            glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+            std::fprintf(stderr, "[Shader Compile Error] %s\n", log);
+            glDeleteShader(s);
+            return 0;
+        }
+        return s;
+    }
+};
 // 状态去重执行器：消除冗余的驱动状态切换
 inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
     std::sort(cmds.begin(), cmds.end(), [](const DrawCommand& a, const DrawCommand& b) {

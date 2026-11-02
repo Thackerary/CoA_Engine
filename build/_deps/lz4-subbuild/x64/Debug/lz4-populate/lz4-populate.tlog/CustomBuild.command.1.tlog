@@ -1,0 +1,150 @@
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-MKDIR.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -Dcfgdir=/Debug -P D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/tmp/lz4-populate-mkdirs.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-mkdir
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-DOWNLOAD.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/tmp/lz4-populate-gitclone.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-download
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-UPDATE.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\lz4-src
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -Dcan_fetch=YES -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/tmp/lz4-populate-gitupdate.cmake
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-PATCH.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-patch
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-CONFIGURE.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\lz4-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-configure
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-BUILD.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\lz4-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-build
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-INSTALL.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\lz4-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-install
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\6016F42CBB3A2A1B13801EF16D1E6E5E\LZ4-POPULATE-TEST.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\lz4-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-test
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\74ED52CB60A635E28D398E899CE1064B\LZ4-POPULATE-COMPLETE.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E make_directory D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/CMakeFiles/Debug
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/CMakeFiles/Debug/lz4-populate-complete
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/lz4-populate-prefix/src/lz4-populate-stamp/Debug/lz4-populate-done
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKEFILES\0C85514B8918F83DCFC10597DCEDE89F\LZ4-POPULATE.RULE
+setlocal
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\LZ4-SUBBUILD\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/GitHub/CoA_Engine/build/_deps/lz4-subbuild -BD:/GitHub/CoA_Engine/build/_deps/lz4-subbuild --check-stamp-file D:/GitHub/CoA_Engine/build/_deps/lz4-subbuild/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

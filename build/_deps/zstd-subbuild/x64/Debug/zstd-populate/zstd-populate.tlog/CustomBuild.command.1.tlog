@@ -1,0 +1,150 @@
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-MKDIR.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -Dcfgdir=/Debug -P D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/tmp/zstd-populate-mkdirs.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-mkdir
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-DOWNLOAD.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/tmp/zstd-populate-gitclone.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-download
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-UPDATE.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\zstd-src
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -Dcan_fetch=YES -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/tmp/zstd-populate-gitupdate.cmake
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-PATCH.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-patch
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-CONFIGURE.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\zstd-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-configure
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-BUILD.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\zstd-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-build
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-INSTALL.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\zstd-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-install
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\E887D9F62FDEE44601B4ABC37DE1DC82\ZSTD-POPULATE-TEST.RULE
+setlocal
+cd D:\GitHub\CoA_Engine\build\_deps\zstd-build
+if %errorlevel% neq 0 goto :cmEnd
+D:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-test
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\A6063C7A4E90E6B6400465D5D4FCF4CF\ZSTD-POPULATE-COMPLETE.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E make_directory D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/CMakeFiles/Debug
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/CMakeFiles/Debug/zstd-populate-complete
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/Debug/zstd-populate-done
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKEFILES\2FA0DCA2729BD6FBF0D513A86BB1A67C\ZSTD-POPULATE.RULE
+setlocal
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\GITHUB\COA_ENGINE\BUILD\_DEPS\ZSTD-SUBBUILD\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/GitHub/CoA_Engine/build/_deps/zstd-subbuild -BD:/GitHub/CoA_Engine/build/_deps/zstd-subbuild --check-stamp-file D:/GitHub/CoA_Engine/build/_deps/zstd-subbuild/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

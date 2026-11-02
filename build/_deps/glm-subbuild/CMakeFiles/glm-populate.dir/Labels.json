@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/glm-populate"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/b179e6e929c5d1d573db33f51652a6bb/glm-populate.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/0d2f19d6cd16e1e4609817b68c4dc19d/glm-populate-complete.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-build.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-configure.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-download.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-install.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-mkdir.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-patch.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-test.rule"
+		},
+		{
+			"file" : "D:/GitHub/CoA_Engine/build/_deps/glm-subbuild/CMakeFiles/ddfb159a15a8256f42d40045ac6b3813/glm-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"glm-populate"
+		],
+		"name" : "glm-populate"
+	}
+}
