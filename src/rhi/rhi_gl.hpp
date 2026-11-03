@@ -247,10 +247,18 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
     });
 
     GLuint lastProg = 0, lastVao = 0, lastVbo = 0, lastIbo = 0, lastTex0 = 0;
+    uint8_t lastPass = 0xFF; // 0xFF = 尚未向当前 program 下发过 Cutout 开关
     for (const auto& c : cmds) {
         if (c.program != lastProg) {
             glUseProgram(c.program);
             lastProg = c.program;
+            lastPass = 0xFF; // 新着色器必须重新下发一次 uniform
+        }
+        // sortKey 高 4 位即 Pass ID (2 = 不透明, 3 = Alpha Cutout)
+        uint8_t pass = static_cast<uint8_t>(c.sortKey >> 60);
+        if (pass != lastPass) {
+            glUniform1i(0, (pass == 3) ? 1 : 0);
+            lastPass = pass;
         }
         if (c.vao != lastVao) {
             glBindVertexArray(c.vao);

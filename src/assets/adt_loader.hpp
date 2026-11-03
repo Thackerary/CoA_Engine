@@ -270,22 +270,6 @@ public:
             doodadGroups[m2Path].push_back(mat);
         }
 
-        // 加载视野内存在的 M2 模型并录入 SSBO 矩阵表
-        for (auto& [m2Path, mats] : doodadGroups) {
-            auto modelOpt = M2Loader::LoadModel(m2Path, vfs, assets, fallbackWhiteTex);
-            if (!modelOpt) continue; // 若当前测试提取尚未提取该 M2，自动跳过
-
-            GpuDoodadBatch batch;
-            batch.model         = std::move(*modelOpt);
-            batch.baseInstance  = static_cast<uint32_t>(sharedInstanceMatrices.size());
-            batch.instanceCount = static_cast<uint32_t>(mats.size());
-
-            sharedInstanceMatrices.insert(sharedInstanceMatrices.end(), mats.begin(), mats.end());
-            tile.doodadBatches.push_back(std::move(batch));
-        }
-
-        std::printf("[ADT Loader] Loaded %zu MCNK chunks, %zu unique M2 doodad types (%zu total instances)\n",
-                    tile.chunks.size(), tile.doodadBatches.size(), sharedInstanceMatrices.size() - 1);
 		// 4. 解析 MODF 大型建筑 (WMO) 并录入 SSBO 矩阵表
         std::unordered_map<std::string, std::vector<glm::mat4>> wmoGroups;
         for (const auto& entry : modfEntries) {
@@ -323,9 +307,36 @@ public:
             batch.instanceCount = static_cast<uint32_t>(mats.size());
 
             sharedInstanceMatrices.insert(sharedInstanceMatrices.end(), mats.begin(), mats.end());
+
+            // 将 WMO 内部 MODD 家具按每个建筑世界实例矩阵展开，并入统一的 M2 实例化分组
+            for (const auto& d : batch.model.doodads) {
+                auto& instList = doodadGroups[d.m2Path];
+                instList.reserve(instList.size() + mats.size());
+                for (const auto& wmoWorldMat : mats) {
+                    instList.push_back(wmoWorldMat * d.localMatrix);
+                }
+            }
+
             tile.wmoBatches.push_back(std::move(batch));
         }
         std::printf("[ADT Loader] Loaded %zu WMO building types\n", tile.wmoBatches.size());
+
+        // 5. 统一加载户外树木与 WMO 室内家具的 M2 模型，录入 SSBO 矩阵表
+        for (auto& [m2Path, mats] : doodadGroups) {
+            auto modelOpt = M2Loader::LoadModel(m2Path, vfs, assets, fallbackWhiteTex);
+            if (!modelOpt) continue; // 若当前测试提取尚未提取该 M2，自动跳过
+
+            GpuDoodadBatch batch;
+            batch.model         = std::move(*modelOpt);
+            batch.baseInstance  = static_cast<uint32_t>(sharedInstanceMatrices.size());
+            batch.instanceCount = static_cast<uint32_t>(mats.size());
+
+            sharedInstanceMatrices.insert(sharedInstanceMatrices.end(), mats.begin(), mats.end());
+            tile.doodadBatches.push_back(std::move(batch));
+        }
+
+        std::printf("[ADT Loader] Loaded %zu MCNK chunks, %zu unique M2 doodad types (%zu total instances)\n",
+                    tile.chunks.size(), tile.doodadBatches.size(), sharedInstanceMatrices.size() - 1);
         return tile;
     }
 

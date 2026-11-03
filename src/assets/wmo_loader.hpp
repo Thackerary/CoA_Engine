@@ -8,6 +8,8 @@
 #include <span>
 #include <optional>
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include "../rhi/rhi_gl.hpp"
 #include "../vfs/vfs.hpp"
 #include "asset_manager.hpp"
@@ -59,7 +61,25 @@ struct WmoBatch {
     uint8_t  materialId;       // 对应根文件 MOMT 数组下标
 };
 static_assert(sizeof(WmoBatch) == 24, "WmoBatch must be 24 bytes");
+
+// WMO 内部家具摆设定义 MODD (40 字节)
+struct WmoDoodadDef {
+    uint32_t  nameIndexAndFlags; // 低 24 位 (nameIndexAndFlags & 0xFFFFFFu) 为在 MODN 中的字节偏移
+    glm::vec3 pos;               // WMO 局部空间坐标 (Z-Up)
+    float     quat[4];           // 四元数旋转 (x, y, z, w)
+    float     scale;             // 缩放比例
+    uint32_t  color;             // BGRA 颜色
+};
+static_assert(sizeof(WmoDoodadDef) == 40, "WmoDoodadDef must be 40 bytes");
 #pragma pack(pop)
+```
+
+src\assets\wmo_loader.hpp
+```cpp
+<<<<<<< SEARCH
+struct GpuWmoModel {
+    std::vector<GpuWmoGroup> groups;
+};
 
 // 与 TerrainVertex 严格一致的 32 字节顶点布局，直接复用 terrainVao
 struct WmoVertex {
@@ -111,6 +131,8 @@ public:
         WmoRootHeader mohd{};
         std::span<const char>        motxBlob;
         std::span<const WmoMaterial> momtMats;
+        std::span<const char>        modnBlob;
+        std::span<const WmoDoodadDef> moddDefs;
 
         size_t cursor = 0;
         while (cursor + 8 <= rootBytes.size()) {
@@ -128,6 +150,11 @@ public:
             } else if (magic == FourCC("MOMT")) {
                 momtMats = std::span<const WmoMaterial>(reinterpret_cast<const WmoMaterial*>(chunk.data()),
                                                         chunk.size() / sizeof(WmoMaterial));
+            } else if (magic == FourCC("MODN")) {
+                modnBlob = std::span<const char>(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+            } else if (magic == FourCC("MODD")) {
+                moddDefs = std::span<const WmoDoodadDef>(reinterpret_cast<const WmoDoodadDef*>(chunk.data()),
+                                                         chunk.size() / sizeof(WmoDoodadDef));
             }
             cursor = dataStart + size;
         }
@@ -153,6 +180,27 @@ public:
         std::string basePrefix = normPath.substr(0, normPath.size() - 4);
         GpuWmoModel wmoModel;
         wmoModel.groups.reserve(mohd.nGroups);
+
+        // 2.5 解析 MODD 内部家具摆设，换算为 WMO 局部空间变换矩阵
+        for (const auto& def : moddDefs) {
+            uint32_t nameOfs = def.nameIndexAndFlags & 0xFFFFFFu;
+            if (nameOfs >= modnBlob.size()) continue;
+
+            std::string m2Path(modnBlob.data() + nameOfs);
+            m2Path = vfs::VirtualFileSystem::NormalizeVirtualPath(m2Path);
+            if (m2Path.empty()) continue;
+            // WMO 内部同样可能写入 .mdx/.mdl 历史遗留后缀
+            if (m2Path.size() >= 4 && (m2Path.ends_with(".mdx") || m2Path.ends_with(".mdl"))) {
+                m2Path.replace(m2Path.size() - 4, 4, ".m2");
+            }
+
+            glm::mat4 localMat = glm::translate(glm::mat4(1.0f), def.pos);
+            glm::quat q(def.quat[3], def.quat[0], def.quat[1], def.quat[2]); // GLM 构造顺序 (w, x, y, z)
+            localMat *= glm::mat4_cast(glm::normalize(q));
+            localMat = glm::scale(localMat, glm::vec3(def.scale));
+
+            wmoModel.doodads.push_back(WmoDoodadTemplate{ std::move(m2Path), localMat });
+        }
 
         for (uint32_t g = 0; g < mohd.nGroups; ++g) {
             char groupPath[512]{};

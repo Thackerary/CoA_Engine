@@ -40,13 +40,15 @@ struct Frustum {
     glm::vec4 planes[6];
 
     static Frustum ExtractFromViewProj(const glm::mat4& vp) {
+        // 转置列主序矩阵，使 m[0]..m[3] 直接对应 vp 的第 0..3 行向量 (r0, r1, r2, r3)
+        const glm::mat4 m = glm::transpose(vp);
         Frustum f;
-        f.planes[0] = glm::vec4(vp[3][0] + vp[0][0], vp[3][1] + vp[0][1], vp[3][2] + vp[0][2], vp[3][3] + vp[0][3]);
-        f.planes[1] = glm::vec4(vp[3][0] - vp[0][0], vp[3][1] - vp[0][1], vp[3][2] - vp[0][2], vp[3][3] - vp[0][3]);
-        f.planes[2] = glm::vec4(vp[3][0] + vp[1][0], vp[3][1] + vp[1][1], vp[3][2] + vp[1][2], vp[3][3] + vp[1][3]);
-        f.planes[3] = glm::vec4(vp[3][0] - vp[1][0], vp[3][1] - vp[1][1], vp[3][2] - vp[1][2], vp[3][3] - vp[1][3]);
-        f.planes[4] = glm::vec4(vp[3][0] - vp[2][0], vp[3][1] - vp[2][1], vp[3][2] - vp[2][2], vp[3][3] - vp[2][3]);
-        f.planes[5] = glm::vec4(vp[2][0], vp[2][1], vp[2][2], vp[2][3]);
+        f.planes[0] = m[3] + m[0]; // Left   : c_x >= -c_w
+        f.planes[1] = m[3] - m[0]; // Right  : c_x <=  c_w
+        f.planes[2] = m[3] + m[1]; // Bottom : c_y >= -c_w
+        f.planes[3] = m[3] - m[1]; // Top    : c_y <=  c_w
+        f.planes[4] = m[3] - m[2]; // Near   : c_z <=  c_w (Reverse-Z 近平面为 1.0)
+        f.planes[5] = m[2];        // Far    : c_z >=  0.0 (Reverse-Z 无穷远平面为 0.0)
 
         for (int i = 0; i < 6; ++i) {
             float len = glm::length(glm::vec3(f.planes[i]));
@@ -117,6 +119,8 @@ layout(binding = 2) uniform sampler2D uTexLayer2;   // 地形 Layer 2
 layout(binding = 3) uniform sampler2D uTexLayer3;   // 地形 Layer 3
 layout(binding = 4) uniform sampler2D uTexAlphaMap; // 64x64 RGB Alpha 遮罩 (M2 模型绑定全黑纹理，alpha=0)
 
+layout(location = 0) uniform int uAlphaCutout; // 0 = 不透明 (不裁切), 1 = Alpha Cutout
+
 layout(std140, binding = 0) uniform FrameBlock {
     mat4 uView;
     mat4 uProj;
@@ -149,7 +153,7 @@ void main() {
         texColor.rgb = HeightBlend(texColor.rgb, c2, alphaWeights.g);
         texColor.rgb = HeightBlend(texColor.rgb, c3, alphaWeights.b);
     }
-    if (texColor.a < 0.5) {
+    if (uAlphaCutout != 0 && texColor.a < 0.5) {
         discard;
     }
 
@@ -184,7 +188,7 @@ void main() {
     float fogFactor = clamp(exp(-max(dist - 120.0, 0.0) * 0.0022), 0.0, 1.0);
     vec3 fogColor = vec3(0.53, 0.72, 0.92);
 
-    FragColor = vec4(mix(fogColor, litColor, fogFactor), texColor.a);
+    FragColor = vec4(mix(fogColor, litColor, fogFactor), 1.0);
 }
 )GLSL";
 
