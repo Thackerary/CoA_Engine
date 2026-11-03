@@ -83,3 +83,14 @@ target_link_libraries(CoA_Engine PRIVATE
     lz4_static
     libzstd_static
 )
+# 5. 自动拉取 StormLib 并编译为 storm.dll 供 Python 离线解包脚本调用
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    StormLib
+    GIT_REPOSITORY https://github.com/ladislav-zezula/StormLib.git
+    GIT_TAG        v9.25
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(StormLib)
+target_compile_definitions(storm PRIVATE UNICODE _UNICODE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)

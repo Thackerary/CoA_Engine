@@ -9,6 +9,7 @@
 #include "vfs/vfs.hpp"
 #include "assets/asset_manager.hpp"
 #include "assets/m2_loader.hpp"
+#include "assets/adt_loader.hpp"
 
 void GLAPIENTRY GlDebugCallback(GLenum /*source*/, GLenum /*type*/, GLuint id, GLenum severity,
                                 GLsizei /*length*/, const GLchar* message, const void* /*userParam*/) {
@@ -33,9 +34,9 @@ struct alignas(16) FrameUniforms {
     glm::vec4 cameraPos;
     glm::vec4 sunDirAndIntensity;
 };
-
+// 顶点着色器：通过 gl_BaseInstance + gl_InstanceID 从 1 号 SSBO 提取实例世界变换矩阵
 // 标准 GLSL 4.60 着色器：支持魔兽 Z-Up 半兰伯特光照 + 三色天光环境反射 + Alpha Cutout 树叶镂空
-constexpr std::string_view kM2VertShader = R"GLSL(
+constexpr std::string_view kWorldVertShader = R"GLSL(
 #version 460 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
@@ -49,22 +50,36 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSunDirAndIntensity;
 };
 
+layout(std430, binding = 1) readonly buffer InstanceBlock {
+    mat4 uModelMatrices[];
+};
+
+out vec3 vWorldPos;
 out vec3 vNormal;
 out vec2 vUV;
 
 void main() {
-    vNormal = aNormal;
-    vUV = aUV;
-    gl_Position = uViewProj * vec4(aPos, 1.0);
+    mat4 modelMat = uModelMatrices[gl_BaseInstance + gl_InstanceID];
+    vec4 worldPos = modelMat * vec4(aPos, 1.0);
+    vWorldPos = worldPos.xyz;
+    vNormal   = mat3(modelMat) * aNormal;
+    vUV       = aUV;
+    gl_Position = uViewProj * worldPos;
 }
 )GLSL";
 
-constexpr std::string_view kM2FragShader = R"GLSL(
+// 片段着色器：半兰伯特光照 + 双色天光 + 远景大气指数雾
+constexpr std::string_view kWorldFragShader = R"GLSL(
 #version 460 core
+in vec3 vWorldPos;
 in vec3 vNormal;
 in vec2 vUV;
 
-layout(binding = 0) uniform sampler2D uTexAlbedo;
+layout(binding = 0) uniform sampler2D uTexAlbedo;   // Layer 0 (或 M2 主贴图)
+layout(binding = 1) uniform sampler2D uTexLayer1;   // 地形 Layer 1
+layout(binding = 2) uniform sampler2D uTexLayer2;   // 地形 Layer 2
+layout(binding = 3) uniform sampler2D uTexLayer3;   // 地形 Layer 3
+layout(binding = 4) uniform sampler2D uTexAlphaMap; // 64x64 RGB Alpha 遮罩 (M2 模型绑定全黑纹理，alpha=0)
 
 layout(std140, binding = 0) uniform FrameBlock {
     mat4 uView;
@@ -78,7 +93,15 @@ out vec4 FragColor;
 
 void main() {
     vec4 texColor = texture(uTexAlbedo, vUV);
-    // Alpha Cutout：裁剪魔兽树叶、草丛、栅栏的透明边缘 (配合 4x MSAA 极其平滑)
+    vec3 alphaWeights = texture(uTexAlphaMap, clamp(vUV / 8.0, 0.0, 1.0)).rgb;
+    if ( dot(alphaWeights, vec3(1.0)) > 0.001 ) {
+        vec3 c1 = texture(uTexLayer1, vUV).rgb;
+        vec3 c2 = texture(uTexLayer2, vUV).rgb;
+        vec3 c3 = texture(uTexLayer3, vUV).rgb;
+        texColor.rgb = mix(texColor.rgb, c1, alphaWeights.r);
+        texColor.rgb = mix(texColor.rgb, c2, alphaWeights.g);
+        texColor.rgb = mix(texColor.rgb, c3, alphaWeights.b);
+    }
     if (texColor.a < 0.5) {
         discard;
     }
@@ -86,17 +109,21 @@ void main() {
     vec3 N = normalize(vNormal);
     vec3 L = normalize(uSunDirAndIntensity.xyz);
 
-    // 半兰伯特漫反射 + 天空/地面双色半球环境光 (还原暴雪手绘贴图通透感)
     float ndotl = max(dot(N, L), 0.0);
     float halfLambert = ndotl * 0.65 + 0.35;
-    vec3 skyAmbient    = vec3(0.42, 0.48, 0.58);
-    vec3 groundAmbient = vec3(0.22, 0.20, 0.16);
+    vec3 skyAmbient    = vec3(0.45, 0.52, 0.62);
+    vec3 groundAmbient = vec3(0.24, 0.22, 0.18);
     vec3 ambient = mix(groundAmbient, skyAmbient, N.z * 0.5 + 0.5);
 
     vec3 sunColor = vec3(1.0, 0.95, 0.85) * uSunDirAndIntensity.w;
-    vec3 lighting = ambient + sunColor * halfLambert;
+    vec3 litColor = texColor.rgb * (ambient + sunColor * halfLambert);
 
-    FragColor = vec4(texColor.rgb * lighting, texColor.a);
+    // 艾尔文森林大气距离雾 (平滑融入背景天际线)
+    float dist = length(vWorldPos - uCameraPos.xyz);
+    float fogFactor = clamp(exp(-max(dist - 120.0, 0.0) * 0.0022), 0.0, 1.0);
+    vec3 fogColor = vec3(0.53, 0.72, 0.92);
+
+    FragColor = vec4(mix(fogColor, litColor, fogFactor), texColor.a);
 }
 )GLSL";
 
@@ -112,7 +139,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 32);
 
     int winW = 1920, winH = 1080;
-    SDL_Window* window = SDL_CreateWindow("CoA Custom Engine (GL 4.6 DSA)", winW, winH,
+    SDL_Window* window = SDL_CreateWindow("CoA Custom Engine - Elwynn Forest ADT", winW, winH,
                                           SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext glCtx = SDL_GL_CreateContext(window);
     gladLoadGLLoader(reinterpret_cast<GLADloadproc>(SDL_GL_GetProcAddress));
@@ -132,43 +159,41 @@ int main(int /*argc*/, char* /*argv*/[]) {
         coa::rhi::GlBuffer frameUbo(sizeof(FrameUniforms));
         frameUbo.BindAsUniformBuffer(0);
 
-        coa::rhi::GlShaderProgram m2Shader(kM2VertShader, kM2FragShader);
+        coa::rhi::GlShaderProgram worldShader(kWorldVertShader, kWorldFragShader);
         GLuint sharedM2Vao = coa::assets::GpuM2Model::CreateSharedVAO();
+        GLuint terrainVao  = coa::assets::GpuAdtTile::CreateTerrainVAO();
 
-        // 生成一张 1x1 纯白兜底纹理（当本地暂未放置对应 BLP 时也能看清 3D 模型光影轮廓）
         coa::rhi::GlTexture2D whiteFallbackTex(1, 1, 1, coa::rhi::PixelFormat::RGBA8, true);
-        const uint8_t whitePixel[4] = {230, 230, 230, 255};
+        const uint8_t whitePixel[4] = {180, 210, 140, 255}; // 浅草绿兜底色
         whiteFallbackTex.UploadUncompressedMip(0, 1, 1, whitePixel);
-
+		coa::rhi::GlTexture2D blackAlphaTex(1, 1, 1, coa::rhi::PixelFormat::RGBA8, false);
+        const uint8_t blackPixel[4] = {0, 0, 0, 0};
+        blackAlphaTex.UploadUncompressedMip(0, 1, 1, blackPixel);
+		
         coa::vfs::VirtualFileSystem vfs;
-        vfs.MountLooseDirectory("D:/CoA_Assets/wotlk_base", 100);
-        vfs.MountLooseDirectory("D:/CoA_Assets/coa_patches", 200);
+        vfs.MountLooseDirectory("CoA_Assets/wotlk_base", 100);
+        vfs.MountLooseDirectory("CoA_Assets/coa_patches", 200);
 
         coa::assets::AssetManager assets(vfs);
-        GLuint grassTex = assets.GetOrLoadTexture("Tileset\\Elwynn\\ElwynnGrassBase.blp");
-        if (grassTex == 0) grassTex = whiteFallbackTex.Handle();
 
-        // 创建一块 40x40 码的 Z-Up 测试地面 (复用 M2Vertex 48 字节格式)
-        const coa::assets::M2Vertex groundVerts[4] = {
-            {{-20.0f, -20.0f, 0.0f}, {255,0,0,0}, {0,0,0,0}, {0.0f, 0.0f, 1.0f}, {{0.0f, 0.0f}, {0.0f, 0.0f}}},
-            {{ 20.0f, -20.0f, 0.0f}, {255,0,0,0}, {0,0,0,0}, {0.0f, 0.0f, 1.0f}, {{8.0f, 0.0f}, {0.0f, 0.0f}}},
-            {{ 20.0f,  20.0f, 0.0f}, {255,0,0,0}, {0,0,0,0}, {0.0f, 0.0f, 1.0f}, {{8.0f, 8.0f}, {0.0f, 0.0f}}},
-            {{-20.0f,  20.0f, 0.0f}, {255,0,0,0}, {0,0,0,0}, {0.0f, 0.0f, 1.0f}, {{0.0f, 8.0f}, {0.0f, 0.0f}}},
-        };
-        const uint16_t groundIndices[6] = {0, 1, 2, 0, 2, 3};
-        coa::rhi::GlBuffer groundVbo(sizeof(groundVerts), groundVerts, 0);
-        coa::rhi::GlBuffer groundIbo(sizeof(groundIndices), groundIndices, 0);
-
-        // 尝试加载一个魔兽 M2 模型 (可替换为你解压目录中实际存在的任意 .m2 路径)
-        auto testM2 = coa::assets::M2Loader::LoadModel(
-            "World\\Azeroth\\Elwynn\\PassiveDoodads\\Trees\\ElwynnTree01.m2",
+        // 加载艾尔文森林闪金镇 ADT 地形与森林装饰物
+        auto adtTile = coa::assets::AdtLoader::LoadAdt(
+            "world/maps/azeroth/azeroth_32_48.adt",
             vfs, assets, whiteFallbackTex.Handle()
         );
 
-        // Z-Up 摄像机状态 (+X 朝前, +Y 朝左, +Z 朝上)
-        glm::vec3 camPos(-12.0f, 0.0f, 4.0f);
-        float camYaw   = 0.0f;   // 绕 Z 轴水平偏航角
-        float camPitch = -0.15f; // 俯仰角
+        // 将 ADT 中所有物体的世界变换矩阵一次性上传至 1 号 SSBO
+        std::vector<glm::mat4> ssboMats = {glm::mat4(1.0f)};
+        if (adtTile && !adtTile->instanceMatrices.empty()) {
+            ssboMats = adtTile->instanceMatrices;
+        }
+        coa::rhi::GlBuffer instanceSsbo(ssboMats.size() * sizeof(glm::mat4), ssboMats.data(), 0);
+        instanceSsbo.BindAsStorageBuffer(1);
+
+        // 自动将摄像机瞬移至当前加载的 ADT 地形中心上空
+        glm::vec3 camPos = adtTile ? adtTile->suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
+        float camYaw   = 0.0f;
+        float camPitch = -0.25f;
         bool rightMouseDown = false;
         uint64_t lastTicks = SDL_GetTicksNS();
 
@@ -200,7 +225,6 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 }
             }
 
-            // 计算 Z-Up 坐标系下的摄像机前向与右向向量
             glm::vec3 forward(
                 std::cos(camPitch) * std::cos(camYaw),
                 std::cos(camPitch) * std::sin(camYaw),
@@ -210,7 +234,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
             glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
 
             const bool* keys = SDL_GetKeyboardState(nullptr);
-            float moveSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 25.0f : 8.0f) * dt;
+            // 按住 Shift 高速飞行 (120码/秒)，方便跨越 533x533 码的 ADT 大地图
+            float moveSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 120.0f : 25.0f) * dt;
             if (keys[SDL_SCANCODE_W]) camPos += forward * moveSpeed;
             if (keys[SDL_SCANCODE_S]) camPos -= forward * moveSpeed;
             if (keys[SDL_SCANCODE_D]) camPos += right * moveSpeed;
@@ -218,11 +243,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
             if (keys[SDL_SCANCODE_SPACE]) camPos += worldUp * moveSpeed;
             if (keys[SDL_SCANCODE_LCTRL]) camPos -= worldUp * moveSpeed;
 
-            // 更新全局 0 号 UBO
             float aspect = (winH > 0) ? (static_cast<float>(winW) / static_cast<float>(winH)) : 1.777f;
             FrameUniforms uboData{};
             uboData.view               = glm::lookAt(camPos, camPos + forward, worldUp);
-            uboData.proj               = MakeInfiniteReverseZProj(glm::radians(60.0f), aspect, 0.1f);
+            uboData.proj               = MakeInfiniteReverseZProj(glm::radians(60.0f), aspect, 0.2f);
             uboData.viewProj           = uboData.proj * uboData.view;
             uboData.cameraPos          = glm::vec4(camPos, 1.0f);
             uboData.sunDirAndIntensity = glm::vec4(glm::normalize(glm::vec3(-0.5f, -0.4f, 0.75f)), 1.1f);
@@ -233,33 +257,72 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             renderQueue.clear();
 
-            // 1. 提交地面网格绘制指令
-            coa::rhi::DrawCommand groundCmd{};
-            groundCmd.sortKey    = coa::rhi::DrawCommand::MakeKey(2, 1, static_cast<uint16_t>(grassTex), 0);
-            groundCmd.program    = m2Shader.Handle();
-            groundCmd.vao        = sharedM2Vao;
-            groundCmd.vbo        = groundVbo.Handle();
-            groundCmd.ibo        = groundIbo.Handle();
-            groundCmd.stride     = sizeof(coa::assets::M2Vertex);
-            groundCmd.texAlbedo  = grassTex;
-            groundCmd.indexCount = 6;
-            renderQueue.push_back(groundCmd);
-
-            // 2. 提交 M2 模型的所有子网格绘制指令
-            if (testM2) {
-                for (const auto& sub : testM2->submeshes) {
+            if (adtTile) {
+                // 1. 提交 256 个 MCNK 地形块绘制指令 (baseInstance = 0 指向单位矩阵)
+                for (const auto& chunk : adtTile->chunks) {
                     coa::rhi::DrawCommand cmd{};
-                    uint8_t pass = (sub.blendMode == 1) ? 3 : 2; // 2=Opaque, 3=AlphaCutout
-                    cmd.sortKey    = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sub.textureId), 0);
-                    cmd.program    = m2Shader.Handle();
-                    cmd.vao        = sharedM2Vao;
-                    cmd.vbo        = testM2->vbo.Handle();
-                    cmd.ibo        = testM2->ibo.Handle();
-                    cmd.stride     = sizeof(coa::assets::M2Vertex);
-                    cmd.texAlbedo  = sub.textureId;
-                    cmd.firstIndex = sub.firstIndex;
-                    cmd.indexCount = sub.indexCount;
+                    cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(2, 1, static_cast<uint16_t>(chunk.layerTex[0]), 0);
+                    cmd.program       = worldShader.Handle();
+                    cmd.vao           = terrainVao;
+                    cmd.vbo           = adtTile->terrainVbo.Handle();
+                    cmd.ibo           = adtTile->terrainIbo.Handle();
+                    cmd.stride        = sizeof(coa::assets::TerrainVertex);
+                    cmd.firstIndex    = chunk.firstIndex;
+                    cmd.indexCount    = chunk.indexCount;
+                    cmd.baseVertex    = chunk.baseVertex;
+                    cmd.instanceCount = 1;
+                    cmd.baseInstance  = 0;
+					cmd.texAlbedo    = chunk.layerTex[0];
+                    cmd.texLayers[0] = chunk.layerTex[1];
+                    cmd.texLayers[1] = chunk.layerTex[2];
+                    cmd.texLayers[2] = chunk.layerTex[3];
+                    cmd.texAlphaMap  = chunk.alphaMapTex;
                     renderQueue.push_back(cmd);
+                }
+
+                // 2. 批量提交整片森林的 M2 装饰物硬件实例化指令
+                for (const auto& batch : adtTile->doodadBatches) {
+                    for (const auto& sub : batch.model.submeshes) {
+                        coa::rhi::DrawCommand cmd{};
+                        uint8_t pass      = (sub.blendMode == 1) ? 3 : 2;
+                        cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sub.textureId), 0);
+                        cmd.program       = worldShader.Handle();
+                        cmd.vao           = sharedM2Vao;
+                        cmd.vbo           = batch.model.vbo.Handle();
+                        cmd.ibo           = batch.model.ibo.Handle();
+                        cmd.stride        = sizeof(coa::assets::M2Vertex);
+                        cmd.texAlbedo     = sub.textureId;
+                        cmd.firstIndex    = sub.firstIndex;
+                        cmd.indexCount    = sub.indexCount;
+                        cmd.baseVertex    = 0;
+                        cmd.instanceCount = batch.instanceCount;
+                        cmd.baseInstance  = batch.baseInstance;
+						cmd.texAlphaMap  = blackAlphaTex.Handle(); // M2 模型权重为 0，仅使用 texAlbedo
+                        renderQueue.push_back(cmd);
+                    }
+                }
+				// 3. 批量提交 WMO 大型建筑 (教堂/酒馆/矿洞) 绘制指令 (复用 terrainVao)
+                for (const auto& wmoBatch : adtTile->wmoBatches) {
+                    for (const auto& grp : wmoBatch.model.groups) {
+                        for (const auto& sb : grp.batches) {
+                            coa::rhi::DrawCommand cmd{};
+                            uint8_t pass      = (sb.blendMode == 1) ? 3 : 2;
+                            cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sb.textureId), 0);
+                            cmd.program       = worldShader.Handle();
+                            cmd.vao           = terrainVao;
+                            cmd.vbo           = grp.vbo.Handle();
+                            cmd.ibo           = grp.ibo.Handle();
+                            cmd.stride        = sizeof(coa::assets::WmoVertex);
+                            cmd.texAlbedo     = sb.textureId;
+                            cmd.texAlphaMap   = blackAlphaTex.Handle();
+                            cmd.firstIndex    = sb.firstIndex;
+                            cmd.indexCount    = sb.indexCount;
+                            cmd.baseVertex    = 0;
+                            cmd.instanceCount = wmoBatch.instanceCount;
+                            cmd.baseInstance  = wmoBatch.baseInstance;
+                            renderQueue.push_back(cmd);
+                        }
+                    }
                 }
             }
 
@@ -267,6 +330,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
             SDL_GL_SwapWindow(window);
         }
 
+        glDeleteVertexArrays(1, &terrainVao);
         glDeleteVertexArrays(1, &sharedM2Vao);
     }
 

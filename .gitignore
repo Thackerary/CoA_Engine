@@ -1,1 +1,37 @@
-build/
+# ==================== 魔兽客户端素材与归档 (严禁上传) ====================
+/CoA_Assets/
+*.mpq
+*.MPQ
+*.pak
+*.blp
+*.BLP
+*.m2
+*.M2
+*.skin
+*.wmo
+*.WMO
+*.adt
+*.ADT
+*.dbc
+*.DBC
+
+# ==================== CMake & Visual Studio 2022 编译缓存 ====================
+/build/
+/out/
+/.vs/
+/.vscode/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.sln
+*.vcxproj*
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.obj
+
+# ==================== Python 缓存 ====================
+__pycache__/
+*.pyc
