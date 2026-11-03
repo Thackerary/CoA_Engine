@@ -97,6 +97,8 @@ struct GpuMcnkChunk {
     uint32_t indexCount = 768;
     GLuint   layerTex[4]  = {0, 0, 0, 0}; // 【修改】将原来的 baseTexId 改为 4 层贴图句柄数组
     GLuint   alphaMapTex  = 0;            // 【新增】当前块的 64x64 RGB Alpha 遮罩纹理句柄
+    glm::vec3 aabbMin{0.0f};
+    glm::vec3 aabbMax{0.0f};
 };
 
 // 同种 M2 装饰物的实例化批次
@@ -116,7 +118,6 @@ struct GpuAdtTile {
     std::vector<GpuMcnkChunk>   chunks;
     std::vector<GpuDoodadBatch> doodadBatches;
 	std::vector<GpuWmoBatch>    wmoBatches; // 【新增】当前 ADT 上的所有 WMO 大型建筑批次
-    std::vector<glm::mat4>      instanceMatrices; // 第 0 号固定为单位矩阵(供地形使用)，1..N 为所有 M2 实例矩阵
 	std::vector<rhi::GlTexture2D> alphaTextures; // 【新增在 GpuAdtTile 内】托管所有 MCNK 的 64x64 遮罩纹理
     glm::vec3                   suggestedCamPos{0.0f};
 
