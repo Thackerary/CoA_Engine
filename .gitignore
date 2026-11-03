@@ -35,3 +35,4 @@ cmake_install.cmake
 # ==================== Python 缓存 ====================
 __pycache__/
 *.pyc
+.aider*

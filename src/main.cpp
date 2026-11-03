@@ -91,34 +91,59 @@ layout(std140, binding = 0) uniform FrameBlock {
 
 out vec4 FragColor;
 
+// 辅助函数：提取像素感知亮度作为微表面高度，并用平滑混合替换线性 mix
+float GetLuma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+vec3 HeightBlend(vec3 baseCol, vec3 overCol, float alpha) {
+    float hBase = GetLuma(baseCol);
+    float hOver = GetLuma(overCol);
+    // 让上层材质优先填充下层材质的暗部缝隙 (0.25 控制咬合锐度)
+    float w = clamp((alpha * 1.4 - 0.2) + (hOver - hBase) * 0.35, 0.0, 1.0);
+    return mix(baseCol, overCol, smoothstep(0.0, 1.0, w));
+}
+
 void main() {
     vec4 texColor = texture(uTexAlbedo, vUV);
     vec3 alphaWeights = texture(uTexAlphaMap, clamp(vUV / 8.0, 0.0, 1.0)).rgb;
-    if ( dot(alphaWeights, vec3(1.0)) > 0.001 ) {
+    if (dot(alphaWeights, vec3(1.0)) > 0.001) {
         vec3 c1 = texture(uTexLayer1, vUV).rgb;
         vec3 c2 = texture(uTexLayer2, vUV).rgb;
         vec3 c3 = texture(uTexLayer3, vUV).rgb;
-        texColor.rgb = mix(texColor.rgb, c1, alphaWeights.r);
-        texColor.rgb = mix(texColor.rgb, c2, alphaWeights.g);
-        texColor.rgb = mix(texColor.rgb, c3, alphaWeights.b);
+        texColor.rgb = HeightBlend(texColor.rgb, c1, alphaWeights.r);
+        texColor.rgb = HeightBlend(texColor.rgb, c2, alphaWeights.g);
+        texColor.rgb = HeightBlend(texColor.rgb, c3, alphaWeights.b);
     }
     if (texColor.a < 0.5) {
         discard;
     }
 
+    // 1. 利用屏幕空间偏导数 (dFdx/dFdy) 从贴图亮度实时重建凹凸法线
     vec3 N = normalize(vNormal);
+    float height = GetLuma(texColor.rgb);
+    vec3 dPdx = dFdx(vWorldPos);
+    vec3 dPdy = dFdy(vWorldPos);
+    vec3 r1 = cross(dPdy, N);
+    vec3 r2 = cross(N, dPdx);
+    float det = dot(dPdx, r1);
+    vec3 surfGrad = ( abs(det) > 1e-8 ) ? ((r1 * dFdx(height) + r2 * dFdy(height)) / det) : vec3(0.0);
+    N = normalize(N - surfGrad * 0.35); // 0.35 为凹凸强度，可按喜好调节
+
+    // 2. 半兰伯特漫反射 + Blinn-Phong 阳光微表面高光
     vec3 L = normalize(uSunDirAndIntensity.xyz);
+    vec3 V = normalize(uCameraPos.xyz - vWorldPos);
+    vec3 H = normalize(L + V);
 
     float ndotl = max(dot(N, L), 0.0);
     float halfLambert = ndotl * 0.65 + 0.35;
+    float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.28 * ndotl;
+
     vec3 skyAmbient    = vec3(0.45, 0.52, 0.62);
     vec3 groundAmbient = vec3(0.24, 0.22, 0.18);
     vec3 ambient = mix(groundAmbient, skyAmbient, N.z * 0.5 + 0.5);
 
     vec3 sunColor = vec3(1.0, 0.95, 0.85) * uSunDirAndIntensity.w;
-    vec3 litColor = texColor.rgb * (ambient + sunColor * halfLambert);
+    vec3 litColor = texColor.rgb * (ambient + sunColor * halfLambert) + sunColor * spec;
 
-    // 艾尔文森林大气距离雾 (平滑融入背景天际线)
     float dist = length(vWorldPos - uCameraPos.xyz);
     float fogFactor = clamp(exp(-max(dist - 120.0, 0.0) * 0.0022), 0.0, 1.0);
     vec3 fogColor = vec3(0.53, 0.72, 0.92);
