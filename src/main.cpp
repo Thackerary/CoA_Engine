@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cmath>
 #include <vector>
+#include <unordered_set>
 #include "rhi/rhi_gl.hpp"
 #include "vfs/vfs.hpp"
 #include "assets/asset_manager.hpp"
@@ -33,6 +34,41 @@ struct alignas(16) FrameUniforms {
     glm::mat4 viewProj;
     glm::vec4 cameraPos;
     glm::vec4 sunDirAndIntensity;
+};
+
+struct Frustum {
+    glm::vec4 planes[6];
+
+    static Frustum ExtractFromViewProj(const glm::mat4& vp) {
+        Frustum f;
+        f.planes[0] = glm::vec4(vp[3][0] + vp[0][0], vp[3][1] + vp[0][1], vp[3][2] + vp[0][2], vp[3][3] + vp[0][3]);
+        f.planes[1] = glm::vec4(vp[3][0] - vp[0][0], vp[3][1] - vp[0][1], vp[3][2] - vp[0][2], vp[3][3] - vp[0][3]);
+        f.planes[2] = glm::vec4(vp[3][0] + vp[1][0], vp[3][1] + vp[1][1], vp[3][2] + vp[1][2], vp[3][3] + vp[1][3]);
+        f.planes[3] = glm::vec4(vp[3][0] - vp[1][0], vp[3][1] - vp[1][1], vp[3][2] - vp[1][2], vp[3][3] - vp[1][3]);
+        f.planes[4] = glm::vec4(vp[3][0] - vp[2][0], vp[3][1] - vp[2][1], vp[3][2] - vp[2][2], vp[3][3] - vp[2][3]);
+        f.planes[5] = glm::vec4(vp[2][0], vp[2][1], vp[2][2], vp[2][3]);
+
+        for (int i = 0; i < 6; ++i) {
+            float len = glm::length(glm::vec3(f.planes[i]));
+            if (len > 1e-8f) {
+                f.planes[i] /= len;
+            }
+        }
+        return f;
+    }
+
+    bool IntersectsAABB(const glm::vec3& bMin, const glm::vec3& bMax) const {
+        glm::vec3 center  = (bMin + bMax) * 0.5f;
+        glm::vec3 extents = (bMax - bMin) * 0.5f;
+        for (const auto& p : planes) {
+            glm::vec3 n(p);
+            glm::vec3 absN(std::fabs(p.x), std::fabs(p.y), std::fabs(p.z));
+            float r = glm::dot(extents, absN);
+            float d = glm::dot(n, center) + p.w;
+            if (d < -r) return false;
+        }
+        return true;
+    }
 };
 // 顶点着色器：通过 gl_BaseInstance + gl_InstanceID 从 1 号 SSBO 提取实例世界变换矩阵
 // 标准 GLSL 4.60 着色器：支持魔兽 Z-Up 半兰伯特光照 + 三色天光环境反射 + Alpha Cutout 树叶镂空
@@ -201,26 +237,37 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
         coa::assets::AssetManager assets(vfs);
 
-        // 加载艾尔文森林闪金镇 ADT 地形与森林装饰物
-        auto adtTile = coa::assets::AdtLoader::LoadAdt(
-            "world/maps/azeroth/azeroth_32_48.adt",
-            vfs, assets, whiteFallbackTex.Handle()
-        );
-
-        // 将 ADT 中所有物体的世界变换矩阵一次性上传至 1 号 SSBO
+        // 多 ADT 无缝拼接：同时加载北郡(32_48)与闪金镇(32_49)
+        std::vector<coa::assets::GpuAdtTile> adtTiles;
         std::vector<glm::mat4> ssboMats = {glm::mat4(1.0f)};
-        if (adtTile && !adtTile->instanceMatrices.empty()) {
-            ssboMats = adtTile->instanceMatrices;
-        }
+        std::unordered_set<uint32_t> seenUniqueIds;
+
+        auto tile1 = coa::assets::AdtLoader::LoadAdt(
+            "world/maps/azeroth/azeroth_32_48.adt",
+            vfs, assets, whiteFallbackTex.Handle(), ssboMats, seenUniqueIds
+        );
+        if (tile1) adtTiles.push_back(std::move(*tile1));
+
+        auto tile2 = coa::assets::AdtLoader::LoadAdt(
+            "world/maps/azeroth/azeroth_32_49.adt",
+            vfs, assets, whiteFallbackTex.Handle(), ssboMats, seenUniqueIds
+        );
+        if (tile2) adtTiles.push_back(std::move(*tile2));
+
+        // 所有 ADT 加载完成后，将合并后的实例矩阵一次性上传至 1 号 SSBO
         coa::rhi::GlBuffer instanceSsbo(ssboMats.size() * sizeof(glm::mat4), ssboMats.data(), 0);
         instanceSsbo.BindAsStorageBuffer(1);
 
-        // 自动将摄像机瞬移至当前加载的 ADT 地形中心上空
-        glm::vec3 camPos = adtTile ? adtTile->suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
+        // 自动将摄像机瞬移至首个成功加载的 ADT 地形中心上空
+        glm::vec3 camPos = (!adtTiles.empty()) ? adtTiles.front().suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
         float camYaw   = 0.0f;
         float camPitch = -0.25f;
         bool rightMouseDown = false;
         uint64_t lastTicks = SDL_GetTicksNS();
+
+        int visibleChunks = 0;
+        int totalChunks = 0;
+        float titleTimer = 0.0f;
 
         std::vector<coa::rhi::DrawCommand> renderQueue;
         bool running = true;
@@ -282,31 +329,42 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             renderQueue.clear();
 
-            if (adtTile) {
-                // 1. 提交 256 个 MCNK 地形块绘制指令 (baseInstance = 0 指向单位矩阵)
-                for (const auto& chunk : adtTile->chunks) {
+            // 每帧提取 Reverse-Z 视锥体
+            Frustum camFrustum = Frustum::ExtractFromViewProj(uboData.viewProj);
+            visibleChunks = 0;
+            totalChunks = 0;
+
+            for (const auto& tile : adtTiles) {
+                // 1. 提交 MCNK 地形块，先按 AABB 进行视锥裁剪
+                for (const auto& chunk : tile.chunks) {
+                    ++totalChunks;
+                    if (!camFrustum.IntersectsAABB(chunk.aabbMin, chunk.aabbMax)) {
+                        continue;
+                    }
+                    ++visibleChunks;
+
                     coa::rhi::DrawCommand cmd{};
                     cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(2, 1, static_cast<uint16_t>(chunk.layerTex[0]), 0);
                     cmd.program       = worldShader.Handle();
                     cmd.vao           = terrainVao;
-                    cmd.vbo           = adtTile->terrainVbo.Handle();
-                    cmd.ibo           = adtTile->terrainIbo.Handle();
+                    cmd.vbo           = tile.terrainVbo.Handle();
+                    cmd.ibo           = tile.terrainIbo.Handle();
                     cmd.stride        = sizeof(coa::assets::TerrainVertex);
                     cmd.firstIndex    = chunk.firstIndex;
                     cmd.indexCount    = chunk.indexCount;
                     cmd.baseVertex    = chunk.baseVertex;
                     cmd.instanceCount = 1;
                     cmd.baseInstance  = 0;
-					cmd.texAlbedo    = chunk.layerTex[0];
-                    cmd.texLayers[0] = chunk.layerTex[1];
-                    cmd.texLayers[1] = chunk.layerTex[2];
-                    cmd.texLayers[2] = chunk.layerTex[3];
-                    cmd.texAlphaMap  = chunk.alphaMapTex;
+                    cmd.texAlbedo     = chunk.layerTex[0];
+                    cmd.texLayers[0]  = chunk.layerTex[1];
+                    cmd.texLayers[1]  = chunk.layerTex[2];
+                    cmd.texLayers[2]  = chunk.layerTex[3];
+                    cmd.texAlphaMap   = chunk.alphaMapTex;
                     renderQueue.push_back(cmd);
                 }
 
                 // 2. 批量提交整片森林的 M2 装饰物硬件实例化指令
-                for (const auto& batch : adtTile->doodadBatches) {
+                for (const auto& batch : tile.doodadBatches) {
                     for (const auto& sub : batch.model.submeshes) {
                         coa::rhi::DrawCommand cmd{};
                         uint8_t pass      = (sub.blendMode == 1) ? 3 : 2;
@@ -322,12 +380,13 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         cmd.baseVertex    = 0;
                         cmd.instanceCount = batch.instanceCount;
                         cmd.baseInstance  = batch.baseInstance;
-						cmd.texAlphaMap  = blackAlphaTex.Handle(); // M2 模型权重为 0，仅使用 texAlbedo
+                        cmd.texAlphaMap   = blackAlphaTex.Handle();
                         renderQueue.push_back(cmd);
                     }
                 }
-				// 3. 批量提交 WMO 大型建筑 (教堂/酒馆/矿洞) 绘制指令 (复用 terrainVao)
-                for (const auto& wmoBatch : adtTile->wmoBatches) {
+
+                // 3. 批量提交 WMO 大型建筑 (教堂/酒馆/矿洞) 绘制指令 (复用 terrainVao)
+                for (const auto& wmoBatch : tile.wmoBatches) {
                     for (const auto& grp : wmoBatch.model.groups) {
                         for (const auto& sb : grp.batches) {
                             coa::rhi::DrawCommand cmd{};
@@ -349,6 +408,17 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         }
                     }
                 }
+            }
+
+            // 每 0.25 秒更新一次窗口标题，观察视锥裁剪统计
+            titleTimer += dt;
+            if (titleTimer >= 0.25f) {
+                char titleBuf[256];
+                std::snprintf(titleBuf, sizeof(titleBuf),
+                              "CoA Engine | Visible Chunks: %d / %d | Total Instances: %zu",
+                              visibleChunks, totalChunks, ssboMats.size() - 1);
+                SDL_SetWindowTitle(window, titleBuf);
+                titleTimer = 0.0f;
             }
 
             coa::rhi::SubmitDrawCommands(renderQueue);

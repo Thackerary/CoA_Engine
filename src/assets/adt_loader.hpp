@@ -7,6 +7,7 @@
 #include <span>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include "../rhi/rhi_gl.hpp"
@@ -157,7 +158,9 @@ public:
         std::string_view adtVirtualPath,
         const vfs::VirtualFileSystem& vfs,
         AssetManager& assets,
-        GLuint fallbackWhiteTex)
+        GLuint fallbackWhiteTex,
+        std::vector<glm::mat4>& sharedInstanceMatrices,
+        std::unordered_set<uint32_t>& seenUniqueIds)
     {
         auto fileOpt = vfs.ReadFile(adtVirtualPath);
         if (!fileOpt || fileOpt->size() < 64) return std::nullopt;
@@ -180,7 +183,6 @@ public:
         GpuAdtTile tile;
         tile.chunks.reserve(256);
 		tile.alphaTextures.reserve(256);
-        tile.instanceMatrices.push_back(glm::mat4(1.0f)); // 槽位 0：留给地形的单位矩阵
 
         // 1. 扫描 ADT 顶层 IFF Chunks
         size_t cursor = 0;
@@ -244,6 +246,10 @@ public:
                 m2Path.replace(m2Path.size() - 4, 4, ".m2");
             }
 
+            if (!seenUniqueIds.insert(entry.uniqueId).second) {
+                continue;
+            }
+
             // 将 MDDF 左上角编辑器坐标转换为魔兽 Z-Up 世界坐标
             glm::vec3 worldPos(
                 kMapHalfSize - entry.pos.z,
@@ -270,15 +276,15 @@ public:
 
             GpuDoodadBatch batch;
             batch.model         = std::move(*modelOpt);
-            batch.baseInstance  = static_cast<uint32_t>(tile.instanceMatrices.size());
+            batch.baseInstance  = static_cast<uint32_t>(sharedInstanceMatrices.size());
             batch.instanceCount = static_cast<uint32_t>(mats.size());
 
-            tile.instanceMatrices.insert(tile.instanceMatrices.end(), mats.begin(), mats.end());
+            sharedInstanceMatrices.insert(sharedInstanceMatrices.end(), mats.begin(), mats.end());
             tile.doodadBatches.push_back(std::move(batch));
         }
 
         std::printf("[ADT Loader] Loaded %zu MCNK chunks, %zu unique M2 doodad types (%zu total instances)\n",
-                    tile.chunks.size(), tile.doodadBatches.size(), tile.instanceMatrices.size() - 1);
+                    tile.chunks.size(), tile.doodadBatches.size(), sharedInstanceMatrices.size() - 1);
 		// 4. 解析 MODF 大型建筑 (WMO) 并录入 SSBO 矩阵表
         std::unordered_map<std::string, std::vector<glm::mat4>> wmoGroups;
         for (const auto& entry : modfEntries) {
@@ -287,6 +293,10 @@ public:
             if (strOffset >= mwmoBlob.size()) continue;
 
             std::string wmoPath = vfs::VirtualFileSystem::NormalizeVirtualPath(mwmoBlob.data() + strOffset);
+            if (!seenUniqueIds.insert(entry.uniqueId).second) {
+                continue;
+            }
+
             glm::vec3 worldPos(
                 kMapHalfSize - entry.pos.z,
                 kMapHalfSize - entry.pos.x,
@@ -308,10 +318,10 @@ public:
 
             GpuWmoBatch batch;
             batch.model         = std::move(*wmoOpt);
-            batch.baseInstance  = static_cast<uint32_t>(tile.instanceMatrices.size());
+            batch.baseInstance  = static_cast<uint32_t>(sharedInstanceMatrices.size());
             batch.instanceCount = static_cast<uint32_t>(mats.size());
 
-            tile.instanceMatrices.insert(tile.instanceMatrices.end(), mats.begin(), mats.end());
+            sharedInstanceMatrices.insert(sharedInstanceMatrices.end(), mats.begin(), mats.end());
             tile.wmoBatches.push_back(std::move(batch));
         }
         std::printf("[ADT Loader] Loaded %zu WMO building types\n", tile.wmoBatches.size());
@@ -394,6 +404,18 @@ private:
         // 解析 1~4 层 MCLY 纹理与 MCAL Alpha 遮罩
         GpuMcnkChunk gpuChunk{};
         gpuChunk.baseVertex = baseVert;
+
+        // 计算当前 MCNK 145 个顶点的世界空间 AABB
+        size_t aabbStart = static_cast<size_t>(baseVert);
+        glm::vec3 vMin = allVerts[aabbStart].pos;
+        glm::vec3 vMax = allVerts[aabbStart].pos;
+        for (size_t i = aabbStart + 1; i < aabbStart + 145; ++i) {
+            vMin = glm::min(vMin, allVerts[i].pos);
+            vMax = glm::max(vMax, allVerts[i].pos);
+        }
+        gpuChunk.aabbMin = vMin;
+        gpuChunk.aabbMax = vMax;
+
         for (int i = 0; i < 4; ++i) gpuChunk.layerTex[i] = fallbackWhiteTex;
 
         uint32_t layerCount = std::min<uint32_t>(hdr.nLayers, 4u);
