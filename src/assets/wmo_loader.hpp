@@ -71,6 +71,14 @@ struct WmoDoodadDef {
     uint32_t  color;             // BGRA 颜色
 };
 static_assert(sizeof(WmoDoodadDef) == 40, "WmoDoodadDef must be 40 bytes");
+// 在 WmoDoodadDef 下方新增 (约第 69 行):
+struct WmoDoodadSet {
+    char     name[20];
+    uint32_t startIndex; // 在 MODD 数组中的起始下标
+    uint32_t count;      // 家具数量
+    uint32_t pad;
+};
+static_assert(sizeof(WmoDoodadSet) == 32, "WmoDoodadSet must be 32 bytes");
 #pragma pack(pop)
 
 // 与 TerrainVertex 严格一致的 32 字节顶点布局，直接复用 terrainVao
@@ -103,7 +111,8 @@ struct WmoDoodadTemplate {
 
 struct GpuWmoModel {
     std::vector<GpuWmoGroup>       groups;
-    std::vector<WmoDoodadTemplate> doodads; // 室内家具/摆设 (MODD)
+    std::vector<WmoDoodadSet>      doodadSets; // 【新增】MODS 家具套装范围表
+    std::vector<WmoDoodadTemplate> doodads;    // 室内家具/摆设 (MODD)
     glm::vec3                      localBoundsMin{-10.0f};
     glm::vec3                      localBoundsMax{10.0f};
 };
@@ -136,7 +145,7 @@ public:
         std::span<const WmoMaterial>  momtMats;
         std::span<const char>         modnBlob;
         std::span<const WmoDoodadDef> moddDefs;
-
+        GpuWmoModel wmoModel;
         size_t cursor = 0;
         while (cursor + 8 <= rootBytes.size()) {
             uint32_t magic = 0, size = 0;
@@ -158,6 +167,10 @@ public:
             } else if (magic == FourCC("MODD")) {
                 moddDefs = std::span<const WmoDoodadDef>(reinterpret_cast<const WmoDoodadDef*>(chunk.data()),
                                                          chunk.size() / sizeof(WmoDoodadDef));
+			} else if (magic == FourCC("MODS")) {
+                auto sets = std::span<const WmoDoodadSet>(reinterpret_cast<const WmoDoodadSet*>(chunk.data()),
+                                                          chunk.size() / sizeof(WmoDoodadSet));
+                wmoModel.doodadSets.assign(sets.begin(), sets.end());
             }
             cursor = dataStart + size;
         }
@@ -180,18 +193,23 @@ public:
         }
 
         // 3. 解析 MODD 内部家具摆设，换算为 WMO 局部空间变换矩阵
-        GpuWmoModel wmoModel;
         wmoModel.groups.reserve(mohd.nGroups);
         bool firstGroup = true;
 
+        wmoModel.doodads.reserve(moddDefs.size());
         for (const auto& def : moddDefs) {
             uint32_t nameOfs = def.nameIndexAndFlags & 0xFFFFFFu;
-            if (nameOfs >= modnBlob.size()) continue;
+            if (nameOfs >= modnBlob.size()) {
+                wmoModel.doodads.push_back(WmoDoodadTemplate{}); // 保持与 MODD 原始下标 1:1 对齐
+                continue;
+            }
 
             std::string m2Path(modnBlob.data() + nameOfs);
             m2Path = vfs::VirtualFileSystem::NormalizeVirtualPath(m2Path);
-            if (m2Path.empty()) continue;
-            // WMO 内部同样可能写入 .mdx/.mdl 历史遗留后缀
+            if (m2Path.empty()) {
+                wmoModel.doodads.push_back(WmoDoodadTemplate{}); // 保持与 MODD 原始下标 1:1 对齐
+                continue;
+            }
             if (m2Path.size() >= 4 && (m2Path.ends_with(".mdx") || m2Path.ends_with(".mdl"))) {
                 m2Path.replace(m2Path.size() - 4, 4, ".m2");
             }
@@ -202,6 +220,14 @@ public:
             localMat = glm::scale(localMat, glm::vec3(def.scale));
 
             wmoModel.doodads.push_back(WmoDoodadTemplate{ std::move(m2Path), localMat });
+        }
+
+        // 若个别 WMO 未包含 MODS 块，生成默认全局 Set 0 兜底
+        if (wmoModel.doodadSets.empty() && !wmoModel.doodads.empty()) {
+            WmoDoodadSet defaultSet{};
+            defaultSet.startIndex = 0;
+            defaultSet.count = static_cast<uint32_t>(wmoModel.doodads.size());
+            wmoModel.doodadSets.push_back(defaultSet);
         }
 
         // 4. 依次加载所有子房间文件 xxx_000.wmo ~ xxx_NNN.wmo

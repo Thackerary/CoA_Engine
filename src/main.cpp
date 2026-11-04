@@ -436,6 +436,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         }
                         if (inst.groupBounds.size() != model.groups.size()) continue;
 
+                        uint32_t wmoBaseInstance = UINT32_MAX;
                         // 3.2 逐个子房间测试世界空间包围盒
                         for (size_t g = 0; g < model.groups.size(); ++g) {
                             const auto& grp = model.groups[g];
@@ -446,8 +447,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
                             }
                             ++visibleWmoGroups;
 
-                            uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
-                            visibleMatrices.push_back(inst.model);
+                            if (wmoBaseInstance == UINT32_MAX) {
+                                wmoBaseInstance = static_cast<uint32_t>(visibleMatrices.size());
+                                visibleMatrices.push_back(inst.model);
+                            }
 
                             for (const auto& sb : grp.batches) {
                                 coa::rhi::DrawCommand cmd{};
@@ -464,7 +467,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                                 cmd.indexCount    = sb.indexCount;
                                 cmd.baseVertex    = 0;
                                 cmd.instanceCount = 1;
-                                cmd.baseInstance  = firstInstance;
+                                cmd.baseInstance  = wmoBaseInstance;
                                 renderQueue.push_back(cmd);
                             }
                         }

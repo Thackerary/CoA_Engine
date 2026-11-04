@@ -311,66 +311,68 @@ public:
             doodadGroups[m2Path].push_back(mat);
         }
 
-		// 4. 解析 MODF 大型建筑 (WMO) 并录入 SSBO 矩阵表
-        std::unordered_map<std::string, std::vector<glm::mat4>> wmoGroups;
+		// 4. 解析 MODF 大型建筑 (WMO) 并记录每个实例的变换矩阵与 doodadSet
+        struct WmoPlacement { glm::mat4 mat; uint16_t doodadSet; };
+        std::unordered_map<std::string, std::vector<WmoPlacement>> wmoGroups;
         for (const auto& entry : modfEntries) {
             if (entry.mwidIndex >= mwidOffsets.size()) continue;
             uint32_t strOffset = mwidOffsets[entry.mwidIndex];
             if (strOffset >= mwmoBlob.size()) continue;
 
             std::string wmoPath = vfs::VirtualFileSystem::NormalizeVirtualPath(mwmoBlob.data() + strOffset);
-            if (!seenUniqueIds.insert(entry.uniqueId).second) {
-                continue;
-            }
+            if (!seenUniqueIds.insert(entry.uniqueId).second) continue;
 
-            glm::vec3 worldPos(
-                kMapHalfSize - entry.pos.z,
-                kMapHalfSize - entry.pos.x,
-                entry.pos.y
-            );
-
+            glm::vec3 worldPos(kMapHalfSize - entry.pos.z, kMapHalfSize - entry.pos.x, entry.pos.y);
             glm::mat4 mat(1.0f);
             mat = glm::translate(mat, worldPos);
             mat = glm::rotate(mat, glm::radians(entry.rot.y - 180.0f), glm::vec3(0.0f, 0.0f, 1.0f));
             mat = glm::rotate(mat, glm::radians(-entry.rot.x),        glm::vec3(0.0f, 1.0f, 0.0f));
             mat = glm::rotate(mat, glm::radians(entry.rot.z),         glm::vec3(1.0f, 0.0f, 0.0f));
 
-            wmoGroups[wmoPath].push_back(mat);
+            wmoGroups[wmoPath].push_back({mat, entry.doodadSet});
         }
 
-        for (auto& [wmoPath, mats] : wmoGroups) {
+        for (auto& [wmoPath, placements] : wmoGroups) {
             auto wmoOpt = WmoLoader::LoadWmo(wmoPath, vfs, assets, fallbackWhiteTex);
             if (!wmoOpt) continue;
 
             GpuWmoBatch batch;
             batch.model = std::move(*wmoOpt);
-            batch.instances.reserve(mats.size());
+            batch.instances.reserve(placements.size());
 
             // 每个建筑实例一次性预计算整栋 + 各子房间的世界空间 AABB
-            for (const auto& instMat : mats) {
+            for (const auto& p : placements) {
                 WmoInstance inst{};
-                inst.model = instMat;
-                TransformLocalAABB(batch.model.localBoundsMin, batch.model.localBoundsMax, instMat,
+                inst.model = p.mat;
+                TransformLocalAABB(batch.model.localBoundsMin, batch.model.localBoundsMax, p.mat,
                                    inst.worldBoundsMin, inst.worldBoundsMax,
                                    inst.worldCenter, inst.worldRadius);
 
                 inst.groupBounds.resize(batch.model.groups.size());
                 for (size_t g = 0; g < batch.model.groups.size(); ++g) {
                     const auto& grp = batch.model.groups[g];
-                    TransformLocalAABB(grp.localBoundsMin, grp.localBoundsMax, instMat,
+                    TransformLocalAABB(grp.localBoundsMin, grp.localBoundsMax, p.mat,
                                        inst.groupBounds[g].worldBoundsMin, inst.groupBounds[g].worldBoundsMax,
                                        inst.groupBounds[g].worldCenter, inst.groupBounds[g].worldRadius);
                 }
                 batch.instances.push_back(std::move(inst));
             }
 
-            // 将 WMO 内部 MODD 家具按每个建筑世界实例矩阵展开，并入统一的 M2 实例化分组
-            for (const auto& d : batch.model.doodads) {
-                auto& instList = doodadGroups[d.m2Path];
-                instList.reserve(instList.size() + mats.size());
-                for (const auto& wmoWorldMat : mats) {
-                    instList.push_back(wmoWorldMat * d.localMatrix);
+            // 将 WMO 内部 MODD 家具按每个建筑实例激活的 doodadSet 展开，并入统一的 M2 实例化分组
+            auto appendDoodadSet = [&](uint16_t setIdx, const glm::mat4& wmoWorldMat) {
+                if (setIdx >= batch.model.doodadSets.size()) return;
+                const auto& ds = batch.model.doodadSets[setIdx];
+                size_t endIdx = std::min<size_t>(ds.startIndex + ds.count, batch.model.doodads.size());
+                for (size_t i = ds.startIndex; i < endIdx; ++i) {
+                    const auto& d = batch.model.doodads[i];
+                    if (!d.m2Path.empty()) {
+                        doodadGroups[d.m2Path].push_back(wmoWorldMat * d.localMatrix);
+                    }
                 }
+            };
+            for (const auto& p : placements) {
+                appendDoodadSet(0, p.mat); // Set 0 (DefaultGlobal) 始终激活
+                if (p.doodadSet != 0) appendDoodadSet(p.doodadSet, p.mat);
             }
 
             tile.wmoBatches.push_back(std::move(batch));
