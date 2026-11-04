@@ -254,15 +254,26 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
             lastProg = c.program;
             lastPass = 0xFF; // 新着色器必须重新下发一次 uniform
         }
-        // sortKey 高 4 位即 Pass ID (2 = 不透明, 3 = Alpha Cutout, 4 = 半透明水体)
+        // sortKey 高 4 位即 Pass ID (2=Opaque, 3=AlphaCutout, 4=MH2O水体, 5=M2半透明瀑布, 6=M2发光叠加)
         uint8_t pass = static_cast<uint8_t>(c.sortKey >> 60);
         if (pass != lastPass) {
             if (pass == 4) {
-                // Pass 4: 半透明水体 —— 开启 Alpha 混合、关闭深度写入(保留 Reverse-Z 深度测试)、关闭背面剔除
+                // Pass 4: MH2O 半透明水体 (使用专属 waterShader，无 location 0 uniform)
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDepthMask(GL_FALSE);
                 glDisable(GL_CULL_FACE);
+            } else if (pass == 5 || pass == 6) {
+                // Pass 5 / 6: M2 半透明水幕 (Pass 5) 与 Additive 发光 (Pass 6)，使用 worldShader
+                glEnable(GL_BLEND);
+                if (pass == 6) {
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                } else {
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                }
+                glDepthMask(GL_FALSE);
+                glDisable(GL_CULL_FACE);
+                glUniform1i(0, 2); // uAlphaCutout == 2 表示输出贴图真实 Alpha 通道
             } else {
                 // Pass 2 / 3: 不透明与 Alpha Cutout —— 关闭混合、恢复深度写入，并下发镂空开关
                 glDisable(GL_BLEND);

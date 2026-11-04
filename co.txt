@@ -1,2 +1,3 @@
 cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release -j
+python tools/extract_mpq_to_loose.py --data-dir "D:/WOW/CoA Client/Data" --out-dir "build/Release/CoA_Assets" --mode test

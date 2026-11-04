@@ -73,8 +73,10 @@ def read_file_from_mpq(storm, h_mpq, internal_path: str) -> bytes | None:
 BASE_MPQ_NAMES = {
     'common.mpq', 'common-2.mpq', 'expansion.mpq', 'lichking.mpq',
     'patch.mpq', 'patch-2.mpq', 'patch-3.mpq',
+    'backup-enus.mpq', 'base-enus.mpq',
     'locale-enus.mpq', 'locale-zhcn.mpq', 'speech-enus.mpq', 'speech-zhcn.mpq',
     'expansion-locale-enus.mpq', 'lichking-locale-enus.mpq',
+    'expansion-speech-enus.mpq', 'lichking-speech-enus.mpq',
     'patch-enus.mpq', 'patch-enus-2.mpq', 'patch-enus-3.mpq',
     'patch-zhcn.mpq', 'patch-zhcn-2.mpq', 'patch-zhcn-3.mpq',
 }
@@ -82,21 +84,32 @@ BASE_MPQ_NAMES = {
 def is_coa_patch_mpq(filename: str) -> bool:
     return filename.lower() not in BASE_MPQ_NAMES
 
-def mpq_priority_score(path: Path) -> int:
-    name = path.name.lower()
-    if 'patch' in name:
-        return 1000 + sum(ord(c) for c in name)
-    if 'lichking' in name:  return 400
-    if 'expansion' in name: return 300
-    if 'common-2' in name:  return 200
-    if 'common' in name:    return 100
-    return 50
+def mpq_priority_key(path: Path) -> tuple[int, str]:
+    stem = path.stem.lower() # 去掉 .mpq 后缀，避免 '.' (ASCII 46) 干扰比较
+    if stem == 'patch':
+        return (1000, '')
+    if stem.startswith('patch-enus') or stem.startswith('patch-zhcn'):
+        return (1100, stem)
+    if stem.startswith('patch-'):
+        tag = stem[6:] # 提取 'patch-' 之后的标识，如 '2', 'a', 'ca', 'wc3', 'z', 'zg'
+        # 数字补丁 (patch-2..9) 排在字母补丁 (patch-a..z) 之前，字母补丁严格按标准字典序比较
+        tier = 1200 if tag.isdigit() else 1300
+        return (tier, tag)
+    if 'lichking' in stem:  return (400, stem)
+    if 'expansion' in stem: return (300, stem)
+    if 'common-2' in stem:  return (200, stem)
+    if 'common' in stem:    return (100, stem)
+    return (50, stem)
 
 # ==================== 3. 自动解析 M2 模型内部引用的 BLP 贴图与 .skin ====================
 def parse_m2_dependencies(m2_rel_path: str, m2_bytes: bytes) -> list[str]:
     deps = []
     if m2_rel_path.endswith('.m2'):
         deps.append(m2_rel_path[:-3] + '00.skin')
+
+    # 兼容 CoA 从高版本移植的 MD21 8字节封装头
+    if len(m2_bytes) >= 0x60 and m2_bytes[:4] == b'MD21':
+        m2_bytes = m2_bytes[8:]
 
     # 检查 MD20 头 (至少 0x58 字节以读取 offset 0x50 处的 textures M2Array)
     if len(m2_bytes) < 0x58 or m2_bytes[:4] != b'MD20':
@@ -148,6 +161,27 @@ def parse_wmo_dependencies(wmo_rel_path: str, wmo_bytes: bytes) -> list[str]:
         for g in range(n_groups):
             deps.append(f"{base}_{g:03d}.wmo")
     return deps
+def parse_adt_dependencies(adt_bytes: bytes) -> list[str]:
+    """扫描 .ADT 内的 MTEX(地表贴图)、MMDX(全部户外M2，含跨资料片瀑布/藤蔓)、MWMO(全部建筑)"""
+    deps = []
+    pos = 0
+    while pos + 8 <= len(adt_bytes):
+        magic = adt_bytes[pos:pos+4]
+        size = struct.unpack_from('<I', adt_bytes, pos + 4)[0]
+        data_start = pos + 8
+        if data_start + size > len(adt_bytes):
+            break
+        chunk = adt_bytes[data_start : data_start + size]
+        if magic in (b'XETM', b'XDMM', b'OMWM'): # Reversed 'MTEX', 'MMDX', 'MWMO'
+            for raw_s in chunk.split(b'\x00'):
+                if len(raw_s) > 4:
+                    p = raw_s.decode('ascii', errors='ignore').replace('\\', '/').lower().lstrip('/')
+                    if p.endswith('.mdx') or p.endswith('.mdl'):
+                        p = p[:-4] + '.m2'
+                    if p.endswith(('.blp', '.m2', '.wmo')):
+                        deps.append(p)
+        pos = data_start + size
+    return deps
 # ==================== 4. 批量提取主流程 ====================
 TEST_PATTERNS = [
     'tileset/*.blp',
@@ -158,9 +192,10 @@ TEST_PATTERNS = [
     'world/maps/azeroth/azeroth_32_49.adt',
 ]
 
-def extract_group(storm, mpq_paths: list[Path], out_dir: Path, mode: str, custom_filter: str):
-    # 按优先级从高到低排序：同一个虚拟路径只从最高优先级的 MPQ 提取一次
-    mpq_paths = sorted(mpq_paths, key=mpq_priority_score, reverse=True)
+def extract_group(storm, mpq_paths: list[Path], out_dir: Path, mode: str, custom_filter: str,
+                  fallback_mpq_paths: list[Path] | None = None):
+    # 按修正后的字典序优先级从高到低排序
+    mpq_paths = sorted(mpq_paths, key=mpq_priority_key, reverse=True)
     handles = []
 
     for p in mpq_paths:
@@ -172,15 +207,29 @@ def extract_group(storm, mpq_paths: list[Path], out_dir: Path, mode: str, custom
     if not handles:
         return
 
+    # 挂载兜底 MPQ 集合（供 coa_patches 的 ADT/WMO 引用原版底包模型时跨包查找）
+    fallback_handles = []
+    if fallback_mpq_paths:
+        for p in sorted(fallback_mpq_paths, key=mpq_priority_key, reverse=True):
+            h = wintypes.HANDLE()
+            if storm.SFileOpenArchive(str(p), 0, MPQ_OPEN_READ_ONLY, ctypes.byref(h)):
+                fallback_handles.append((p.name, h))
+
+    all_search_handles = handles + fallback_handles
     extracted_set = set()
     pending_deps = set()
 
-    def save_virtual_file(rel_lower: str, data: bytes):
+    def save_virtual_file(rel_lower: str, data: bytes, source_mpq: str = ""):
         dest = out_dir / rel_lower
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
         extracted_set.add(rel_lower)
-        if rel_lower.endswith('.m2'):
+        if rel_lower.endswith('.adt'):
+            print(f"  [ADT Extracted] {rel_lower}  <-- from {source_mpq} ({len(data)} bytes)")
+            for dep in parse_adt_dependencies(data):
+                if dep not in extracted_set:
+                    pending_deps.add(dep)
+        elif rel_lower.endswith('.m2'):
             for dep in parse_m2_dependencies(rel_lower, data):
                 if dep not in extracted_set:
                     pending_deps.add(dep)
@@ -212,27 +261,29 @@ def extract_group(storm, mpq_paths: list[Path], out_dir: Path, mode: str, custom
             if matched:
                 data = read_file_from_mpq(storm, h_mpq, raw_line.strip())
                 if data:
-                    save_virtual_file(rel_lower, data)
+                    save_virtual_file(rel_lower, data, mpq_name)
 
-    # 2. 自动补齐 M2 模型依赖的所有 .skin 与跨目录 .blp 贴图
+    # 2. 递归补齐 ADT / WMO / M2 引用的所有跨资料片模型、子房间、.skin 与 .blp 贴图
     while pending_deps:
         dep_path = pending_deps.pop()
         if dep_path in extracted_set:
             continue
-        for _mpq_name, h_mpq in handles:
+        for mpq_name, h_mpq in all_search_handles:
             data = read_file_from_mpq(storm, h_mpq, dep_path)
             if data:
-                save_virtual_file(dep_path, data)
+                save_virtual_file(dep_path, data, mpq_name)
                 break
 
     for _name, h in handles:
+        storm.SFileCloseArchive(h)
+    for _name, h in fallback_handles:
         storm.SFileCloseArchive(h)
 
     print(f"  -> 已提取 {len(extracted_set)} 个文件至 {out_dir}\n")
 
 def main():
     parser = argparse.ArgumentParser(description="提取飞升服/3.3.5a MPQ 至全小写散文件目录")
-    parser.add_argument("--data-dir", required=True, help="飞升服客户端 Data 目录路径 (例如 D:/Ascension/Data)")
+    parser.add_argument("--data-dir", required=True, help="飞升服客户端 Data 目录路径 (例如 D:/WOW/CoA Client/Data)")
     parser.add_argument("--out-dir", default="build/Release/CoA_Assets", help="输出根目录 (默认项目内 CoA_Assets)")
     parser.add_argument("--dll", default="build/_deps/stormlib-build/Release/StormLib.dll", help="StormLib.dll 路径")
     parser.add_argument("--mode", choices=['test', 'all', 'filter'], default='test',
@@ -246,12 +297,12 @@ def main():
         print(f"[Error] Data 目录不存在: {data_dir}")
         sys.exit(1)
 
-    # 扫描 Data 目录及语言子目录中的所有 .MPQ
+    # 扫描 Data 目录及子目录 (含 enUS, area-52, Content 等) 中的所有 .MPQ
     all_mpqs = list(data_dir.glob("*.[mM][pP][qQ]"))
-    for loc in ("enUS", "zhCN", "enGB", "zhTW"):
-        loc_dir = data_dir / loc
-        if loc_dir.exists():
-            all_mpqs.extend(loc_dir.glob("*.[mM][pP][qQ]"))
+    for sub in ("enUS", "zhCN", "enGB", "zhTW", "area-52", "Content"):
+        sub_dir = data_dir / sub
+        if sub_dir.exists():
+            all_mpqs.extend(sub_dir.glob("*.[mM][pP][qQ]"))
 
     base_mpqs  = [p for p in all_mpqs if not is_coa_patch_mpq(p.name)]
     patch_mpqs = [p for p in all_mpqs if is_coa_patch_mpq(p.name)]
@@ -262,7 +313,7 @@ def main():
     extract_group(storm, base_mpqs, out_root / "wotlk_base", args.mode, args.filter)
 
     print(f"[2/2] 处理飞升服魔改补丁 ({len(patch_mpqs)} 个 MPQ) -> {out_root / 'coa_patches'}")
-    extract_group(storm, patch_mpqs, out_root / "coa_patches", args.mode, args.filter)
+    extract_group(storm, patch_mpqs, out_root / "coa_patches", args.mode, args.filter, fallback_mpq_paths=base_mpqs)
     print("=== 全部提取完成！ ===")
 
 if __name__ == "__main__":

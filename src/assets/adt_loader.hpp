@@ -182,6 +182,14 @@ struct GpuAdtTile {
     std::vector<GpuLiquidChunk> liquidChunks;    // 【新增】所有水体绘制区间
     glm::vec3                   suggestedCamPos{0.0f};
 
+    struct DebugPlacement {
+        std::string path;
+        glm::vec3   pos{0.0f};
+        float       scale = 1.0f;
+        bool        isWmo = false;
+    };
+    std::vector<DebugPlacement> debugPlacements;
+
     static GLuint CreateTerrainVAO() {
         GLuint vao = 0;
         glCreateVertexArrays(1, &vao);
@@ -342,20 +350,21 @@ public:
                 kMapHalfSize - entry.pos.x,
                 entry.pos.y
             );
-            float scale = static_cast<float>(entry.scale) / 1024.0f;
+            float scale = (entry.scale > 0) ? (static_cast<float>(entry.scale) / 1024.0f) : 1.0f;
 
             glm::mat4 mat(1.0f);
             mat = glm::translate(mat, worldPos);
-            // 魔兽 MDDF 欧拉角转 Z-Up 旋转矩阵
+            // 魔兽 MDDF 欧拉角转 Z-Up 旋转矩阵 (Noggit +Z 轴对应我方 -Y 轴，负负得正为 +entry.rot.x)
             mat = glm::rotate(mat, glm::radians(entry.rot.y - 180.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-            mat = glm::rotate(mat, glm::radians(-entry.rot.x),        glm::vec3(0.0f, 1.0f, 0.0f));
-            mat = glm::rotate(mat, glm::radians(entry.rot.z),         glm::vec3(1.0f, 0.0f, 0.0f));
+            mat = glm::rotate(mat, glm::radians(entry.rot.x),          glm::vec3(0.0f, 1.0f, 0.0f));
+            mat = glm::rotate(mat, glm::radians(entry.rot.z),          glm::vec3(1.0f, 0.0f, 0.0f));
             mat = glm::scale(mat, glm::vec3(scale));
 
             doodadGroups[m2Path].push_back(mat);
+            tile.debugPlacements.push_back({m2Path, worldPos, scale, false});
         }
 
-		// 4. 解析 MODF 大型建筑 (WMO) 并记录每个实例的变换矩阵与 doodadSet
+        // 4. 解析 MODF 大型建筑 (WMO) 并记录每个实例的变换矩阵与 doodadSet
         struct WmoPlacement { glm::mat4 mat; uint16_t doodadSet; };
         std::unordered_map<std::string, std::vector<WmoPlacement>> wmoGroups;
         for (const auto& entry : modfEntries) {
@@ -370,15 +379,20 @@ public:
             glm::mat4 mat(1.0f);
             mat = glm::translate(mat, worldPos);
             mat = glm::rotate(mat, glm::radians(entry.rot.y - 180.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-            mat = glm::rotate(mat, glm::radians(-entry.rot.x),        glm::vec3(0.0f, 1.0f, 0.0f));
-            mat = glm::rotate(mat, glm::radians(entry.rot.z),         glm::vec3(1.0f, 0.0f, 0.0f));
+            mat = glm::rotate(mat, glm::radians(entry.rot.x),          glm::vec3(0.0f, 1.0f, 0.0f));
+            mat = glm::rotate(mat, glm::radians(entry.rot.z),          glm::vec3(1.0f, 0.0f, 0.0f));
 
             wmoGroups[wmoPath].push_back({mat, entry.doodadSet});
+            tile.debugPlacements.push_back({wmoPath, worldPos, 1.0f, true});
         }
 
         for (auto& [wmoPath, placements] : wmoGroups) {
             auto wmoOpt = WmoLoader::LoadWmo(wmoPath, vfs, assets, fallbackWhiteTex);
-            if (!wmoOpt) continue;
+            if (!wmoOpt) {
+                std::fprintf(stderr, "[ADT Warning] Failed or skipped WMO building: %s (%zu instances)\n",
+                             wmoPath.c_str(), placements.size());
+                continue;
+            }
 
             GpuWmoBatch batch;
             batch.model = std::move(*wmoOpt);
@@ -426,7 +440,11 @@ public:
         // 5. 统一加载户外树木与 WMO 室内家具的 M2 模型，并逐实例预计算世界空间 AABB
         for (auto& [m2Path, mats] : doodadGroups) {
             auto modelOpt = M2Loader::LoadModel(m2Path, vfs, assets, fallbackWhiteTex);
-            if (!modelOpt) continue; // 若当前测试提取尚未提取该 M2，自动跳过
+            if (!modelOpt) {
+                std::fprintf(stderr, "[ADT Warning] Failed or skipped M2 model: %s (%zu instances)\n",
+                             m2Path.c_str(), mats.size());
+                continue;
+            }
 
             GpuDoodadBatch batch;
             batch.model = std::move(*modelOpt);

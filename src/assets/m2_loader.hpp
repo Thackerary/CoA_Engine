@@ -168,26 +168,45 @@ public:
         // 构造同目录下的 xxx00.skin 路径
         std::string skinPath = normPath.substr(0, normPath.size() - 3) + "00.skin";
 
-        auto m2BytesOpt   = vfs.ReadFile(normPath);
+        auto m2BytesOpt = vfs.ReadFile(normPath);
+        if (!m2BytesOpt) {
+            std::fprintf(stderr, "  -> [M2 Reason] Missing .m2 in VFS: %s\n", normPath.c_str());
+            return std::nullopt;
+        }
         auto skinBytesOpt = vfs.ReadFile(skinPath);
-        if (!m2BytesOpt || !skinBytesOpt) return std::nullopt;
+        if (!skinBytesOpt) {
+            std::fprintf(stderr, "  -> [M2 Reason] Missing 00.skin in VFS: %s\n", skinPath.c_str());
+            return std::nullopt;
+        }
 
         std::span<const uint8_t> m2Bytes(*m2BytesOpt);
         std::span<const uint8_t> skinBytes(*skinBytesOpt);
 
+        // 兼容 CoA 从高版本移植的 MD21 封装格式 (扫描定位内部真正的 "MD20" 起始偏移)
+        if (m2Bytes.size() >= sizeof(M2HeaderV264) + 8 && std::memcmp(m2Bytes.data(), "MD21", 4) == 0) {
+            m2Bytes = m2Bytes.subspan(8);
+        }
+
         if (m2Bytes.size() < sizeof(M2HeaderV264) || skinBytes.size() < sizeof(M2SkinHeader)) {
+            std::fprintf(stderr, "  -> [M2 Reason] File too small: %s\n", normPath.c_str());
             return std::nullopt;
         }
 
         M2HeaderV264 m2Hdr{};
         std::memcpy(&m2Hdr, m2Bytes.data(), sizeof(M2HeaderV264));
-        if (std::memcmp(m2Hdr.magic, "MD20", 4) != 0 || m2Hdr.vertices.count == 0) {
+        if (std::memcmp(m2Hdr.magic, "MD20", 4) != 0) {
+            std::fprintf(stderr, "  -> [M2 Reason] Bad magic (%.4s) in: %s\n", m2Hdr.magic, normPath.c_str());
+            return std::nullopt;
+        }
+        if (m2Hdr.vertices.count == 0) {
+            std::fprintf(stderr, "  -> [M2 Reason] 0 mesh vertices (particle-only M2): %s\n", normPath.c_str());
             return std::nullopt;
         }
 
         M2SkinHeader skinHdr{};
         std::memcpy(&skinHdr, skinBytes.data(), sizeof(M2SkinHeader));
         if (std::memcmp(skinHdr.magic, "SKIN", 4) != 0) {
+            std::fprintf(stderr, "  -> [M2 Reason] Bad SKIN magic in: %s\n", skinPath.c_str());
             return std::nullopt;
         }
 
@@ -250,35 +269,51 @@ public:
         gpuModel.localBoundsMin = localMin;
         gpuModel.localBoundsMax = localMax;
 
-        // 5. 将 M2Batch 材质与 M2SkinSection 子网格配对组装
+        // 5. 将 M2Batch 材质与 M2SkinSection 子网格配对组装 (支持多层半透明/瀑布/发光叠加)
         for (size_t sIdx = 0; sIdx < skinSubmeshes.size(); ++sIdx) {
             const auto& sec = skinSubmeshes[sIdx];
-            uint32_t firstIdx = static_cast<uint32_t>(sec.indexStart) + (static_cast<uint32_t>(sec.level) << 16);
-            if (firstIdx + sec.indexCount > globalIndices.size()) continue;
-
-            GpuM2Submesh sub{};
-            sub.firstIndex = firstIdx;
-            sub.indexCount = sec.indexCount;
-            sub.geosetId   = sec.skinSectionId;
-            sub.textureId  = fallbackWhiteTex;
-            sub.blendMode  = 0;
-
-            // 在 M2Batch 中查找绑定到当前子网格的第一层主材质与贴图
-            for (const auto& batch : skinBatches) {
-                if (batch.skinSectionIndex == sIdx) {
-                    if (batch.materialIndex < m2Mats.size()) {
-                        sub.blendMode = m2Mats[batch.materialIndex].blendMode;
-                    }
-                    if (batch.textureComboIndex < m2TexLut.size()) {
-                        uint16_t texDefIdx = m2TexLut[batch.textureComboIndex];
-                        if (texDefIdx < loadedTexHandles.size()) {
-                            sub.textureId = loadedTexHandles[texDefIdx];
-                        }
-                    }
-                    break;
+            uint32_t firstIdx = static_cast<uint32_t>(sec.indexStart);
+            if (globalIndices.size() > 65536u) {
+                uint32_t extIdx = firstIdx + (static_cast<uint32_t>(sec.level) << 16);
+                if (extIdx + sec.indexCount <= globalIndices.size()) {
+                    firstIdx = extIdx;
                 }
             }
-            gpuModel.submeshes.push_back(sub);
+            if (firstIdx + sec.indexCount > globalIndices.size()) continue;
+
+            bool matchedBatch = false;
+            for (const auto& batch : skinBatches) {
+                if (batch.skinSectionIndex != sIdx) continue;
+
+                GpuM2Submesh sub{};
+                sub.firstIndex = firstIdx;
+                sub.indexCount = sec.indexCount;
+                sub.geosetId   = sec.skinSectionId;
+                sub.textureId  = fallbackWhiteTex;
+                sub.blendMode  = 0;
+
+                if (batch.materialIndex < m2Mats.size()) {
+                    sub.blendMode = m2Mats[batch.materialIndex].blendMode;
+                }
+                if (batch.textureComboIndex < m2TexLut.size()) {
+                    uint16_t texDefIdx = m2TexLut[batch.textureComboIndex];
+                    if (texDefIdx < loadedTexHandles.size()) {
+                        sub.textureId = loadedTexHandles[texDefIdx];
+                    }
+                }
+                gpuModel.submeshes.push_back(sub);
+                matchedBatch = true;
+            }
+
+            if (!matchedBatch) {
+                GpuM2Submesh sub{};
+                sub.firstIndex = firstIdx;
+                sub.indexCount = sec.indexCount;
+                sub.geosetId   = sec.skinSectionId;
+                sub.textureId  = loadedTexHandles.empty() ? fallbackWhiteTex : loadedTexHandles.front();
+                sub.blendMode  = 0;
+                gpuModel.submeshes.push_back(sub);
+            }
         }
 
         return gpuModel;

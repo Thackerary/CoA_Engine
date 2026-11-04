@@ -199,7 +199,8 @@ void main() {
     float fogFactor = clamp(exp(-max(dist - 120.0, 0.0) * 0.0022), 0.0, 1.0);
     vec3 fogColor = vec3(0.53, 0.72, 0.92);
 
-    FragColor = vec4(mix(fogColor, litColor, fogFactor), 1.0);
+    float outAlpha = (uAlphaCutout == 2) ? texColor.a : 1.0;
+    FragColor = vec4(mix(fogColor, litColor, fogFactor), outAlpha);
 }
 )GLSL";
 
@@ -402,6 +403,19 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     winW = ev.window.data1;
                     winH = ev.window.data2;
                     glViewport(0, 0, winW, winH);
+                } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_P) {
+                    std::printf("\n=== [Scene Inspector] Camera Pos: (%.1f, %.1f, %.1f) ===\n",
+                                camPos.x, camPos.y, camPos.z);
+                    for (size_t t = 0; t < adtTiles.size(); ++t) {
+                        for (const auto& dp : adtTiles[t].debugPlacements) {
+                            float dist = glm::length(dp.pos - camPos);
+                            if (dist <= 120.0f) {
+                                std::printf("  [Tile %zu] [%s] dist=%5.1f scale=%.2f path=%s\n",
+                                            t, dp.isWmo ? "WMO" : "M2 ", dist, dp.scale, dp.path.c_str());
+                            }
+                        }
+                    }
+                    std::printf("========================================================\n\n");
                 } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_RIGHT) {
                     rightMouseDown = true;
                     SDL_SetWindowRelativeMouseMode(window, true);
@@ -506,7 +520,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     // 同一 M2 模型的每个子网格仅生成 1 条实例化 DrawCommand
                     for (const auto& sub : batch.model.submeshes) {
                         coa::rhi::DrawCommand cmd{};
-                        uint8_t pass      = (sub.blendMode == 1) ? 3 : 2;
+                        uint8_t pass = 2;
+                        if (sub.blendMode == 1) {
+                            pass = 3; // Alpha Cutout (树叶/栅栏)
+                        } else if (sub.blendMode == 2) {
+                            pass = 5; // Alpha Blend (瀑布水幕/半透明薄纱)
+                        } else if (sub.blendMode >= 3) {
+                            pass = 6; // Additive / Mod (火盆光晕/魔法水花)
+                        }
                         cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sub.textureId), 0);
                         cmd.program       = worldShader.Handle();
                         cmd.vao           = sharedM2Vao;
