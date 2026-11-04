@@ -133,6 +133,14 @@ def parse_wmo_dependencies(wmo_rel_path: str, wmo_bytes: bytes) -> list[str]:
                     p = raw_s.decode('ascii', errors='ignore').replace('\\', '/').lower().lstrip('/')
                     if p.endswith('.blp'):
                         deps.append(p)
+        elif magic == b'NDOM': # Reversed 'MODN' (WMO 内部 M2 家具路径池)
+            for raw_s in chunk.split(b'\x00'):
+                if len(raw_s) > 4:
+                    p = raw_s.decode('ascii', errors='ignore').replace('\\', '/').lower().lstrip('/')
+                    if p.endswith('.mdx') or p.endswith('.mdl'):
+                        p = p[:-4] + '.m2'
+                    if p.endswith('.m2'):
+                        deps.append(p)
         pos = data_start + size
 
     if n_groups > 0 and n_groups <= 512 and wmo_rel_path.endswith('.wmo'):
@@ -143,9 +151,9 @@ def parse_wmo_dependencies(wmo_rel_path: str, wmo_bytes: bytes) -> list[str]:
 # ==================== 4. 批量提取主流程 ====================
 TEST_PATTERNS = [
     'tileset/*.blp',
-    'world/azeroth/elwynn/passivedoodads/trees/*',
-    'world/azeroth/elwynn/passivedoodads/bushes/*',
-    'world/wmo/*',  # <-- 【修改这里】提取所有 WMO 建筑模型，并由依赖解析器自动拉取其所有墙面/屋顶 BLP 贴图
+    'world/azeroth/elwynn/*', # <-- 提取艾尔文森林所有树木、栅栏、路灯、矿车等 M2
+    'world/generic/*',        # <-- 提取人类城镇通用家具（酒桶、桌椅、书架、铁匠铺工具）
+    'world/wmo/*',
     'world/maps/azeroth/azeroth_32_48.adt',
     'world/maps/azeroth/azeroth_32_49.adt',
 ]
