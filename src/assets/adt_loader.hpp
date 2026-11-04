@@ -101,16 +101,41 @@ struct GpuMcnkChunk {
     glm::vec3 aabbMax{0.0f};
 };
 
+// M2 装饰物单实例：加载期已预计算世界空间裁剪数据
+struct M2Instance {
+    glm::mat4 model{1.0f};
+    glm::vec3 worldBoundsMin{0.0f};
+    glm::vec3 worldBoundsMax{0.0f};
+    glm::vec3 worldCenter{0.0f};
+    float     worldRadius = 0.0f;
+};
+
+// WMO 子房间在某个建筑实例下的世界空间裁剪数据
+struct WmoGroupCull {
+    glm::vec3 worldBoundsMin{0.0f};
+    glm::vec3 worldBoundsMax{0.0f};
+    glm::vec3 worldCenter{0.0f};
+    float     worldRadius = 0.0f;
+};
+
+// WMO 大型建筑单实例：整栋包围盒 + 各子房间包围盒
+struct WmoInstance {
+    glm::mat4 model{1.0f};
+    glm::vec3 worldBoundsMin{0.0f};
+    glm::vec3 worldBoundsMax{0.0f};
+    glm::vec3 worldCenter{0.0f};
+    float     worldRadius = 0.0f;
+    std::vector<WmoGroupCull> groupBounds;
+};
+
 // 同种 M2 装饰物的实例化批次
 struct GpuDoodadBatch {
-    GpuM2Model model;
-    uint32_t   baseInstance  = 0; // 在场景 SSBO 矩阵表中的起始下标
-    uint32_t   instanceCount = 0; // 该种树木/石头在本 ADT 中的总数量
+    GpuM2Model               model;
+    std::vector<M2Instance>  instances;
 };
 struct GpuWmoBatch {
-    GpuWmoModel model;
-    uint32_t    baseInstance  = 0;
-    uint32_t    instanceCount = 0;
+    GpuWmoModel               model;
+    std::vector<WmoInstance>  instances;
 };
 struct GpuAdtTile {
     rhi::GlBuffer               terrainVbo;
@@ -155,12 +180,28 @@ public:
                (static_cast<uint32_t>(static_cast<uint8_t>(tag[3])));
     }
 
+    // Arvo 仿射包围盒变换：由局部 AABB 与模型矩阵直接求世界空间 AABB 及包围球
+    static void TransformLocalAABB(const glm::vec3& bmin, const glm::vec3& bmax, const glm::mat4& m,
+                                   glm::vec3& outMin, glm::vec3& outMax,
+                                   glm::vec3& outCenter, float& outRadius) {
+        glm::vec3 localCenter  = 0.5f * (bmin + bmax);
+        glm::vec3 localExtents = 0.5f * (bmax - bmin);
+
+        outCenter = glm::vec3(m * glm::vec4(localCenter, 1.0f));
+        glm::vec3 worldExtents = glm::abs(glm::vec3(m[0])) * localExtents.x
+                               + glm::abs(glm::vec3(m[1])) * localExtents.y
+                               + glm::abs(glm::vec3(m[2])) * localExtents.z;
+
+        outMin    = outCenter - worldExtents;
+        outMax    = outCenter + worldExtents;
+        outRadius = glm::length(worldExtents);
+    }
+
     [[nodiscard]] static std::optional<GpuAdtTile> LoadAdt(
         std::string_view adtVirtualPath,
         const vfs::VirtualFileSystem& vfs,
         AssetManager& assets,
         GLuint fallbackWhiteTex,
-        std::vector<glm::mat4>& sharedInstanceMatrices,
         std::unordered_set<uint32_t>& seenUniqueIds)
     {
         auto fileOpt = vfs.ReadFile(adtVirtualPath);
@@ -302,11 +343,26 @@ public:
             if (!wmoOpt) continue;
 
             GpuWmoBatch batch;
-            batch.model         = std::move(*wmoOpt);
-            batch.baseInstance  = static_cast<uint32_t>(sharedInstanceMatrices.size());
-            batch.instanceCount = static_cast<uint32_t>(mats.size());
+            batch.model = std::move(*wmoOpt);
+            batch.instances.reserve(mats.size());
 
-            sharedInstanceMatrices.insert(sharedInstanceMatrices.end(), mats.begin(), mats.end());
+            // 每个建筑实例一次性预计算整栋 + 各子房间的世界空间 AABB
+            for (const auto& instMat : mats) {
+                WmoInstance inst{};
+                inst.model = instMat;
+                TransformLocalAABB(batch.model.localBoundsMin, batch.model.localBoundsMax, instMat,
+                                   inst.worldBoundsMin, inst.worldBoundsMax,
+                                   inst.worldCenter, inst.worldRadius);
+
+                inst.groupBounds.resize(batch.model.groups.size());
+                for (size_t g = 0; g < batch.model.groups.size(); ++g) {
+                    const auto& grp = batch.model.groups[g];
+                    TransformLocalAABB(grp.localBoundsMin, grp.localBoundsMax, instMat,
+                                       inst.groupBounds[g].worldBoundsMin, inst.groupBounds[g].worldBoundsMax,
+                                       inst.groupBounds[g].worldCenter, inst.groupBounds[g].worldRadius);
+                }
+                batch.instances.push_back(std::move(inst));
+            }
 
             // 将 WMO 内部 MODD 家具按每个建筑世界实例矩阵展开，并入统一的 M2 实例化分组
             for (const auto& d : batch.model.doodads) {
@@ -321,22 +377,31 @@ public:
         }
         std::printf("[ADT Loader] Loaded %zu WMO building types\n", tile.wmoBatches.size());
 
-        // 5. 统一加载户外树木与 WMO 室内家具的 M2 模型，录入 SSBO 矩阵表
+        // 5. 统一加载户外树木与 WMO 室内家具的 M2 模型，并逐实例预计算世界空间 AABB
         for (auto& [m2Path, mats] : doodadGroups) {
             auto modelOpt = M2Loader::LoadModel(m2Path, vfs, assets, fallbackWhiteTex);
             if (!modelOpt) continue; // 若当前测试提取尚未提取该 M2，自动跳过
 
             GpuDoodadBatch batch;
-            batch.model         = std::move(*modelOpt);
-            batch.baseInstance  = static_cast<uint32_t>(sharedInstanceMatrices.size());
-            batch.instanceCount = static_cast<uint32_t>(mats.size());
+            batch.model = std::move(*modelOpt);
+            batch.instances.reserve(mats.size());
 
-            sharedInstanceMatrices.insert(sharedInstanceMatrices.end(), mats.begin(), mats.end());
+            for (const auto& instMat : mats) {
+                M2Instance inst{};
+                inst.model = instMat;
+                TransformLocalAABB(batch.model.localBoundsMin, batch.model.localBoundsMax, instMat,
+                                   inst.worldBoundsMin, inst.worldBoundsMax,
+                                   inst.worldCenter, inst.worldRadius);
+                batch.instances.push_back(std::move(inst));
+            }
             tile.doodadBatches.push_back(std::move(batch));
         }
 
+        size_t totalM2Instances = 0;
+        for (const auto& b : tile.doodadBatches) totalM2Instances += b.instances.size();
+
         std::printf("[ADT Loader] Loaded %zu MCNK chunks, %zu unique M2 doodad types (%zu total instances)\n",
-                    tile.chunks.size(), tile.doodadBatches.size(), sharedInstanceMatrices.size() - 1);
+                    tile.chunks.size(), tile.doodadBatches.size(), totalM2Instances);
         return tile;
     }
 

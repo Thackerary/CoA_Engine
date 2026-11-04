@@ -122,6 +122,8 @@ struct GpuM2Model {
     rhi::GlBuffer               vbo;
     rhi::GlBuffer               ibo;
     std::vector<GpuM2Submesh>   submeshes;
+    glm::vec3                   localBoundsMin{-1.0f};
+    glm::vec3                   localBoundsMax{1.0f};
 
     // 创建全局共享的 M2 顶点格式 VAO (DSA 架构下所有 M2 模型共用同一个 VAO 即可)
     static GLuint CreateSharedVAO() {
@@ -211,6 +213,16 @@ public:
             return std::nullopt;
         }
 
+        // 1.5 统计 M2Vertex.pos 得到模型局部空间 AABB (供加载期世界空间包围盒预计算使用)
+        glm::vec3 localMin = m2Verts.front().pos;
+        glm::vec3 localMax = m2Verts.front().pos;
+        for (const auto& v : m2Verts) {
+            localMin = glm::min(localMin, v.pos);
+            localMax = glm::max(localMax, v.pos);
+        }
+        // 施加最小厚度防止扁平/零体积几何体退化导致视锥误剔除
+        localMax = localMin + glm::max(localMax - localMin, glm::vec3(0.05f));
+
         // 2. 解析 M2 内部引用的所有硬编码 BLP 贴图
         std::vector<GLuint> loadedTexHandles(m2TexDefs.size(), fallbackWhiteTex);
         for (size_t i = 0; i < m2TexDefs.size(); ++i) {
@@ -235,6 +247,8 @@ public:
         GpuM2Model gpuModel;
         gpuModel.vbo = rhi::GlBuffer(m2Verts.size_bytes(), m2Verts.data(), 0);
         gpuModel.ibo = rhi::GlBuffer(globalIndices.size() * sizeof(uint16_t), globalIndices.data(), 0);
+        gpuModel.localBoundsMin = localMin;
+        gpuModel.localBoundsMax = localMax;
 
         // 5. 将 M2Batch 材质与 M2SkinSection 子网格配对组装
         for (size_t sIdx = 0; sIdx < skinSubmeshes.size(); ++sIdx) {

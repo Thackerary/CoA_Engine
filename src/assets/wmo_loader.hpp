@@ -91,6 +91,8 @@ struct GpuWmoGroup {
     rhi::GlBuffer               vbo;
     rhi::GlBuffer               ibo;
     std::vector<GpuWmoSubBatch> batches;
+    glm::vec3                   localBoundsMin{-1.0f};
+    glm::vec3                   localBoundsMax{1.0f};
 };
 
 // WMO 内部家具模板 (M2 虚拟路径 + 已换算好的 WMO 局部空间变换矩阵)
@@ -102,6 +104,8 @@ struct WmoDoodadTemplate {
 struct GpuWmoModel {
     std::vector<GpuWmoGroup>       groups;
     std::vector<WmoDoodadTemplate> doodads; // 室内家具/摆设 (MODD)
+    glm::vec3                      localBoundsMin{-10.0f};
+    glm::vec3                      localBoundsMax{10.0f};
 };
 
 class WmoLoader {
@@ -178,6 +182,7 @@ public:
         // 3. 解析 MODD 内部家具摆设，换算为 WMO 局部空间变换矩阵
         GpuWmoModel wmoModel;
         wmoModel.groups.reserve(mohd.nGroups);
+        bool firstGroup = true;
 
         for (const auto& def : moddDefs) {
             uint32_t nameOfs = def.nameIndexAndFlags & 0xFFFFFFu;
@@ -209,6 +214,15 @@ public:
             if (!groupBytesOpt) continue;
 
             if (auto grp = ParseGroupFile(*groupBytesOpt, matTextures, matBlendModes, fallbackWhiteTex)) {
+                // 将所有子房间局部包围盒 union 到整栋建筑的父级包围盒
+                if (firstGroup) {
+                    wmoModel.localBoundsMin = grp->localBoundsMin;
+                    wmoModel.localBoundsMax = grp->localBoundsMax;
+                    firstGroup = false;
+                } else {
+                    wmoModel.localBoundsMin = glm::min(wmoModel.localBoundsMin, grp->localBoundsMin);
+                    wmoModel.localBoundsMax = glm::max(wmoModel.localBoundsMax, grp->localBoundsMax);
+                }
                 wmoModel.groups.push_back(std::move(*grp));
             }
         }
@@ -281,7 +295,18 @@ private:
             verts[i].uv     = (i < motvUVs.size())     ? motvUVs[i]     : glm::vec2(0.0f);
         }
 
+        // 统计 MOVT 顶点数组得到该子房间局部空间 AABB
+        glm::vec3 gmin = movtPositions.front();
+        glm::vec3 gmax = movtPositions.front();
+        for (const auto& p : movtPositions) {
+            gmin = glm::min(gmin, p);
+            gmax = glm::max(gmax, p);
+        }
+        gmax = gmin + glm::max(gmax - gmin, glm::vec3(0.05f));
+
         GpuWmoGroup group;
+        group.localBoundsMin = gmin;
+        group.localBoundsMax = gmax;
         group.vbo = rhi::GlBuffer(verts.size() * sizeof(WmoVertex), verts.data(), 0);
         group.ibo = rhi::GlBuffer(moviIndices.size() * sizeof(uint16_t), moviIndices.data(), 0);
 

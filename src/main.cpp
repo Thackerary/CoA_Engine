@@ -72,7 +72,18 @@ struct Frustum {
         return true;
     }
 };
-// 顶点着色器：通过 gl_BaseInstance + gl_InstanceID 从 1 号 SSBO 提取实例世界变换矩阵
+
+// 自适应距离剔除 + Reverse-Z 视锥体裁剪
+inline bool IsInstanceVisible(const Frustum& frustum, const glm::vec3& camPos,
+                              const glm::vec3& bmin, const glm::vec3& bmax,
+                              const glm::vec3& center, float radius) {
+    float maxDist = glm::clamp(80.0f + radius * 35.0f, 100.0f, 950.0f);
+    glm::vec3 d = center - camPos;
+    if (glm::dot(d, d) > maxDist * maxDist) return false;
+    return frustum.IntersectsAABB(bmin, bmax);
+}
+
+// 顶点着色器：通过 gl_BaseInstance + gl_InstanceID 从 0 号 SSBO 提取实例世界变换矩阵
 // 标准 GLSL 4.60 着色器：支持魔兽 Z-Up 半兰伯特光照 + 三色天光环境反射 + Alpha Cutout 树叶镂空
 constexpr std::string_view kWorldVertShader = R"GLSL(
 #version 460 core
@@ -88,8 +99,8 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSunDirAndIntensity;
 };
 
-layout(std430, binding = 1) readonly buffer InstanceBlock {
-    mat4 uModelMatrices[];
+layout(std430, binding = 0) readonly buffer InstanceBuffer {
+    mat4 uInstanceMatrices[];
 };
 
 out vec3 vWorldPos;
@@ -97,10 +108,10 @@ out vec3 vNormal;
 out vec2 vUV;
 
 void main() {
-    mat4 modelMat = uModelMatrices[gl_BaseInstance + gl_InstanceID];
+    mat4 modelMat = uInstanceMatrices[gl_BaseInstance + gl_InstanceID];
     vec4 worldPos = modelMat * vec4(aPos, 1.0);
     vWorldPos = worldPos.xyz;
-    vNormal   = mat3(modelMat) * aNormal;
+    vNormal   = normalize(mat3(modelMat) * aNormal);
     vUV       = aUV;
     gl_Position = uViewProj * worldPos;
 }
@@ -228,6 +239,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
         GLuint sharedM2Vao = coa::assets::GpuM2Model::CreateSharedVAO();
         GLuint terrainVao  = coa::assets::GpuAdtTile::CreateTerrainVAO();
 
+        // 每帧动态上传可见实例矩阵的 SSBO (binding = 0，与 FrameBlock UBO 空间相互独立)
+        coa::rhi::GlBuffer instanceSsbo(sizeof(glm::mat4), nullptr, GL_DYNAMIC_STORAGE_BIT);
+        instanceSsbo.BindAsStorageBuffer(0);
+
         coa::rhi::GlTexture2D whiteFallbackTex(1, 1, 1, coa::rhi::PixelFormat::RGBA8, true);
         const uint8_t whitePixel[4] = {180, 210, 140, 255}; // 浅草绿兜底色
         whiteFallbackTex.UploadUncompressedMip(0, 1, 1, whitePixel);
@@ -243,24 +258,19 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
         // 多 ADT 无缝拼接：同时加载北郡(32_48)与闪金镇(32_49)
         std::vector<coa::assets::GpuAdtTile> adtTiles;
-        std::vector<glm::mat4> ssboMats = {glm::mat4(1.0f)};
         std::unordered_set<uint32_t> seenUniqueIds;
 
         auto tile1 = coa::assets::AdtLoader::LoadAdt(
             "world/maps/azeroth/azeroth_32_48.adt",
-            vfs, assets, whiteFallbackTex.Handle(), ssboMats, seenUniqueIds
+            vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds
         );
         if (tile1) adtTiles.push_back(std::move(*tile1));
 
         auto tile2 = coa::assets::AdtLoader::LoadAdt(
             "world/maps/azeroth/azeroth_32_49.adt",
-            vfs, assets, whiteFallbackTex.Handle(), ssboMats, seenUniqueIds
+            vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds
         );
         if (tile2) adtTiles.push_back(std::move(*tile2));
-
-        // 所有 ADT 加载完成后，将合并后的实例矩阵一次性上传至 1 号 SSBO
-        coa::rhi::GlBuffer instanceSsbo(ssboMats.size() * sizeof(glm::mat4), ssboMats.data(), 0);
-        instanceSsbo.BindAsStorageBuffer(1);
 
         // 自动将摄像机瞬移至首个成功加载的 ADT 地形中心上空
         glm::vec3 camPos = (!adtTiles.empty()) ? adtTiles.front().suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
@@ -271,9 +281,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
         int visibleChunks = 0;
         int totalChunks = 0;
+        int visibleWmoGroups = 0;
+        int visibleM2Instances = 0;
         float titleTimer = 0.0f;
 
         std::vector<coa::rhi::DrawCommand> renderQueue;
+        std::vector<glm::mat4> visibleMatrices;
         bool running = true;
 
         while (running) {
@@ -332,11 +345,15 @@ int main(int /*argc*/, char* /*argv*/[]) {
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
             renderQueue.clear();
+            visibleMatrices.clear();
+            visibleMatrices.push_back(glm::mat4(1.0f)); // 下标 0 固定为单位阵，供 MCNK 地形复用
 
             // 每帧提取 Reverse-Z 视锥体
             Frustum camFrustum = Frustum::ExtractFromViewProj(uboData.viewProj);
             visibleChunks = 0;
             totalChunks = 0;
+            visibleWmoGroups = 0;
+            visibleM2Instances = 0;
 
             for (const auto& tile : adtTiles) {
                 // 1. 提交 MCNK 地形块，先按 AABB 进行视锥裁剪
@@ -358,7 +375,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.indexCount    = chunk.indexCount;
                     cmd.baseVertex    = chunk.baseVertex;
                     cmd.instanceCount = 1;
-                    cmd.baseInstance  = 0;
+                    cmd.baseInstance  = 0; // 复用下标 0 的单位阵
                     cmd.texAlbedo     = chunk.layerTex[0];
                     cmd.texLayers[0]  = chunk.layerTex[1];
                     cmd.texLayers[1]  = chunk.layerTex[2];
@@ -366,9 +383,26 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.texAlphaMap   = chunk.alphaMapTex;
                     renderQueue.push_back(cmd);
                 }
+            }
 
-                // 2. 批量提交整片森林的 M2 装饰物硬件实例化指令
+            // 2. M2 按模型分桶硬件实例化：每个 doodadBatch 的 model 指针即为唯一桶键
+            for (const auto& tile : adtTiles) {
                 for (const auto& batch : tile.doodadBatches) {
+                    uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
+                    uint32_t visibleCount  = 0;
+
+                    for (const auto& inst : batch.instances) {
+                        if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
+                                               inst.worldCenter, inst.worldRadius)) {
+                            continue;
+                        }
+                        visibleMatrices.push_back(inst.model);
+                        ++visibleCount;
+                    }
+                    if (visibleCount == 0) continue;
+                    visibleM2Instances += static_cast<int>(visibleCount);
+
+                    // 同一 M2 模型的每个子网格仅生成 1 条实例化 DrawCommand
                     for (const auto& sub : batch.model.submeshes) {
                         coa::rhi::DrawCommand cmd{};
                         uint8_t pass      = (sub.blendMode == 1) ? 3 : 2;
@@ -382,45 +416,77 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         cmd.firstIndex    = sub.firstIndex;
                         cmd.indexCount    = sub.indexCount;
                         cmd.baseVertex    = 0;
-                        cmd.instanceCount = batch.instanceCount;
-                        cmd.baseInstance  = batch.baseInstance;
+                        cmd.instanceCount = visibleCount;
+                        cmd.baseInstance  = firstInstance;
                         cmd.texAlphaMap   = blackAlphaTex.Handle();
                         renderQueue.push_back(cmd);
                     }
                 }
+            }
 
-                // 3. 批量提交 WMO 大型建筑 (教堂/酒馆/矿洞) 绘制指令 (复用 terrainVao)
+            // 3. WMO 两级层次化裁剪：先整栋建筑，再逐个子房间
+            for (const auto& tile : adtTiles) {
                 for (const auto& wmoBatch : tile.wmoBatches) {
-                    for (const auto& grp : wmoBatch.model.groups) {
-                        for (const auto& sb : grp.batches) {
-                            coa::rhi::DrawCommand cmd{};
-                            uint8_t pass      = (sb.blendMode == 1) ? 3 : 2;
-                            cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sb.textureId), 0);
-                            cmd.program       = worldShader.Handle();
-                            cmd.vao           = terrainVao;
-                            cmd.vbo           = grp.vbo.Handle();
-                            cmd.ibo           = grp.ibo.Handle();
-                            cmd.stride        = sizeof(coa::assets::WmoVertex);
-                            cmd.texAlbedo     = sb.textureId;
-                            cmd.texAlphaMap   = blackAlphaTex.Handle();
-                            cmd.firstIndex    = sb.firstIndex;
-                            cmd.indexCount    = sb.indexCount;
-                            cmd.baseVertex    = 0;
-                            cmd.instanceCount = wmoBatch.instanceCount;
-                            cmd.baseInstance  = wmoBatch.baseInstance;
-                            renderQueue.push_back(cmd);
+                    const auto& model = wmoBatch.model;
+                    for (const auto& inst : wmoBatch.instances) {
+                        // 3.1 整栋建筑不可见 -> 直接跳过其所有子房间
+                        if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
+                                               inst.worldCenter, inst.worldRadius)) {
+                            continue;
+                        }
+                        if (inst.groupBounds.size() != model.groups.size()) continue;
+
+                        // 3.2 逐个子房间测试世界空间包围盒
+                        for (size_t g = 0; g < model.groups.size(); ++g) {
+                            const auto& grp = model.groups[g];
+                            const auto& gc  = inst.groupBounds[g];
+                            if (!IsInstanceVisible(camFrustum, camPos, gc.worldBoundsMin, gc.worldBoundsMax,
+                                                   gc.worldCenter, gc.worldRadius)) {
+                                continue;
+                            }
+                            ++visibleWmoGroups;
+
+                            uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
+                            visibleMatrices.push_back(inst.model);
+
+                            for (const auto& sb : grp.batches) {
+                                coa::rhi::DrawCommand cmd{};
+                                uint8_t pass      = (sb.blendMode == 1) ? 3 : 2;
+                                cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sb.textureId), 0);
+                                cmd.program       = worldShader.Handle();
+                                cmd.vao           = terrainVao;
+                                cmd.vbo           = grp.vbo.Handle();
+                                cmd.ibo           = grp.ibo.Handle();
+                                cmd.stride        = sizeof(coa::assets::WmoVertex);
+                                cmd.texAlbedo     = sb.textureId;
+                                cmd.texAlphaMap   = blackAlphaTex.Handle();
+                                cmd.firstIndex    = sb.firstIndex;
+                                cmd.indexCount    = sb.indexCount;
+                                cmd.baseVertex    = 0;
+                                cmd.instanceCount = 1;
+                                cmd.baseInstance  = firstInstance;
+                                renderQueue.push_back(cmd);
+                            }
                         }
                     }
                 }
             }
+
+            // 将本帧可见实例的模型矩阵上传至 SSBO (binding = 0)，必要时按需扩容重建
+            size_t neededBytes = visibleMatrices.size() * sizeof(glm::mat4);
+            if (neededBytes > instanceSsbo.Size()) {
+                instanceSsbo = coa::rhi::GlBuffer(neededBytes, nullptr, GL_DYNAMIC_STORAGE_BIT);
+                instanceSsbo.BindAsStorageBuffer(0);
+            }
+            instanceSsbo.UpdateSubData(0, neededBytes, visibleMatrices.data());
 
             // 每 0.25 秒更新一次窗口标题，观察视锥裁剪统计
             titleTimer += dt;
             if (titleTimer >= 0.25f) {
                 char titleBuf[256];
                 std::snprintf(titleBuf, sizeof(titleBuf),
-                              "CoA Engine | Visible Chunks: %d / %d | Total Instances: %zu",
-                              visibleChunks, totalChunks, ssboMats.size() - 1);
+                              "CoA Engine | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Batched DrawCalls: %zu",
+                              visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances, renderQueue.size());
                 SDL_SetWindowTitle(window, titleBuf);
                 titleTimer = 0.0f;
             }
