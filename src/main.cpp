@@ -203,6 +203,104 @@ void main() {
 }
 )GLSL";
 
+// 水体顶点着色器：复用 TerrainVertex 布局，aNormal.z 即加载期预计算的精确几何水深
+constexpr std::string_view kWaterVertShader = R"GLSL(
+#version 460 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aUV;
+
+layout(std140, binding = 0) uniform FrameBlock {
+    mat4 uView;
+    mat4 uProj;
+    mat4 uViewProj;
+    vec4 uCameraPos;
+    vec4 uSunDirAndIntensity;
+};
+
+layout(std430, binding = 0) readonly buffer InstanceBuffer {
+    mat4 uInstanceMatrices[];
+};
+
+out vec3  vWorldPos;
+out vec2  vUV;
+out float vWaterDepth;
+
+void main() {
+    mat4 modelMat = uInstanceMatrices[gl_BaseInstance + gl_InstanceID];
+    vec4 worldPos = modelMat * vec4(aPos, 1.0);
+    vWorldPos   = worldPos.xyz;
+    vUV         = aUV;
+    vWaterDepth = aNormal.z;
+    gl_Position = uViewProj * worldPos;
+}
+)GLSL";
+
+// 水体片段着色器：解析正弦波法线 + Schlick 菲涅尔 + Beer-Lambert 深度透射 + 阳光高光
+constexpr std::string_view kWaterFragShader = R"GLSL(
+#version 460 core
+in vec3  vWorldPos;
+in vec2  vUV;
+in float vWaterDepth;
+
+layout(std140, binding = 0) uniform FrameBlock {
+    mat4 uView;
+    mat4 uProj;
+    mat4 uViewProj;
+    vec4 uCameraPos;          // xyz = 相机位置, w = 累计运行秒数
+    vec4 uSunDirAndIntensity;
+};
+
+out vec4 FragColor;
+
+void main() {
+    float time = uCameraPos.w;
+    vec3  V    = normalize(uCameraPos.xyz - vWorldPos);
+    vec3  L    = normalize(uSunDirAndIntensity.xyz);
+    vec3  H    = normalize(L + V);
+
+    // 1. 叠加 3 组不同方向与频率的正弦波，解析求偏导构造动态波浪法线
+    vec2 p  = vWorldPos.xy;
+    vec2 k0 = vec2( 0.41,  0.23);
+    vec2 k1 = vec2(-0.27,  0.52);
+    vec2 k2 = vec2( 0.63, -0.35);
+    float a0 = 0.16, a1 = 0.10, a2 = 0.06;
+
+    vec2 grad = a0 * k0 * cos(dot(p, k0) + time * 1.10)
+              + a1 * k1 * cos(dot(p, k1) + time * 1.55)
+              + a2 * k2 * cos(dot(p, k2) + time * 2.05);
+
+    vec3 N = normalize(vec3(-grad.x, -grad.y, 1.0));
+
+    // 2. Schlick 菲涅尔：掠射角反射上升
+    float fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+
+    // 3. Beer-Lambert 深度透射：浅水青绿 -> 深水暗蓝
+    float depthT      = clamp(vWaterDepth / 6.0, 0.0, 1.0);
+    vec3  shallowColor = vec3(0.16, 0.50, 0.48);
+    vec3  deepColor    = vec3(0.03, 0.14, 0.25);
+    vec3  waterColor   = mix(shallowColor, deepColor, depthT);
+
+    vec3  skyReflect = vec3(0.53, 0.72, 0.92);
+    vec3  sunColor   = vec3(1.0, 0.95, 0.85) * uSunDirAndIntensity.w;
+    float spec       = pow(max(dot(N, H), 0.0), 128.0) * 1.6;
+
+    vec3 waterLitColor = mix(waterColor, skyReflect, fresnel * 0.65) + sunColor * spec;
+
+    // 4. 岸边柔化与整体透明度
+    float shoreAlpha = smoothstep(0.0, 0.55, vWaterDepth);
+    float alpha = clamp(shoreAlpha * mix(0.45, 0.92,
+                    clamp(vWaterDepth * 0.25 + fresnel * 0.6, 0.0, 1.0)), 0.0, 0.95);
+
+    // 5. 与 kWorldFragShader 完全一致的指数距离雾，使远处水面融入天际
+    float dist = length(vWorldPos - uCameraPos.xyz);
+    float fogFactor = clamp(exp(-max(dist - 120.0, 0.0) * 0.0022), 0.0, 1.0);
+    vec3  fogColor  = vec3(0.53, 0.72, 0.92);
+
+    FragColor = vec4(mix(fogColor, waterLitColor, fogFactor), alpha);
+}
+)GLSL";
+
 int main(int /*argc*/, char* /*argv*/[]) {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
 
@@ -236,6 +334,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
         frameUbo.BindAsUniformBuffer(0);
 
         coa::rhi::GlShaderProgram worldShader(kWorldVertShader, kWorldFragShader);
+        coa::rhi::GlShaderProgram waterShader(kWaterVertShader, kWaterFragShader);
         GLuint sharedM2Vao = coa::assets::GpuM2Model::CreateSharedVAO();
         GLuint terrainVao  = coa::assets::GpuAdtTile::CreateTerrainVAO();
 
@@ -283,6 +382,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
         int totalChunks = 0;
         int visibleWmoGroups = 0;
         int visibleM2Instances = 0;
+        int visibleWaterChunks = 0;
         float titleTimer = 0.0f;
 
         std::vector<coa::rhi::DrawCommand> renderQueue;
@@ -337,7 +437,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
             uboData.view               = glm::lookAt(camPos, camPos + forward, worldUp);
             uboData.proj               = MakeInfiniteReverseZProj(glm::radians(60.0f), aspect, 0.2f);
             uboData.viewProj           = uboData.proj * uboData.view;
-            uboData.cameraPos          = glm::vec4(camPos, 1.0f);
+            uboData.cameraPos          = glm::vec4(camPos, static_cast<float>(nowTicks) * 1e-9f);
             uboData.sunDirAndIntensity = glm::vec4(glm::normalize(glm::vec3(-0.5f, -0.4f, 0.75f)), 1.1f);
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
 
@@ -354,6 +454,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
             totalChunks = 0;
             visibleWmoGroups = 0;
             visibleM2Instances = 0;
+            visibleWaterChunks = 0;
 
             for (const auto& tile : adtTiles) {
                 // 1. 提交 MCNK 地形块，先按 AABB 进行视锥裁剪
@@ -475,6 +576,32 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 }
             }
 
+            // 4. MH2O 半透明水体 (Pass 4)：按水面 AABB 视锥裁剪后，复用下标 0 的单位阵实例绘制
+            for (const auto& tile : adtTiles) {
+                if (tile.liquidChunks.empty() || tile.liquidVbo.Handle() == 0) continue;
+                for (const auto& lchunk : tile.liquidChunks) {
+                    if (!camFrustum.IntersectsAABB(lchunk.aabbMin, lchunk.aabbMax)) {
+                        continue;
+                    }
+                    ++visibleWaterChunks;
+
+                    coa::rhi::DrawCommand cmd{};
+                    cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(4, 2, static_cast<uint16_t>(lchunk.liquidType), 0);
+                    cmd.program       = waterShader.Handle();
+                    cmd.vao           = terrainVao;
+                    cmd.vbo           = tile.liquidVbo.Handle();
+                    cmd.ibo           = tile.liquidIbo.Handle();
+                    cmd.stride        = sizeof(coa::assets::TerrainVertex);
+                    cmd.texAlbedo     = whiteFallbackTex.Handle();
+                    cmd.firstIndex    = lchunk.firstIndex;
+                    cmd.indexCount    = lchunk.indexCount;
+                    cmd.baseVertex    = 0;
+                    cmd.instanceCount = 1;
+                    cmd.baseInstance  = 0; // 复用下标 0 的单位阵
+                    renderQueue.push_back(cmd);
+                }
+            }
+
             // 将本帧可见实例的模型矩阵上传至 SSBO (binding = 0)，必要时按需扩容重建
             size_t neededBytes = visibleMatrices.size() * sizeof(glm::mat4);
             if (neededBytes > instanceSsbo.Size()) {
@@ -488,8 +615,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
             if (titleTimer >= 0.25f) {
                 char titleBuf[256];
                 std::snprintf(titleBuf, sizeof(titleBuf),
-                              "CoA Engine | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Batched DrawCalls: %zu",
-                              visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances, renderQueue.size());
+                              "CoA Engine | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
+                              visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances,
+                              visibleWaterChunks, renderQueue.size());
                 SDL_SetWindowTitle(window, titleBuf);
                 titleTimer = 0.0f;
             }

@@ -254,10 +254,21 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
             lastProg = c.program;
             lastPass = 0xFF; // 新着色器必须重新下发一次 uniform
         }
-        // sortKey 高 4 位即 Pass ID (2 = 不透明, 3 = Alpha Cutout)
+        // sortKey 高 4 位即 Pass ID (2 = 不透明, 3 = Alpha Cutout, 4 = 半透明水体)
         uint8_t pass = static_cast<uint8_t>(c.sortKey >> 60);
         if (pass != lastPass) {
-            glUniform1i(0, (pass == 3) ? 1 : 0);
+            if (pass == 4) {
+                // Pass 4: 半透明水体 —— 开启 Alpha 混合、关闭深度写入(保留 Reverse-Z 深度测试)、关闭背面剔除
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+                glDisable(GL_CULL_FACE);
+            } else {
+                // Pass 2 / 3: 不透明与 Alpha Cutout —— 关闭混合、恢复深度写入，并下发镂空开关
+                glDisable(GL_BLEND);
+                glDepthMask(GL_TRUE);
+                glUniform1i(0, (pass == 3) ? 1 : 0);
+            }
             lastPass = pass;
         }
         if (c.vao != lastVao) {
@@ -297,6 +308,10 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
             c.baseInstance
         );
     }
+
+    // 关键状态恢复：防止下一帧 glClear(GL_DEPTH_BUFFER_BIT) 因深度写入关闭而失效
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
 }
 
 } // namespace coa::rhi

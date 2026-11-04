@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -58,6 +59,29 @@ struct MclyEntry {
     int32_t  effectId;
 };
 
+// MH2O 水体块头 (12 字节)：每个 MCNK 索引对应一个
+struct Mh2oChunkHeader {
+    uint32_t ofsInstances;  // 相对于 MH2O 数据块起始处(跳过8字节头)的偏移
+    uint32_t layerCount;    // 水体层数 (0 = 无水)
+    uint32_t ofsAttributes;
+};
+static_assert(sizeof(Mh2oChunkHeader) == 12, "Mh2oChunkHeader must be 12 bytes");
+
+// MH2O 单层水体实例 (24 字节)
+struct Mh2oInstance {
+    uint16_t liquidType;
+    uint16_t liquidVertexFormat; // 0 = Height+Depth, 1 = Height+UV, 2 = DepthOnly, 3 = Height+UV+Depth
+    float    minHeightLevel;
+    float    maxHeightLevel;
+    uint8_t  xOffset;            // 列偏移 c (0..7)
+    uint8_t  yOffset;            // 行偏移 r (0..7)
+    uint8_t  width;              // 列宽 (1..8)
+    uint8_t  height;             // 行高 (1..8)
+    uint32_t ofsExistsBitmap;    // 8x8 子格存在掩码偏移 (0 = 全部存在)
+    uint32_t ofsVertexData;      // 顶点数据偏移 (0 = 恒取 minHeightLevel)
+};
+static_assert(sizeof(Mh2oInstance) == 24, "Mh2oInstance must be 24 bytes");
+
 // MDDF 装饰物 (M2 树木/石头/灌木) 摆放信息 (36 字节)
 struct MddfEntry {
     uint32_t mmidIndex; // 对应 MMID 数组下标
@@ -97,6 +121,15 @@ struct GpuMcnkChunk {
     uint32_t indexCount = 768;
     GLuint   layerTex[4]  = {0, 0, 0, 0}; // 【修改】将原来的 baseTexId 改为 4 层贴图句柄数组
     GLuint   alphaMapTex  = 0;            // 【新增】当前块的 64x64 RGB Alpha 遮罩纹理句柄
+    glm::vec3 aabbMin{0.0f};
+    glm::vec3 aabbMax{0.0f};
+};
+
+// 单个 MH2O 水体实例在合并液态 VBO/IBO 中的绘制区间
+struct GpuLiquidChunk {
+    uint32_t  firstIndex = 0;
+    uint32_t  indexCount = 0;
+    uint16_t  liquidType = 0;
     glm::vec3 aabbMin{0.0f};
     glm::vec3 aabbMax{0.0f};
 };
@@ -144,6 +177,9 @@ struct GpuAdtTile {
     std::vector<GpuDoodadBatch> doodadBatches;
 	std::vector<GpuWmoBatch>    wmoBatches; // 【新增】当前 ADT 上的所有 WMO 大型建筑批次
 	std::vector<rhi::GlTexture2D> alphaTextures; // 【新增在 GpuAdtTile 内】托管所有 MCNK 的 64x64 遮罩纹理
+    rhi::GlBuffer               liquidVbo;       // 【新增】MH2O 水面合并顶点缓冲
+    rhi::GlBuffer               liquidIbo;       // 【新增】MH2O 水面合并索引缓冲
+    std::vector<GpuLiquidChunk> liquidChunks;    // 【新增】所有水体绘制区间
     glm::vec3                   suggestedCamPos{0.0f};
 
     static GLuint CreateTerrainVAO() {
@@ -215,6 +251,7 @@ public:
 		std::span<const char>      mwmoBlob;
         std::span<const uint32_t>  mwidOffsets;
         std::span<const ModfEntry> modfEntries;
+        std::span<const uint8_t>   mh2oChunkData;
         std::vector<TerrainVertex> allVerts;
         allVerts.reserve(256 * 145);
 
@@ -256,6 +293,8 @@ public:
             } else if (magic == FourCC("MODF")) {
                 modfEntries = std::span<const ModfEntry>(reinterpret_cast<const ModfEntry*>(chunkData.data()),
                                                          chunkData.size() / sizeof(ModfEntry));
+            } else if (magic == FourCC("MH2O")) {
+                mh2oChunkData = chunkData;
             } else if (magic == FourCC("MCNK") && size >= sizeof(McnkHeader)) {
                 // 解析单个 MCNK 地形块 (包含 8 字节头在内的起始位置为 cursor)
                 auto mcnkFullSpan = bytes.subspan(cursor, size + 8);
@@ -266,6 +305,11 @@ public:
         }
 
         if (tile.chunks.empty()) return std::nullopt;
+
+        // 1.5 解析 MH2O 水体层 (必须放在全部 MCNK 顶点写入 allVerts 之后)
+        if (!mh2oChunkData.empty()) {
+            ParseMh2oChunk(mh2oChunkData, allVerts, tile);
+        }
 
         // 2. 上传地形合并 VBO 与 IBO
         tile.terrainVbo = rhi::GlBuffer(allVerts.size() * sizeof(TerrainVertex), allVerts.data(), 0);
@@ -408,6 +452,141 @@ public:
     }
 
 private:
+    // 解析 MH2O 水体：还原每层子格水面高度，按河床高度计算精确水深，生成 Pass 4 几何
+    static void ParseMh2oChunk(
+        std::span<const uint8_t> mh2oChunkData,
+        const std::vector<TerrainVertex>& allVerts,
+        GpuAdtTile& tile)
+    {
+        if (mh2oChunkData.size() < 256 * sizeof(Mh2oChunkHeader)) return;
+
+        std::vector<TerrainVertex> liquidVerts;
+        std::vector<uint16_t>      liquidIndices;
+
+        const size_t chunkCount = std::min<size_t>(256, tile.chunks.size());
+        for (size_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
+            Mh2oChunkHeader hdr{};
+            std::memcpy(&hdr, mh2oChunkData.data() + chunkIdx * sizeof(Mh2oChunkHeader), sizeof(Mh2oChunkHeader));
+            if (hdr.layerCount == 0) continue;
+            if (hdr.ofsInstances + hdr.layerCount * sizeof(Mh2oInstance) > mh2oChunkData.size()) continue;
+
+            // 该 MCNK 的 145 个地形顶点必须已存在于合并顶点数组中
+            if ((chunkIdx + 1) * 145 > allVerts.size()) continue;
+
+            for (uint32_t layer = 0; layer < hdr.layerCount; ++layer) {
+                Mh2oInstance inst{};
+                std::memcpy(&inst,
+                            mh2oChunkData.data() + hdr.ofsInstances + layer * sizeof(Mh2oInstance),
+                            sizeof(Mh2oInstance));
+
+                if (inst.xOffset >= 8 || inst.yOffset >= 8) continue;
+                if (inst.width < 1 || inst.height < 1) continue;
+                if (inst.xOffset + inst.width > 8 || inst.yOffset + inst.height > 8) continue;
+
+                const uint32_t wVerts = static_cast<uint32_t>(inst.width) + 1u;
+                const uint32_t hVerts = static_cast<uint32_t>(inst.height) + 1u;
+                const uint32_t vCount = wVerts * hVerts;
+
+                // 可选的高度表 (格式 2 = DepthOnly 无高度数据)
+                const float* heightTable = nullptr;
+                if (inst.ofsVertexData != 0 && inst.liquidVertexFormat != 2 &&
+                    static_cast<size_t>(inst.ofsVertexData) + static_cast<size_t>(vCount) * sizeof(float) <= mh2oChunkData.size())
+                {
+                    heightTable = reinterpret_cast<const float*>(mh2oChunkData.data() + inst.ofsVertexData);
+                }
+
+                const uint32_t vertexBase = static_cast<uint32_t>(liquidVerts.size());
+                glm::vec3 aabbMin(0.0f);
+                glm::vec3 aabbMax(0.0f);
+                bool hasBounds = false;
+
+                // 1. 逐顶点：水面高度 + 从河床高度求真实几何水深 (存入 normal.z)
+                for (uint32_t dy = 0; dy < hVerts; ++dy) {
+                    for (uint32_t dx = 0; dx < wVerts; ++dx) {
+                        const uint32_t r = static_cast<uint32_t>(inst.yOffset) + dy;
+                        const uint32_t c = static_cast<uint32_t>(inst.xOffset) + dx;
+                        const glm::vec3& bedPos = allVerts[chunkIdx * 145 + r * 17 + c].pos;
+
+                        float waterZ = inst.minHeightLevel;
+                        if (heightTable != nullptr) {
+                            float h = heightTable[dy * wVerts + dx];
+                            if (!std::isfinite(h) || (h == 0.0f && std::fabs(inst.minHeightLevel) > 1e-4f)) {
+                                waterZ = inst.minHeightLevel;
+                            } else {
+                                waterZ = h;
+                            }
+                        }
+
+                        const float waterDepth = std::max(0.0f, waterZ - bedPos.z);
+
+                        TerrainVertex v{};
+                        v.pos    = glm::vec3(bedPos.x, bedPos.y, waterZ);
+                        v.normal = glm::vec3(0.0f, 0.0f, waterDepth); // 借用 normal.z 传递精确几何水深
+                        v.uv     = glm::vec2(static_cast<float>(c), static_cast<float>(r));
+                        liquidVerts.push_back(v);
+
+                        if (!hasBounds) {
+                            aabbMin  = v.pos;
+                            aabbMax  = v.pos;
+                            hasBounds = true;
+                        } else {
+                            aabbMin = glm::min(aabbMin, v.pos);
+                            aabbMax = glm::max(aabbMax, v.pos);
+                        }
+                    }
+                }
+
+                // 2. 逐子格生成 2 个逆时针三角形 (tl, bl, br) 与 (tl, br, tr)
+                const uint32_t firstIndex = static_cast<uint32_t>(liquidIndices.size());
+                for (uint32_t dy = 0; dy < inst.height; ++dy) {
+                    for (uint32_t dx = 0; dx < inst.width; ++dx) {
+                        // 8x8 子格存在掩码：bit = 1 才生成水面，否则为空洞 (如码头缝隙)
+                        if (inst.ofsExistsBitmap != 0) {
+                            const uint32_t bitIdx  = dy * static_cast<uint32_t>(inst.width) + dx;
+                            const size_t   byteOfs = static_cast<size_t>(inst.ofsExistsBitmap) + (bitIdx >> 3);
+                            if (byteOfs >= mh2oChunkData.size()) continue;
+                            const uint8_t maskByte = mh2oChunkData[byteOfs];
+                            if ((maskByte & (1u << (bitIdx & 7u))) == 0) continue;
+                        }
+
+                        const uint16_t tl = static_cast<uint16_t>(vertexBase + dy * wVerts + dx);
+                        const uint16_t tr = static_cast<uint16_t>(tl + 1);
+                        const uint16_t bl = static_cast<uint16_t>(vertexBase + (dy + 1) * wVerts + dx);
+                        const uint16_t br = static_cast<uint16_t>(bl + 1);
+                        liquidIndices.insert(liquidIndices.end(), { tl, bl, br, tl, br, tr });
+                    }
+                }
+
+                const uint32_t indexCount = static_cast<uint32_t>(liquidIndices.size()) - firstIndex;
+                if (indexCount == 0) {
+                    // 所有子格都被掩码剔除，回收刚追加的顶点
+                    liquidVerts.resize(vertexBase);
+                    continue;
+                }
+
+                // 水面近乎水平，强制至少 0.5 码厚度，避免视锥 AABB 退化
+                if (hasBounds && (aabbMax.z - aabbMin.z) < 0.5f) {
+                    aabbMax.z = aabbMin.z + 0.5f;
+                }
+
+                GpuLiquidChunk liquidChunk{};
+                liquidChunk.firstIndex = firstIndex;
+                liquidChunk.indexCount = indexCount;
+                liquidChunk.liquidType = inst.liquidType;
+                liquidChunk.aabbMin    = aabbMin;
+                liquidChunk.aabbMax    = aabbMax;
+                tile.liquidChunks.push_back(liquidChunk);
+            }
+        }
+
+        if (liquidVerts.empty() || liquidIndices.empty()) return;
+
+        tile.liquidVbo = rhi::GlBuffer(liquidVerts.size() * sizeof(TerrainVertex), liquidVerts.data(), 0);
+        tile.liquidIbo = rhi::GlBuffer(liquidIndices.size() * sizeof(uint16_t), liquidIndices.data(), 0);
+
+        std::printf("[ADT Loader] Loaded %zu MH2O liquid chunks\n", tile.liquidChunks.size());
+    }
+
     static void ParseNullTerminatedStrings(std::span<const uint8_t> blob, std::vector<std::string>& outList) {
         size_t start = 0;
         for (size_t i = 0; i < blob.size(); ++i) {
