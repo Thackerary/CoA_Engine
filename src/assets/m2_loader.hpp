@@ -685,16 +685,15 @@ public:
         // ==================== 解析 3.3.5a 粒子发射器 (476 字节 M2ParticleDefV264) ====================
         auto particleDefs = getSpan.template operator()<M2ParticleDefV264>(m2Bytes, m2Hdr.particleEmitters);
         if (!particleDefs.empty()) {
-            // 浮点轨统一取前 4 帧均值，抑制异常单帧；结果为 0 时回落到合理默认值
-            auto sampleTrackFloat = [&](const M2TrackBase& track, float fallback, float defaultIfZero) -> float {
+            // 浮点轨统一取前 4 帧均值，抑制异常单帧；无关键帧才回落到 fallback，
+            // 真实值 0 必须保留，用于识别 Stand 待机状态下的休眠发射器
+            auto sampleTrackFloat = [&](const M2TrackBase& track, float fallback) -> float {
                 auto anim = ExtractTrack<float, float>(m2Bytes, track, sequences, [](float v) { return v; });
                 if (anim.values.empty()) return fallback;
                 const size_t n = std::min<size_t>(anim.values.size(), 4);
                 float sum = 0.0f;
                 for (size_t k = 0; k < n; ++k) sum += anim.values[k];
-                const float v = sum / static_cast<float>(n);
-                if (std::fabs(v) < 1e-6f && defaultIfZero != 0.0f) return defaultIfZero;
-                return v;
+                return sum / static_cast<float>(n);
             };
             // M2FakeAnimBlock 的值数组存在两种落盘布局：
             //   1) 一维直接存储: values 直接指向 DiskT[kCount]
@@ -754,35 +753,73 @@ public:
                 const uint16_t texIdx = static_cast<uint16_t>(pDef.texture & 0x1Fu);
                 em.textureId = (texIdx < loadedTexHandles.size()) ? loadedTexHandles[texIdx] : fallbackWhiteTex;
 
-                em.speed        = sampleTrackFloat(pDef.emissionSpeed,      2.5f,  2.5f);
-                em.speedVary    = sampleTrackFloat(pDef.speedVariation,     0.2f,  0.0f);
-                em.vertRange    = sampleTrackFloat(pDef.verticalRange,      0.2f,  0.0f);
-                em.horizRange   = sampleTrackFloat(pDef.horizontalRange,    0.2f,  0.0f);
-                em.gravity      = sampleTrackFloat(pDef.gravity,            0.0f,  0.0f);
-                em.lifespan     = std::max(sampleTrackFloat(pDef.lifespan,      2.5f,  2.5f),  0.25f);
-                em.emissionRate = std::max(sampleTrackFloat(pDef.emissionRate, 12.0f, 12.0f), 0.0f);
-                em.areaLength   = sampleTrackFloat(pDef.emissionAreaLength, 0.5f,  0.0f);
-                em.areaWidth    = sampleTrackFloat(pDef.emissionAreaWidth,  0.5f,  0.0f);
+                // Stand 待机状态下 emissionRate 为 0 的发射器视为休眠，直接跳过 (避免静止马车冒烟)
+                em.emissionRate = sampleTrackFloat(pDef.emissionRate, 0.0f);
+                if (em.emissionRate <= 0.05f) continue;
+
+                em.speed      = sampleTrackFloat(pDef.emissionSpeed, 0.0f); // 保留灯笼光晕的 0 速度
+                em.speedVary  = sampleTrackFloat(pDef.speedVariation, 0.2f);
+                em.vertRange  = sampleTrackFloat(pDef.verticalRange,  0.2f);
+                em.horizRange = sampleTrackFloat(pDef.horizontalRange, 0.2f);
+                em.gravity    = sampleTrackFloat(pDef.gravity,        0.0f);
+                em.lifespan   = std::max(sampleTrackFloat(pDef.lifespan, 2.0f), 0.25f);
+                em.areaLength = sampleTrackFloat(pDef.emissionAreaLength, 0.5f);
+                em.areaWidth  = sampleTrackFloat(pDef.emissionAreaWidth,  0.5f);
 
                 applyColorTriple(
                     extractFakeValues.template operator()<glm::vec3>(pDef.colorTrack), em);
 
                 const auto alphaRaw = extractFakeValues.template operator()<uint16_t>(pDef.alphaTrack);
+                uint16_t maxA = 0;
+                for (uint16_t a : alphaRaw) maxA = std::max(maxA, a);
+                // 3.3.5a 磁盘 alpha 存在 0..255 与 0..32767 两种量纲，按实测最大值自适应选择标度
+                const float alphaScale = (maxA > 0 && maxA <= 255) ? (1.0f / 255.0f) : (1.0f / 32767.0f);
                 std::vector<float> alphaNorm;
                 alphaNorm.reserve(alphaRaw.size());
                 for (uint16_t a : alphaRaw) {
-                    alphaNorm.push_back(std::clamp(static_cast<float>(a) / 32767.0f, 0.0f, 1.0f));
+                    alphaNorm.push_back(std::clamp(static_cast<float>(a) * alphaScale, 0.0f, 1.0f));
                 }
                 applyAlphaTriple(alphaNorm, em);
 
                 applyScaleTriple(
                     extractFakeValues.template operator()<glm::vec2>(pDef.scaleTrack), em);
 
+                // 可见性兜底：动画数据缺失/全零时给出柔和且合理的三段默认曲线
+                if (std::max({em.alphaStart, em.alphaMid, em.alphaEnd}) < 0.05f) {
+                    em.alphaStart = 0.2f;
+                    em.alphaMid   = 0.65f;
+                    em.alphaEnd   = 0.0f;
+                }
+                if (std::max({em.scaleStart, em.scaleMid, em.scaleEnd}) < 0.05f) {
+                    em.scaleStart = 0.4f;
+                    em.scaleMid   = 1.2f;
+                    em.scaleEnd   = 2.2f;
+                }
+                if (glm::length(em.colorStart) + glm::length(em.colorMid) < 0.05f) {
+                    em.colorStart = glm::vec3(0.75f);
+                    em.colorMid   = glm::vec3(0.75f);
+                    em.colorEnd   = glm::vec3(0.75f);
+                }
+
                 gpuModel.particleEmitters.push_back(em);
             }
 
-            std::printf("[M2] %s -> %zu particle emitters (hasMesh=%d)\n",
-                        normPath.c_str(), gpuModel.particleEmitters.size(), hasMesh ? 1 : 0);
+            // 含粒子模型扩大保守包围盒，防止 housesmoke 等纯特效层被视锥裁剪
+            if (!gpuModel.particleEmitters.empty()) {
+                gpuModel.localBoundsMin = glm::min(gpuModel.localBoundsMin, glm::vec3(-6.0f, -6.0f, -2.0f));
+                gpuModel.localBoundsMax = glm::max(gpuModel.localBoundsMax, glm::vec3( 6.0f,  6.0f, 18.0f));
+            }
+
+            if (!gpuModel.particleEmitters.empty()) {
+                const auto& e0 = gpuModel.particleEmitters.front();
+                std::printf("[M2] %s -> %zu particle emitters (hasMesh=%d) | rate=%.2f speed=%.2f life=%.2f "
+                            "scaleMid=%.2f alphaMid=%.2f\n",
+                            normPath.c_str(), gpuModel.particleEmitters.size(), hasMesh ? 1 : 0,
+                            e0.emissionRate, e0.speed, e0.lifespan, e0.scaleMid, e0.alphaMid);
+            } else {
+                std::printf("[M2] %s -> 0 active particle emitters (hasMesh=%d)\n",
+                            normPath.c_str(), hasMesh ? 1 : 0);
+            }
         }
 
         return gpuModel;
