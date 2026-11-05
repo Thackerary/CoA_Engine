@@ -11,6 +11,7 @@
 #include "assets/asset_manager.hpp"
 #include "assets/m2_loader.hpp"
 #include "assets/adt_loader.hpp"
+#include "assets/dbc_loader.hpp"
 
 void GLAPIENTRY GlDebugCallback(GLenum /*source*/, GLenum /*type*/, GLuint id, GLenum severity,
                                 GLsizei /*length*/, const GLchar* message, const void* /*userParam*/) {
@@ -32,8 +33,18 @@ struct alignas(16) FrameUniforms {
     glm::mat4 view;
     glm::mat4 proj;
     glm::mat4 viewProj;
-    glm::vec4 cameraPos;
-    glm::vec4 sunDirAndIntensity;
+    glm::vec4 cameraPos;          // xyz = 相机位置, w = 累计运行秒数
+    glm::vec4 sunDirAndIntensity; // xyz = 太阳/月亮方向, w = 强度
+    glm::vec4 sunColor;           // rgb = 太阳主光颜色
+    glm::vec4 ambientSky;         // rgb = 天空环境光
+    glm::vec4 ambientGround;      // rgb = 地面反射环境光
+    glm::vec4 fogColorAndParams;  // rgb = 雾色(或水下滤镜色), w = 雾起始距离
+    glm::vec4 skyTopAndDensity;   // rgb = 天顶色, w = 雾浓度系数
+    glm::vec4 skyMid;             // rgb = 中空色
+    glm::vec4 skyBand1;           // rgb = 中低空过渡色
+    glm::vec4 skyHorizon;         // rgb = 地平线色
+    glm::vec4 waterShallow;       // rgb = 动态浅水色
+    glm::vec4 waterDeep;          // rgb = 动态深水色
 };
 
 struct Frustum {
@@ -83,6 +94,82 @@ inline bool IsInstanceVisible(const Frustum& frustum, const glm::vec3& camPos,
     return frustum.IntersectsAABB(bmin, bmax);
 }
 
+inline bool IsCameraUnderwater(const glm::vec3& camPos, const std::vector<coa::assets::GpuAdtTile>& tiles) {
+    for (const auto& tile : tiles) {
+        for (const auto& lc : tile.liquidChunks) {
+            if (camPos.x >= lc.aabbMin.x && camPos.x <= lc.aabbMax.x &&
+                camPos.y >= lc.aabbMin.y && camPos.y <= lc.aabbMax.y &&
+                camPos.z < lc.aabbMax.z && camPos.z > lc.aabbMin.z - 25.0f) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 全屏天空渐变：利用逆视图旋转与投影对角线重建世界空间视线方向
+constexpr std::string_view kSkyVertShader = R"GLSL(
+#version 460 core
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)GLSL";
+
+constexpr std::string_view kSkyFragShader = R"GLSL(
+#version 460 core
+layout(location = 0) uniform vec2 uScreenSize;
+
+layout(std140, binding = 0) uniform FrameBlock {
+    mat4 uView;
+    mat4 uProj;
+    mat4 uViewProj;
+    vec4 uCameraPos;
+    vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
+};
+
+out vec4 FragColor;
+
+void main() {
+    vec2 ndc = (gl_FragCoord.xy / max(uScreenSize, vec2(1.0))) * 2.0 - 1.0;
+    vec3 viewRay = vec3(ndc.x / uProj[0][0], ndc.y / uProj[1][1], -1.0);
+    vec3 dir = normalize(transpose(mat3(uView)) * viewRay);
+
+    vec3 cTop     = uSkyTopAndDensity.rgb;
+    vec3 cMid     = uSkyMid.rgb;
+    vec3 cBand1   = uSkyBand1.rgb;
+    vec3 cHorizon = uSkyHorizon.rgb;
+    vec3 cLow     = mix(uFogColorAndParams.rgb, cHorizon, 0.45);
+    vec3 cUpper   = mix(cMid, cTop, 0.55);
+
+    // 6 段渐变天空：地平线雾 -> 地平线 -> 中低空 -> 中空 -> 高空混合 -> 天顶
+    float h = clamp(dir.z, -0.1, 1.0);
+    vec3 sky;
+    if (h < 0.08)      sky = mix(cLow, cHorizon, smoothstep(-0.1, 0.08, h));
+    else if (h < 0.20) sky = mix(cHorizon, cBand1, smoothstep(0.08, 0.20, h));
+    else if (h < 0.36) sky = mix(cBand1, cMid, smoothstep(0.20, 0.36, h));
+    else if (h < 0.55) sky = mix(cMid, cUpper, smoothstep(0.36, 0.55, h));
+    else if (h < 0.78) sky = mix(cUpper, cTop, smoothstep(0.55, 0.78, h));
+    else               sky = cTop;
+
+    vec3 sunDir = normalize(uSunDirAndIntensity.xyz);
+    float sunAmt = pow(max(dot(dir, sunDir), 0.0), 96.0);
+    sky += uSunColor.rgb * sunAmt * 0.75 * smoothstep(-0.05, 0.12, dir.z);
+
+    FragColor = vec4(sky, 1.0);
+}
+)GLSL";
+
 // 顶点着色器：通过 gl_BaseInstance + gl_InstanceID 从 0 号 SSBO 提取实例世界变换矩阵
 // 标准 GLSL 4.60 着色器：支持魔兽 Z-Up 半兰伯特光照 + 三色天光环境反射 + Alpha Cutout 树叶镂空
 constexpr std::string_view kWorldVertShader = R"GLSL(
@@ -97,6 +184,16 @@ layout(std140, binding = 0) uniform FrameBlock {
     mat4 uViewProj;
     vec4 uCameraPos;
     vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
 };
 
 layout(std430, binding = 0) readonly buffer InstanceBuffer {
@@ -138,6 +235,16 @@ layout(std140, binding = 0) uniform FrameBlock {
     mat4 uViewProj;
     vec4 uCameraPos;
     vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
 };
 
 out vec4 FragColor;
@@ -154,7 +261,8 @@ vec3 HeightBlend(vec3 baseCol, vec3 overCol, float alpha) {
 }
 
 void main() {
-    vec4 texColor = texture(uTexAlbedo, vUV);
+    vec2 sampleUV = (uAlphaCutout == 3) ? (vUV + vec2(0.0, -0.75 * uCameraPos.w)) : vUV;
+    vec4 texColor = texture(uTexAlbedo, sampleUV);
     vec3 alphaWeights = texture(uTexAlphaMap, clamp(vUV / 8.0, 0.0, 1.0)).rgb;
     if (dot(alphaWeights, vec3(1.0)) > 0.001) {
         vec3 c1 = texture(uTexLayer1, vUV).rgb;
@@ -188,18 +296,18 @@ void main() {
     float halfLambert = ndotl * 0.65 + 0.35;
     float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.28 * ndotl;
 
-    vec3 skyAmbient    = vec3(0.45, 0.52, 0.62);
-    vec3 groundAmbient = vec3(0.24, 0.22, 0.18);
+    vec3 skyAmbient    = uAmbientSky.rgb;
+    vec3 groundAmbient = uAmbientGround.rgb;
     vec3 ambient = mix(groundAmbient, skyAmbient, N.z * 0.5 + 0.5);
 
-    vec3 sunColor = vec3(1.0, 0.95, 0.85) * uSunDirAndIntensity.w;
+    vec3 sunColor = uSunColor.rgb * uSunDirAndIntensity.w;
     vec3 litColor = texColor.rgb * (ambient + sunColor * halfLambert) + sunColor * spec;
 
     float dist = length(vWorldPos - uCameraPos.xyz);
-    float fogFactor = clamp(exp(-max(dist - 120.0, 0.0) * 0.0022), 0.0, 1.0);
-    vec3 fogColor = vec3(0.53, 0.72, 0.92);
+    float fogFactor = clamp(exp(-max(dist - uFogColorAndParams.w, 0.0) * uSkyTopAndDensity.w), 0.0, 1.0);
+    vec3 fogColor = uFogColorAndParams.rgb;
 
-    float outAlpha = (uAlphaCutout == 2) ? texColor.a : 1.0;
+    float outAlpha = (uAlphaCutout >= 2) ? clamp(texColor.a * 0.85, 0.0, 0.95) : 1.0;
     FragColor = vec4(mix(fogColor, litColor, fogFactor), outAlpha);
 }
 )GLSL";
@@ -217,6 +325,16 @@ layout(std140, binding = 0) uniform FrameBlock {
     mat4 uViewProj;
     vec4 uCameraPos;
     vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
 };
 
 layout(std430, binding = 0) readonly buffer InstanceBuffer {
@@ -250,6 +368,16 @@ layout(std140, binding = 0) uniform FrameBlock {
     mat4 uViewProj;
     vec4 uCameraPos;          // xyz = 相机位置, w = 累计运行秒数
     vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
 };
 
 out vec4 FragColor;
@@ -260,16 +388,29 @@ void main() {
     vec3  L    = normalize(uSunDirAndIntensity.xyz);
     vec3  H    = normalize(L + V);
 
-    // 1. 叠加 3 组不同方向与频率的正弦波，解析求偏导构造动态波浪法线
+    // 1. 4 组低频交叉相位波函数：避免规则正弦网格，得到柔和自然的动态水面
     vec2 p  = vWorldPos.xy;
-    vec2 k0 = vec2( 0.41,  0.23);
-    vec2 k1 = vec2(-0.27,  0.52);
-    vec2 k2 = vec2( 0.63, -0.35);
-    float a0 = 0.16, a1 = 0.10, a2 = 0.06;
+    vec2 k0 = vec2( 0.11,  0.06);
+    vec2 k1 = vec2(-0.07,  0.13);
+    vec2 k2 = vec2( 0.16, -0.09);
+    vec2 k3 = vec2(-0.13, -0.15);
+    float a0 = 0.12, a1 = 0.09, a2 = 0.07, a3 = 0.05;
 
-    vec2 grad = a0 * k0 * cos(dot(p, k0) + time * 1.10)
-              + a1 * k1 * cos(dot(p, k1) + time * 1.55)
-              + a2 * k2 * cos(dot(p, k2) + time * 2.05);
+    float ph0 = dot(p, k0) + time * 0.45;
+    float ph1 = dot(p, k1) + time * 0.62 + 0.7;
+    float ph2 = dot(p, k2) + time * 0.78 + 1.3;
+    float ph3 = dot(p, k3) + time * 0.94 + 2.1;
+
+    // 交叉相位调制：用相邻波相位轻微扰动当前波，消除生硬感
+    ph0 += sin(ph1) * 0.35;
+    ph1 += sin(ph2) * 0.30;
+    ph2 += sin(ph3) * 0.28;
+    ph3 += sin(ph0) * 0.25;
+
+    vec2 grad = a0 * k0 * cos(ph0)
+              + a1 * k1 * cos(ph1)
+              + a2 * k2 * cos(ph2)
+              + a3 * k3 * cos(ph3);
 
     vec3 N = normalize(vec3(-grad.x, -grad.y, 1.0));
 
@@ -278,12 +419,12 @@ void main() {
 
     // 3. Beer-Lambert 深度透射：浅水青绿 -> 深水暗蓝
     float depthT      = clamp(vWaterDepth / 6.0, 0.0, 1.0);
-    vec3  shallowColor = vec3(0.16, 0.50, 0.48);
-    vec3  deepColor    = vec3(0.03, 0.14, 0.25);
+    vec3  shallowColor = uWaterShallow.rgb;
+    vec3  deepColor    = uWaterDeep.rgb;
     vec3  waterColor   = mix(shallowColor, deepColor, depthT);
 
-    vec3  skyReflect = vec3(0.53, 0.72, 0.92);
-    vec3  sunColor   = vec3(1.0, 0.95, 0.85) * uSunDirAndIntensity.w;
+    vec3  skyReflect = uSkyHorizon.rgb;
+    vec3  sunColor   = uSunColor.rgb * uSunDirAndIntensity.w;
     float spec       = pow(max(dot(N, H), 0.0), 128.0) * 1.6;
 
     vec3 waterLitColor = mix(waterColor, skyReflect, fresnel * 0.65) + sunColor * spec;
@@ -295,8 +436,8 @@ void main() {
 
     // 5. 与 kWorldFragShader 完全一致的指数距离雾，使远处水面融入天际
     float dist = length(vWorldPos - uCameraPos.xyz);
-    float fogFactor = clamp(exp(-max(dist - 120.0, 0.0) * 0.0022), 0.0, 1.0);
-    vec3  fogColor  = vec3(0.53, 0.72, 0.92);
+    float fogFactor = clamp(exp(-max(dist - uFogColorAndParams.w, 0.0) * uSkyTopAndDensity.w), 0.0, 1.0);
+    vec3  fogColor  = uFogColorAndParams.rgb;
 
     FragColor = vec4(mix(fogColor, waterLitColor, fogFactor), alpha);
 }
@@ -336,8 +477,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
         coa::rhi::GlShaderProgram worldShader(kWorldVertShader, kWorldFragShader);
         coa::rhi::GlShaderProgram waterShader(kWaterVertShader, kWaterFragShader);
+        coa::rhi::GlShaderProgram skyShader(kSkyVertShader, kSkyFragShader);
         GLuint sharedM2Vao = coa::assets::GpuM2Model::CreateSharedVAO();
         GLuint terrainVao  = coa::assets::GpuAdtTile::CreateTerrainVAO();
+        GLuint skyVao      = 0;
+        glCreateVertexArrays(1, &skyVao);
 
         // 每帧动态上传可见实例矩阵的 SSBO (binding = 0，与 FrameBlock UBO 空间相互独立)
         coa::rhi::GlBuffer instanceSsbo(sizeof(glm::mat4), nullptr, GL_DYNAMIC_STORAGE_BIT);
@@ -355,6 +499,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
         vfs.MountLooseDirectory("CoA_Assets/coa_patches", 200);
 
         coa::assets::AssetManager assets(vfs);
+
+        coa::assets::LightDbcManager lightMgr;
+        lightMgr.Load(vfs, 0);
 
         // 多 ADT 无缝拼接：同时加载北郡(32_48)与闪金镇(32_49)
         std::vector<coa::assets::GpuAdtTile> adtTiles;
@@ -376,6 +523,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
         glm::vec3 camPos = (!adtTiles.empty()) ? adtTiles.front().suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
         float camYaw   = 0.0f;
         float camPitch = -0.25f;
+        float gameTimeHalfMin = 1560.0f; // 默认 13:00，金色阳光
         bool rightMouseDown = false;
         uint64_t lastTicks = SDL_GetTicksNS();
 
@@ -446,17 +594,54 @@ int main(int /*argc*/, char* /*argv*/[]) {
             if (keys[SDL_SCANCODE_SPACE]) camPos += worldUp * moveSpeed;
             if (keys[SDL_SCANCODE_LCTRL]) camPos -= worldUp * moveSpeed;
 
+            if (keys[SDL_SCANCODE_LEFTBRACKET])  gameTimeHalfMin -= 360.0f * dt;
+            if (keys[SDL_SCANCODE_RIGHTBRACKET]) gameTimeHalfMin += 360.0f * dt;
+            gameTimeHalfMin += dt; // 默认缓慢流逝：1 半分钟 / 秒
+            while (gameTimeHalfMin < 0.0f)    gameTimeHalfMin += 2880.0f;
+            while (gameTimeHalfMin >= 2880.0f) gameTimeHalfMin -= 2880.0f;
+
+            const bool underwater = IsCameraUnderwater(camPos, adtTiles);
+            const coa::assets::EvaluatedLight lightState =
+                lightMgr.Evaluate(camPos, gameTimeHalfMin, underwater);
+
+            constexpr float kTwoPi = 6.28318530718f;
+            constexpr float kHalfPi = 1.57079632679f;
+            const float sunElev = std::sin((gameTimeHalfMin / 2880.0f) * kTwoPi - kHalfPi);
+            const float dayFactor = glm::smoothstep(-0.08f, 0.25f, sunElev);
+            const float lightIntensity = glm::mix(0.18f, 1.15f, dayFactor);
+
             float aspect = (winH > 0) ? (static_cast<float>(winW) / static_cast<float>(winH)) : 1.777f;
             FrameUniforms uboData{};
             uboData.view               = glm::lookAt(camPos, camPos + forward, worldUp);
             uboData.proj               = MakeInfiniteReverseZProj(glm::radians(60.0f), aspect, 0.2f);
             uboData.viewProj           = uboData.proj * uboData.view;
             uboData.cameraPos          = glm::vec4(camPos, static_cast<float>(nowTicks) * 1e-9f);
-            uboData.sunDirAndIntensity = glm::vec4(glm::normalize(glm::vec3(-0.5f, -0.4f, 0.75f)), 1.1f);
+            uboData.sunDirAndIntensity = glm::vec4(glm::normalize(lightState.sunDir), lightIntensity);
+            uboData.sunColor           = glm::vec4(lightState.directColor, 1.0f);
+            uboData.ambientSky         = glm::vec4(lightState.ambientColor, 1.0f);
+            uboData.ambientGround      = glm::vec4(lightState.ambientColor * 0.55f, 1.0f);
+            uboData.fogColorAndParams  = glm::vec4(lightState.fogColor, underwater ? 0.0f : 120.0f);
+            uboData.skyTopAndDensity   = glm::vec4(lightState.skyTop, underwater ? 0.028f : 0.0022f);
+            uboData.skyMid             = glm::vec4(lightState.skyMiddle, 1.0f);
+            uboData.skyBand1           = glm::vec4(lightState.skyBand1, 1.0f);
+            uboData.skyHorizon         = glm::vec4(lightState.skyHorizon, 1.0f);
+            uboData.waterShallow       = glm::vec4(lightState.riverShallow, 1.0f);
+            uboData.waterDeep          = glm::vec4(lightState.riverDeep, 1.0f);
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
 
-            glClearColor(0.53f, 0.72f, 0.92f, 1.0f);
+            glClearColor(lightState.skyHorizon.r, lightState.skyHorizon.g, lightState.skyHorizon.b, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            // 天空盒先于所有不透明几何绘制：关闭深度测试与写入，只填充背景渐变
+            glDisable(GL_DEPTH_TEST);
+            glDepthMask(GL_FALSE);
+            glDisable(GL_BLEND);
+            glUseProgram(skyShader.Handle());
+            glUniform2f(0, static_cast<float>(winW), static_cast<float>(winH));
+            glBindVertexArray(skyVao);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glDepthMask(GL_TRUE);
+            glEnable(GL_DEPTH_TEST);
 
             renderQueue.clear();
             visibleMatrices.clear();
@@ -525,6 +710,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
                             pass = 3; // Alpha Cutout (树叶/栅栏)
                         } else if (sub.blendMode == 2) {
                             pass = 5; // Alpha Blend (瀑布水幕/半透明薄纱)
+                        } else if (sub.blendMode == 10) {
+                            pass = 7; // UV 动态滚动的瀑布水幕
                         } else if (sub.blendMode >= 3) {
                             pass = 6; // Additive / Mod (火盆光晕/魔法水花)
                         }
@@ -634,9 +821,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
             // 每 0.25 秒更新一次窗口标题，观察视锥裁剪统计
             titleTimer += dt;
             if (titleTimer >= 0.25f) {
-                char titleBuf[256];
+                int totalMinutes = static_cast<int>(gameTimeHalfMin * 0.5f) % (24 * 60);
+                int hh = totalMinutes / 60;
+                int mm = totalMinutes % 60;
+
+                char titleBuf[320];
                 std::snprintf(titleBuf, sizeof(titleBuf),
-                              "CoA Engine | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
+                              "CoA Engine | Time: %02d:%02d | %s | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
+                              hh, mm, underwater ? "UNDERWATER" : "Surface",
                               visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances,
                               visibleWaterChunks, renderQueue.size());
                 SDL_SetWindowTitle(window, titleBuf);
@@ -649,6 +841,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
         glDeleteVertexArrays(1, &terrainVao);
         glDeleteVertexArrays(1, &sharedM2Vao);
+        glDeleteVertexArrays(1, &skyVao);
     }
 
     SDL_GL_DestroyContext(glCtx);
