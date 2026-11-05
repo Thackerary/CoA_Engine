@@ -184,9 +184,10 @@ def parse_adt_dependencies(adt_bytes: bytes) -> list[str]:
     return deps
 # ==================== 4. 批量提取主流程 ====================
 TEST_PATTERNS = [
+    'dbfilesclient/light*.dbc',
     'tileset/*.blp',
-    'world/azeroth/elwynn/*', # <-- 提取艾尔文森林所有树木、栅栏、路灯、矿车等 M2
-    'world/generic/*',        # <-- 提取人类城镇通用家具（酒桶、桌椅、书架、铁匠铺工具）
+    'world/azeroth/elwynn/*',
+    'world/generic/*',
     'world/wmo/*',
     'world/maps/azeroth/azeroth_32_48.adt',
     'world/maps/azeroth/azeroth_32_49.adt',

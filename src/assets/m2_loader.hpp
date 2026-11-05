@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,27 +30,30 @@ struct M2Vertex {
 };
 static_assert(sizeof(M2Vertex) == 48, "M2Vertex must be exactly 48 bytes");
 
-// 3.3.5a MD20 (Version 264) 文件头核心段 (共 144 字节核心索引区)
+// 3.3.5a MD20 (Version 264) 文件头核心段
 struct M2HeaderV264 {
-    char     magic[4];           // 0x00: "MD20"
-    uint32_t version;            // 0x04: 3.3.5a 固定为 264 (0x108)
-    M2Array  name;               // 0x08
-    uint32_t globalFlags;        // 0x10
-    M2Array  globalSequences;    // 0x14
-    M2Array  animations;         // 0x1C
-    M2Array  animationLookup;    // 0x24
-    M2Array  bones;              // 0x2C
-    M2Array  keyBoneLookup;      // 0x34
-    M2Array  vertices;           // 0x3C: 指向 M2Vertex 数组
-    uint32_t numSkinProfiles;    // 0x44: 外部 .skin 文件数量
-    M2Array  colors;             // 0x48
-    M2Array  textures;           // 0x50: 指向 M2Texture 数组
-    M2Array  transparency;       // 0x58
-    M2Array  textureTransforms;  // 0x60
-    M2Array  texReplace;         // 0x68
-    M2Array  renderFlags;        // 0x70: 指向 M2Material (flags + blendMode)
-    M2Array  boneLookupTable;    // 0x78
-    M2Array  texLookupTable;     // 0x80: 指向 uint16_t 纹理查找表
+    char     magic[4];                // 0x00: "MD20"
+    uint32_t version;                 // 0x04: 3.3.5a 固定为 264 (0x108)
+    M2Array  name;                    // 0x08
+    uint32_t globalFlags;             // 0x10
+    M2Array  globalSequences;         // 0x14
+    M2Array  animations;              // 0x1C
+    M2Array  animationLookup;         // 0x24
+    M2Array  bones;                   // 0x2C
+    M2Array  keyBoneLookup;           // 0x34
+    M2Array  vertices;                // 0x3C: 指向 M2Vertex 数组
+    uint32_t numSkinProfiles;         // 0x44: 外部 .skin 文件数量
+    M2Array  colors;                  // 0x48
+    M2Array  textures;                // 0x50: 指向 M2TextureDef 数组
+    M2Array  transparency;            // 0x58
+    M2Array  textureTransforms;       // 0x60: 指向 UV 动画数组
+    M2Array  texReplace;              // 0x68
+    M2Array  renderFlags;             // 0x70: 指向 M2Material (flags + blendMode)
+    M2Array  boneLookupTable;         // 0x78
+    M2Array  texLookupTable;          // 0x80: 指向 uint16_t 纹理查找表
+    M2Array  texUnitLookupTable;      // 0x88
+    M2Array  transparencyLookupTable; // 0x90
+    M2Array  texTransformLookupTable; // 0x98: 指向 uint16_t UV 动画查找表
 };
 
 struct M2TextureDef {
@@ -114,7 +118,7 @@ struct GpuM2Submesh {
     uint32_t firstIndex  = 0;
     uint32_t indexCount  = 0;
     GLuint   textureId   = 0;
-    uint16_t blendMode   = 0; // 0 = Opaque, 1 = AlphaCutout
+    uint16_t blendMode   = 0; // 0 = Opaque, 1 = AlphaCutout, 2 = AlphaBlend, 10 = UV Scroll Waterfall
     uint16_t geosetId    = 0;
 };
 
@@ -182,7 +186,7 @@ public:
         std::span<const uint8_t> m2Bytes(*m2BytesOpt);
         std::span<const uint8_t> skinBytes(*skinBytesOpt);
 
-        // 兼容 CoA 从高版本移植的 MD21 封装格式 (扫描定位内部真正的 "MD20" 起始偏移)
+        // 兼容 CoA 从高版本移植的 MD21 封装格式 (剥离 8 字节 'MD21' + size 块头后即为标准 MD20)
         if (m2Bytes.size() >= sizeof(M2HeaderV264) + 8 && std::memcmp(m2Bytes.data(), "MD21", 4) == 0) {
             m2Bytes = m2Bytes.subspan(8);
         }
@@ -195,7 +199,7 @@ public:
         M2HeaderV264 m2Hdr{};
         std::memcpy(&m2Hdr, m2Bytes.data(), sizeof(M2HeaderV264));
         if (std::memcmp(m2Hdr.magic, "MD20", 4) != 0) {
-            std::fprintf(stderr, "  -> [M2 Reason] Bad magic (%.4s) in: %s\n", m2Hdr.magic, normPath.c_str());
+            std::fprintf(stderr, "  -> [M2 Reason] Bad magic in: %s\n", normPath.c_str());
             return std::nullopt;
         }
         if (m2Hdr.vertices.count == 0) {
@@ -222,6 +226,7 @@ public:
         auto m2TexDefs  = getSpan.template operator()<M2TextureDef>(m2Bytes, m2Hdr.textures);
         auto m2Mats     = getSpan.template operator()<M2Material>(m2Bytes, m2Hdr.renderFlags);
         auto m2TexLut   = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.texLookupTable);
+        auto uvAnimLut  = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.texTransformLookupTable);
 
         auto skinVertLut   = getSpan.template operator()<uint16_t>(skinBytes, skinHdr.vertices);
         auto skinIndices   = getSpan.template operator()<uint16_t>(skinBytes, skinHdr.indices);
@@ -242,7 +247,7 @@ public:
         // 施加最小厚度防止扁平/零体积几何体退化导致视锥误剔除
         localMax = localMin + glm::max(localMax - localMin, glm::vec3(0.05f));
 
-        // 2. 解析 M2 内部引用的所有硬编码 BLP 贴图
+        // 2. 解析 M2 内部引用的所有硬编码 BLP 贴图 (开启 repeatWrap = true 支持瀑布/长条构件 UV 平铺)
         std::vector<GLuint> loadedTexHandles(m2TexDefs.size(), fallbackWhiteTex);
         for (size_t i = 0; i < m2TexDefs.size(); ++i) {
             const auto& td = m2TexDefs[i];
@@ -250,7 +255,7 @@ public:
                 static_cast<size_t>(td.filename.offset) + td.filename.count <= m2Bytes.size()) {
                 std::string_view texPath(reinterpret_cast<const char*>(m2Bytes.data() + td.filename.offset),
                                          td.filename.count - 1);
-                GLuint h = assets.GetOrLoadTexture(texPath, (td.flags & 3) != 0);
+                GLuint h = assets.GetOrLoadTexture(texPath, true);
                 if (h != 0) loadedTexHandles[i] = h;
             }
         }
@@ -294,6 +299,11 @@ public:
 
                 if (batch.materialIndex < m2Mats.size()) {
                     sub.blendMode = m2Mats[batch.materialIndex].blendMode;
+                }
+                if (m2Hdr.textureTransforms.count > 0 && batch.textureTransformComboIndex < uvAnimLut.size()) {
+                    if (uvAnimLut[batch.textureTransformComboIndex] < m2Hdr.textureTransforms.count) {
+                        sub.blendMode = 10; // 10 = 启用 UV 动态滚动的瀑布/水幕层
+                    }
                 }
                 if (batch.textureComboIndex < m2TexLut.size()) {
                     uint16_t texDefIdx = m2TexLut[batch.textureComboIndex];

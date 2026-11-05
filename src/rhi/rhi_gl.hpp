@@ -263,8 +263,8 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDepthMask(GL_FALSE);
                 glDisable(GL_CULL_FACE);
-            } else if (pass == 5 || pass == 6) {
-                // Pass 5 / 6: M2 半透明水幕 (Pass 5) 与 Additive 发光 (Pass 6)，使用 worldShader
+            } else if (pass == 5 || pass == 6 || pass == 7) {
+                // Pass 5=M2半透明, Pass 6=M2发光叠加, Pass 7=M2带UV滚动动画的瀑布水幕
                 glEnable(GL_BLEND);
                 if (pass == 6) {
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
@@ -273,7 +273,7 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
                 }
                 glDepthMask(GL_FALSE);
                 glDisable(GL_CULL_FACE);
-                glUniform1i(0, 2); // uAlphaCutout == 2 表示输出贴图真实 Alpha 通道
+                glUniform1i(0, (pass == 7) ? 3 : 2);
             } else {
                 // Pass 2 / 3: 不透明与 Alpha Cutout —— 关闭混合、恢复深度写入，并下发镂空开关
                 glDisable(GL_BLEND);
