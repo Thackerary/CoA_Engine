@@ -2,12 +2,17 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <span>
 #include <optional>
+#include <array>
+#include <algorithm>
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include "../rhi/rhi_gl.hpp"
 #include "../vfs/vfs.hpp"
 #include "asset_manager.hpp"
@@ -30,7 +35,7 @@ struct M2Vertex {
 };
 static_assert(sizeof(M2Vertex) == 48, "M2Vertex must be exactly 48 bytes");
 
-// 3.3.5a MD20 (Version 264) 文件头核心段
+// 3.3.5a MD20 (Version 264) 文件头核心段 (160 字节)
 struct M2HeaderV264 {
     char     magic[4];                // 0x00: "MD20"
     uint32_t version;                 // 0x04: 3.3.5a 固定为 264 (0x108)
@@ -54,7 +59,25 @@ struct M2HeaderV264 {
     M2Array  texUnitLookupTable;      // 0x88
     M2Array  transparencyLookupTable; // 0x90
     M2Array  texTransformLookupTable; // 0x98: 指向 uint16_t UV 动画查找表
+    glm::vec3 boundingBoxMin;         // 0xA0
+    glm::vec3 boundingBoxMax;         // 0xAC
+    float     boundingBoxRadius;      // 0xB8
+    glm::vec3 vertexBoxMin;           // 0xBC
+    glm::vec3 vertexBoxMax;           // 0xC8
+    float     vertexBoxRadius;        // 0xD4
+    M2Array   boundingTriangles;      // 0xD8
+    M2Array   boundingVertices;       // 0xE0
+    M2Array   boundingNormals;        // 0xE8
+    M2Array   attachments;            // 0xF0
+    M2Array   attachmentLookupTable;  // 0xF8
+    M2Array   events;                 // 0x100
+    M2Array   lights;                 // 0x108
+    M2Array   cameras;                // 0x110
+    M2Array   cameraLookupTable;      // 0x118
+    M2Array   ribbonEmitters;         // 0x120
+    M2Array   particleEmitters;       // 0x128: 指向 476 字节 M2ParticleDefV264 数组
 };
+static_assert(sizeof(M2HeaderV264) == 304, "M2HeaderV264 must be 304 bytes");
 
 struct M2TextureDef {
     uint32_t type;               // 0 = 硬编码贴图文件名; 非 0 = 角色皮肤/披风动态替换贴图
@@ -111,25 +134,256 @@ struct M2Batch {
     uint16_t textureTransformComboIndex;
 };
 static_assert(sizeof(M2Batch) == 24, "M2Batch must be 24 bytes");
+
+// 3.3.5a (v264) M2Track 二级嵌套动画轨头 (20 字节)
+struct M2TrackBase {
+    uint16_t interpolationType;
+    int16_t  globalSequence;
+    M2Array  timestamps; // 外层为 M2Array<M2Array>，内层为 uint32_t 毫秒时间戳
+    M2Array  values;     // 外层为 M2Array<M2Array>，内层为 T 关键帧值
+};
+static_assert(sizeof(M2TrackBase) == 20, "M2TrackBase must be 20 bytes");
+
+struct M2Sequence {
+    uint16_t animId;
+    uint16_t subAnimId;
+    uint32_t duration; // 动作循环时长 (毫秒)
+    uint8_t  pad[56];
+};
+static_assert(sizeof(M2Sequence) == 64, "M2Sequence must be 64 bytes");
+
+struct M2CompQuat {
+    int16_t x, y, z, w;
+};
+static_assert(sizeof(M2CompQuat) == 8, "M2CompQuat must be 8 bytes");
+
+struct M2CompBone {
+    int32_t     keyBoneId;
+    uint32_t    flags;
+    int16_t     parentBone;
+    uint16_t    submeshId;
+    uint32_t    boneNameCRC;
+    M2TrackBase translation; // glm::vec3
+    M2TrackBase rotation;    // M2CompQuat (8 bytes)
+    M2TrackBase scale;       // glm::vec3
+    glm::vec3   pivot;
+};
+static_assert(sizeof(M2CompBone) == 88, "M2CompBone must be 88 bytes");
+
+struct M2ColorDef {
+    M2TrackBase color; // glm::vec3
+    M2TrackBase alpha; // uint16_t (0..32767)
+};
+static_assert(sizeof(M2ColorDef) == 40, "M2ColorDef must be 40 bytes");
+
+struct M2TexTransformDef {
+    M2TrackBase translation; // glm::vec3
+    M2TrackBase rotation;    // glm::quat (16 bytes)
+    M2TrackBase scaling;     // glm::vec3
+};
+static_assert(sizeof(M2TexTransformDef) == 60, "M2TexTransformDef must be 60 bytes");
+
+// 粒子颜色/透明度/尺寸动画块：时间戳为 uint16_t，缺失插值类型与全局序列号
+struct M2FakeAnimBlock {
+    M2Array timestamps; // uint16_t 数组
+    M2Array values;     // T 数组
+};
+static_assert(sizeof(M2FakeAnimBlock) == 16, "M2FakeAnimBlock must be 16 bytes");
+
+struct M2ParticleDefV264 {
+    int32_t         particleId;          // 0x00
+    uint32_t        flags;               // 0x04
+    glm::vec3       position;            // 0x08: 模型局部空间位置
+    uint16_t        bone;                // 0x14
+    uint16_t        texture;             // 0x16: 低 5 位为贴图索引
+    M2Array         modelFileName;       // 0x18
+    M2Array         childEmitterName;    // 0x20
+    uint8_t         blendingType;        // 0x28: 2=AlphaBlend, 3/4=Additive
+    uint8_t         emitterType;         // 0x29: 1=Plane, 2=Sphere
+    uint16_t        particleColorIndex;  // 0x2A
+    uint8_t         particleType;        // 0x2C
+    uint8_t         headOrTail;          // 0x2D
+    int16_t         texTileRotation;     // 0x2E
+    uint16_t        texRows;             // 0x30
+    uint16_t        texCols;             // 0x32
+    M2TrackBase     emissionSpeed;       // 0x34 (float)
+    M2TrackBase     speedVariation;      // 0x48 (float)
+    M2TrackBase     verticalRange;       // 0x5C (float)
+    M2TrackBase     horizontalRange;     // 0x70 (float)
+    M2TrackBase     gravity;             // 0x84 (float)
+    M2TrackBase     lifespan;            // 0x98 (float)
+    float           lifespanVary;        // 0xAC
+    M2TrackBase     emissionRate;        // 0xB0 (float)
+    float           emissionRateVary;    // 0xC4
+    M2TrackBase     emissionAreaLength;  // 0xC8 (float)
+    M2TrackBase     emissionAreaWidth;   // 0xDC (float)
+    M2TrackBase     zSource;             // 0xF0 (float)
+    M2FakeAnimBlock colorTrack;          // 0x104 (glm::vec3, 0..255)
+    M2FakeAnimBlock alphaTrack;          // 0x114 (uint16_t, 0..32767)
+    M2FakeAnimBlock scaleTrack;          // 0x124 (glm::vec2)
+    uint8_t         tailPadding[168];    // 0x134..0x1DC
+};
+static_assert(sizeof(M2ParticleDefV264) == 476, "M2ParticleDefV264 must be 476 bytes");
 #pragma pack(pop)
 
-// 上传到 GPU 后的 M2 模型渲染对象
+// CPU 侧已解包的单条关键帧动画轨
+template <typename T>
+struct M2AnimTrack {
+    uint16_t              interpType    = 1;
+    int16_t               globalSeq     = -1;
+    uint32_t              seqDurationMs = 3000;
+    std::vector<uint32_t> times;
+    std::vector<T>        values;
+
+    [[nodiscard]] bool HasAnimation() const noexcept {
+        return values.size() > 1 && times.size() >= values.size();
+    }
+
+    [[nodiscard]] uint32_t ResolveLoopMs(const std::vector<uint32_t>& globalSeqs) const noexcept {
+        if (globalSeq >= 0 && static_cast<size_t>(globalSeq) < globalSeqs.size() && globalSeqs[globalSeq] > 0) {
+            return globalSeqs[globalSeq];
+        }
+        if (!times.empty() && times.back() > seqDurationMs) {
+            return times.back();
+        }
+        return (seqDurationMs > 0) ? seqDurationMs : (!times.empty() ? std::max(times.back(), 1u) : 1000u);
+    }
+
+    [[nodiscard]] T SampleLinear(float timeSec, const std::vector<uint32_t>& globalSeqs, const T& defVal) const noexcept {
+        const size_t n = std::min(times.size(), values.size());
+        if (n == 0) return defVal;
+        if (n == 1 || interpType == 0) return values.front();
+
+        const uint32_t loopMs = std::max(ResolveLoopMs(globalSeqs), 1u);
+        const uint32_t tMs    = static_cast<uint32_t>( std::fmod(std::max(timeSec, 0.0f) * 1000.0f, static_cast<float>(loopMs)) );
+
+        if (tMs <= times.front()) return values.front();
+        if (tMs >= times[n - 1])  return values[n - 1];
+
+        for (size_t i = 0; i + 1 < n; ++i) {
+            if (tMs >= times[i] && tMs <= times[i + 1]) {
+                uint32_t span = times[i + 1] - times[i];
+                if (span == 0) return values[i];
+                float a = static_cast<float>(tMs - times[i]) / static_cast<float>(span);
+                return glm::mix(values[i], values[i + 1], a);
+            }
+        }
+        return values.back();
+    }
+
+    [[nodiscard]] glm::quat SampleQuat(float timeSec, const std::vector<uint32_t>& globalSeqs) const noexcept {
+        const size_t n = std::min(times.size(), values.size());
+        if (n == 0) return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        if (n == 1 || interpType == 0) return values.front();
+
+        const uint32_t loopMs = std::max(ResolveLoopMs(globalSeqs), 1u);
+        const uint32_t tMs    = static_cast<uint32_t>( std::fmod(std::max(timeSec, 0.0f) * 1000.0f, static_cast<float>(loopMs)) );
+
+        if (tMs <= times.front()) return values.front();
+        if (tMs >= times[n - 1])  return values[n - 1];
+
+        for (size_t i = 0; i + 1 < n; ++i) {
+            if (tMs >= times[i] && tMs <= times[i + 1]) {
+                uint32_t span = times[i + 1] - times[i];
+                if (span == 0) return values[i];
+                float a = static_cast<float>(tMs - times[i]) / static_cast<float>(span);
+                return glm::normalize(glm::slerp(values[i], values[i + 1], a));
+            }
+        }
+        return values.back();
+    }
+};
+
+struct RuntimeM2Bone {
+    int16_t                  parentBone = -1;
+    glm::vec3                pivot{0.0f};
+    M2AnimTrack<glm::vec3>   translation;
+    M2AnimTrack<glm::quat>   rotation;
+    M2AnimTrack<glm::vec3>   scale;
+};
+
+struct RuntimeM2Color {
+    M2AnimTrack<glm::vec3> color;
+    M2AnimTrack<float>     alpha;
+};
+
+// CPU 侧已解包的粒子发射器 (屋顶炊烟 / 火把火苗)
+struct RuntimeM2ParticleEmitter {
+    glm::vec3 localPos{0.0f};
+    uint16_t  boneIndex    = 0;
+    GLuint    textureId    = 0;
+    uint8_t   blendingType = 2;
+    uint8_t   emitterType  = 1;
+    uint16_t  texRows      = 1;
+    uint16_t  texCols      = 1;
+    float     speed        = 2.0f;
+    float     speedVary    = 0.2f;
+    float     vertRange    = 0.2f;
+    float     horizRange   = 0.2f;
+    float     gravity      = 0.0f;
+    float     lifespan     = 2.5f;
+    float     emissionRate = 10.0f;
+    float     areaLength   = 0.5f;
+    float     areaWidth    = 0.5f;
+    glm::vec3 colorStart{1.0f}, colorMid{1.0f}, colorEnd{1.0f};
+    float     alphaStart = 1.0f, alphaMid = 0.7f, alphaEnd = 0.0f;
+    float     scaleStart = 0.5f, scaleMid = 1.2f, scaleEnd = 2.0f;
+};
+
+// 上传到 GPU 后的 M2 子网格渲染对象
 struct GpuM2Submesh {
-    uint32_t firstIndex  = 0;
-    uint32_t indexCount  = 0;
-    GLuint   textureId   = 0;
-    uint16_t blendMode   = 0; // 0 = Opaque, 1 = AlphaCutout, 2 = AlphaBlend, 10 = UV Scroll Waterfall
-    uint16_t geosetId    = 0;
+    uint32_t firstIndex       = 0;
+    uint32_t indexCount       = 0;
+    GLuint   textureId        = 0;
+    uint16_t blendMode        = 0;  // 0 = Opaque, 1 = AlphaCutout, 2 = AlphaBlend, 10 = UV Scroll Waterfall
+    uint16_t materialFlags    = 0;  // 0x01 = Unlit, 0x04 = TwoSided
+    uint16_t geosetId         = 0;
+    int16_t  colorIndex       = -1; // 指向 GpuM2Model::colorTracks
+    int16_t  transWeightIndex = -1; // 指向 GpuM2Model::transWeightTracks
+    int16_t  uvTransIndex     = -1; // 指向 GpuM2Model::uvTransTracks
 };
 
 struct GpuM2Model {
-    rhi::GlBuffer               vbo;
-    rhi::GlBuffer               ibo;
-    std::vector<GpuM2Submesh>   submeshes;
-    glm::vec3                   localBoundsMin{-1.0f};
-    glm::vec3                   localBoundsMax{1.0f};
+    rhi::GlBuffer                       vbo;
+    rhi::GlBuffer                       ibo;
+    std::vector<GpuM2Submesh>           submeshes;
+    glm::vec3                           localBoundsMin{-1.0f};
+    glm::vec3                           localBoundsMax{1.0f};
+    std::vector<uint32_t>               globalSequences;
+    std::vector<RuntimeM2Bone>          bones;
+    bool                                hasAnimatedBones = false;
+    std::vector<RuntimeM2Color>         colorTracks;
+    std::vector<M2AnimTrack<float>>       transWeightTracks;
+    std::vector<M2AnimTrack<glm::vec3>>   uvTransTracks;
+    std::vector<RuntimeM2ParticleEmitter> particleEmitters;
 
-    // 创建全局共享的 M2 顶点格式 VAO (DSA 架构下所有 M2 模型共用同一个 VAO 即可)
+    // 评估当前时刻整棵骨骼树的枢轴空间蒙皮矩阵，追加到 visibleBoneMatrices 并返回起始下标
+    uint32_t EvaluateBones(float timeSec, std::vector<glm::mat4>& outBoneBuffer) const {
+        if (!hasAnimatedBones || bones.empty()) return 0;
+        const uint32_t baseIdx = static_cast<uint32_t>(outBoneBuffer.size());
+        outBoneBuffer.resize(baseIdx + bones.size(), glm::mat4(1.0f));
+
+        for (size_t i = 0; i < bones.size(); ++i) {
+            const auto& b = bones[i];
+            glm::vec3 tr = b.translation.SampleLinear(timeSec, globalSequences, glm::vec3(0.0f));
+            glm::quat rq = b.rotation.SampleQuat(timeSec, globalSequences);
+            glm::vec3 sc = b.scale.SampleLinear(timeSec, globalSequences, glm::vec3(1.0f));
+
+            glm::mat4 localMat = glm::translate(glm::mat4(1.0f), b.pivot + tr);
+            localMat *= glm::mat4_cast(rq);
+            localMat  = glm::scale(localMat, sc);
+            localMat  = glm::translate(localMat, -b.pivot);
+
+            if (b.parentBone >= 0 && static_cast<size_t>(b.parentBone) < i) {
+                outBoneBuffer[baseIdx + i] = outBoneBuffer[baseIdx + static_cast<size_t>(b.parentBone)] * localMat;
+            } else {
+                outBoneBuffer[baseIdx + i] = localMat;
+            }
+        }
+        return baseIdx;
+    }
+
+    // 创建全局共享的 M2 顶点格式 VAO (含 Attr 3 骨骼权重与 Attr 4 骨骼索引)
     static GLuint CreateSharedVAO() {
         GLuint vao = 0;
         glCreateVertexArrays(1, &vao);
@@ -149,6 +403,16 @@ struct GpuM2Model {
         glVertexArrayAttribFormat(vao, 2, 2, GL_FLOAT, GL_FALSE, offsetof(M2Vertex, texCoords[0]));
         glVertexArrayAttribBinding(vao, 2, 0);
 
+        // Attr 3: boneWeights (4 x uint8 normalized -> vec4, offset 12)
+        glEnableVertexArrayAttrib(vao, 3);
+        glVertexArrayAttribFormat(vao, 3, 4, GL_UNSIGNED_BYTE, GL_TRUE, offsetof(M2Vertex, boneWeights));
+        glVertexArrayAttribBinding(vao, 3, 0);
+
+        // Attr 4: boneIndices (4 x uint8 integer -> uvec4, offset 16)
+        glEnableVertexArrayAttrib(vao, 4);
+        glVertexArrayAttribIFormat(vao, 4, 4, GL_UNSIGNED_BYTE, offsetof(M2Vertex, boneIndices));
+        glVertexArrayAttribBinding(vao, 4, 0);
+
         return vao;
     }
 };
@@ -164,12 +428,10 @@ public:
         std::string normPath = vfs::VirtualFileSystem::NormalizeVirtualPath(m2VirtualPath);
         if (normPath.size() < 4) return std::nullopt;
 
-        // 兼容魔兽地形/建筑内部把 .m2 写成 .mdx 或 .mdl 的历史遗留后缀
         if (normPath.ends_with(".mdx") || normPath.ends_with(".mdl")) {
             normPath.replace(normPath.size() - 4, 4, ".m2");
         }
 
-        // 构造同目录下的 xxx00.skin 路径
         std::string skinPath = normPath.substr(0, normPath.size() - 3) + "00.skin";
 
         auto m2BytesOpt = vfs.ReadFile(normPath);
@@ -177,21 +439,18 @@ public:
             std::fprintf(stderr, "  -> [M2 Reason] Missing .m2 in VFS: %s\n", normPath.c_str());
             return std::nullopt;
         }
-        auto skinBytesOpt = vfs.ReadFile(skinPath);
-        if (!skinBytesOpt) {
-            std::fprintf(stderr, "  -> [M2 Reason] Missing 00.skin in VFS: %s\n", skinPath.c_str());
-            return std::nullopt;
-        }
 
         std::span<const uint8_t> m2Bytes(*m2BytesOpt);
-        std::span<const uint8_t> skinBytes(*skinBytesOpt);
 
-        // 兼容 CoA 从高版本移植的 MD21 封装格式 (剥离 8 字节 'MD21' + size 块头后即为标准 MD20)
+        // 纯粒子 M2 (屋顶炊烟/火苗) 无外部 .skin，仅在存在实体网格时才延迟读取
+        std::vector<uint8_t>     skinBytesStorage;
+        std::span<const uint8_t> skinBytes{};
+
         if (m2Bytes.size() >= sizeof(M2HeaderV264) + 8 && std::memcmp(m2Bytes.data(), "MD21", 4) == 0) {
             m2Bytes = m2Bytes.subspan(8);
         }
 
-        if (m2Bytes.size() < sizeof(M2HeaderV264) || skinBytes.size() < sizeof(M2SkinHeader)) {
+        if (m2Bytes.size() < sizeof(M2HeaderV264)) {
             std::fprintf(stderr, "  -> [M2 Reason] File too small: %s\n", normPath.c_str());
             return std::nullopt;
         }
@@ -202,19 +461,37 @@ public:
             std::fprintf(stderr, "  -> [M2 Reason] Bad magic in: %s\n", normPath.c_str());
             return std::nullopt;
         }
-        if (m2Hdr.vertices.count == 0) {
-            std::fprintf(stderr, "  -> [M2 Reason] 0 mesh vertices (particle-only M2): %s\n", normPath.c_str());
+        const bool hasMesh      = (m2Hdr.vertices.count > 0);
+        const bool hasParticles = (m2Hdr.particleEmitters.count > 0);
+        if (!hasMesh && !hasParticles) {
+            std::fprintf(stderr, "  -> [M2 Reason] 0 mesh vertices and 0 particle emitters: %s\n", normPath.c_str());
             return std::nullopt;
+        }
+
+        // 纯粒子 M2 不读取 .skin，直接跳过 VBO/IBO 与 submesh 构建流程
+        if (hasMesh) {
+            auto skinBytesOpt = vfs.ReadFile(skinPath);
+            if (!skinBytesOpt) {
+                std::fprintf(stderr, "  -> [M2 Reason] Missing 00.skin in VFS: %s\n", skinPath.c_str());
+                return std::nullopt;
+            }
+            skinBytesStorage = std::move(*skinBytesOpt);
+            skinBytes        = skinBytesStorage;
+            if (skinBytes.size() < sizeof(M2SkinHeader)) {
+                std::fprintf(stderr, "  -> [M2 Reason] Skin file too small: %s\n", skinPath.c_str());
+                return std::nullopt;
+            }
         }
 
         M2SkinHeader skinHdr{};
-        std::memcpy(&skinHdr, skinBytes.data(), sizeof(M2SkinHeader));
-        if (std::memcmp(skinHdr.magic, "SKIN", 4) != 0) {
-            std::fprintf(stderr, "  -> [M2 Reason] Bad SKIN magic in: %s\n", skinPath.c_str());
-            return std::nullopt;
+        if (hasMesh) {
+            std::memcpy(&skinHdr, skinBytes.data(), sizeof(M2SkinHeader));
+            if (std::memcmp(skinHdr.magic, "SKIN", 4) != 0) {
+                std::fprintf(stderr, "  -> [M2 Reason] Bad SKIN magic in: %s\n", skinPath.c_str());
+                return std::nullopt;
+            }
         }
 
-        // 1. 边界安全切片辅助函数
         auto getSpan = []<typename T>(std::span<const uint8_t> blob, M2Array arr) -> std::span<const T> {
             if (arr.count == 0 || static_cast<size_t>(arr.offset) + static_cast<size_t>(arr.count) * sizeof(T) > blob.size()) {
                 return {};
@@ -222,32 +499,54 @@ public:
             return std::span<const T>(reinterpret_cast<const T*>(blob.data() + arr.offset), arr.count);
         };
 
-        auto m2Verts    = getSpan.template operator()<M2Vertex>(m2Bytes, m2Hdr.vertices);
-        auto m2TexDefs  = getSpan.template operator()<M2TextureDef>(m2Bytes, m2Hdr.textures);
-        auto m2Mats     = getSpan.template operator()<M2Material>(m2Bytes, m2Hdr.renderFlags);
-        auto m2TexLut   = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.texLookupTable);
-        auto uvAnimLut  = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.texTransformLookupTable);
+        auto m2Verts     = getSpan.template operator()<M2Vertex>(m2Bytes, m2Hdr.vertices);
+        auto m2TexDefs   = getSpan.template operator()<M2TextureDef>(m2Bytes, m2Hdr.textures);
+        auto m2Mats      = getSpan.template operator()<M2Material>(m2Bytes, m2Hdr.renderFlags);
+        auto m2TexLut    = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.texLookupTable);
+        auto transLut    = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.transparencyLookupTable);
+        auto uvAnimLut   = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.texTransformLookupTable);
+        auto globalSeqs  = getSpan.template operator()<uint32_t>(m2Bytes, m2Hdr.globalSequences);
+        auto sequences   = getSpan.template operator()<M2Sequence>(m2Bytes, m2Hdr.animations);
+        auto compBones   = getSpan.template operator()<M2CompBone>(m2Bytes, m2Hdr.bones);
+        auto colorDefs   = getSpan.template operator()<M2ColorDef>(m2Bytes, m2Hdr.colors);
+        auto transDefs   = getSpan.template operator()<M2TrackBase>(m2Bytes, m2Hdr.transparency);
+        auto uvTransDefs = getSpan.template operator()<M2TexTransformDef>(m2Bytes, m2Hdr.textureTransforms);
 
         auto skinVertLut   = getSpan.template operator()<uint16_t>(skinBytes, skinHdr.vertices);
         auto skinIndices   = getSpan.template operator()<uint16_t>(skinBytes, skinHdr.indices);
         auto skinSubmeshes = getSpan.template operator()<M2SkinSection>(skinBytes, skinHdr.submeshes);
         auto skinBatches   = getSpan.template operator()<M2Batch>(skinBytes, skinHdr.batches);
 
-        if (m2Verts.empty() || skinVertLut.empty() || skinIndices.empty() || skinSubmeshes.empty()) {
+        if (hasMesh && (m2Verts.empty() || skinVertLut.empty() || skinIndices.empty() || skinSubmeshes.empty())) {
             return std::nullopt;
         }
 
-        // 1.5 统计 M2Vertex.pos 得到模型局部空间 AABB (供加载期世界空间包围盒预计算使用)
-        glm::vec3 localMin = m2Verts.front().pos;
-        glm::vec3 localMax = m2Verts.front().pos;
-        for (const auto& v : m2Verts) {
-            localMin = glm::min(localMin, v.pos);
-            localMax = glm::max(localMax, v.pos);
+        // 统计 M2Vertex.pos 得到模型局部空间 AABB；纯粒子模型使用保守包围盒
+        glm::vec3 localMin(-4.0f, -4.0f, -1.0f);
+        glm::vec3 localMax( 4.0f,  4.0f, 12.0f);
+        if (hasMesh) {
+            localMin = m2Verts.front().pos;
+            localMax = m2Verts.front().pos;
+            for (const auto& v : m2Verts) {
+                localMin = glm::min(localMin, v.pos);
+                localMax = glm::max(localMax, v.pos);
+            }
+            localMax = localMin + glm::max(localMax - localMin, glm::vec3(0.05f));
         }
-        // 施加最小厚度防止扁平/零体积几何体退化导致视锥误剔除
-        localMax = localMin + glm::max(localMax - localMin, glm::vec3(0.05f));
 
-        // 2. 解析 M2 内部引用的所有硬编码 BLP 贴图 (开启 repeatWrap = true 支持瀑布/长条构件 UV 平铺)
+        // 校验顶点骨骼索引不越界，避免非法索引访问 SSBO
+        std::vector<M2Vertex> safeVerts(m2Verts.begin(), m2Verts.end());
+        const uint8_t maxBoneIdx = compBones.empty() ? 0 : static_cast<uint8_t>(std::min<size_t>(compBones.size() - 1, 255));
+        for (auto& v : safeVerts) {
+            for (int k = 0; k < 4; ++k) {
+                if (v.boneIndices[k] > maxBoneIdx) {
+                    v.boneIndices[k] = 0;
+                    v.boneWeights[k] = 0;
+                }
+            }
+        }
+
+        // 加载 M2 引用的所有 BLP 贴图
         std::vector<GLuint> loadedTexHandles(m2TexDefs.size(), fallbackWhiteTex);
         for (size_t i = 0; i < m2TexDefs.size(); ++i) {
             const auto& td = m2TexDefs[i];
@@ -260,21 +559,66 @@ public:
             }
         }
 
-        // 3. 将 .skin 的二级局部索引展开为直接指向 M2Vertex 的全局索引数组
         std::vector<uint16_t> globalIndices(skinIndices.size());
         for (size_t i = 0; i < skinIndices.size(); ++i) {
             uint16_t localIdx = skinIndices[i];
             globalIndices[i] = (localIdx < skinVertLut.size()) ? skinVertLut[localIdx] : 0;
         }
 
-        // 4. 上传 VBO 与 IBO 到 GPU 显存 (不可变静态存储，0 flag)
         GpuM2Model gpuModel;
-        gpuModel.vbo = rhi::GlBuffer(m2Verts.size_bytes(), m2Verts.data(), 0);
-        gpuModel.ibo = rhi::GlBuffer(globalIndices.size() * sizeof(uint16_t), globalIndices.data(), 0);
+        if (hasMesh) {
+            gpuModel.vbo = rhi::GlBuffer(safeVerts.size() * sizeof(M2Vertex), safeVerts.data(), 0);
+            gpuModel.ibo = rhi::GlBuffer(globalIndices.size() * sizeof(uint16_t), globalIndices.data(), 0);
+        }
         gpuModel.localBoundsMin = localMin;
         gpuModel.localBoundsMax = localMax;
+        gpuModel.globalSequences.assign(globalSeqs.begin(), globalSeqs.end());
 
-        // 5. 将 M2Batch 材质与 M2SkinSection 子网格配对组装 (支持多层半透明/瀑布/发光叠加)
+        // 解析骨骼、颜色、透明度与 UV 变换关键帧轨道
+        gpuModel.bones.reserve(compBones.size());
+        for (const auto& cb : compBones) {
+            RuntimeM2Bone rb{};
+            rb.parentBone  = cb.parentBone;
+            rb.pivot       = cb.pivot;
+            rb.translation = ExtractTrack<glm::vec3, glm::vec3>(m2Bytes, cb.translation, sequences,
+                                [](const glm::vec3& v) { return v; });
+            rb.rotation    = ExtractTrack<M2CompQuat, glm::quat>(m2Bytes, cb.rotation, sequences, DecompressQuat);
+            rb.scale       = ExtractTrack<glm::vec3, glm::vec3>(m2Bytes, cb.scale, sequences,
+                                [](const glm::vec3& v) { return v; });
+
+            if (rb.translation.HasAnimation() || rb.rotation.HasAnimation() || rb.scale.HasAnimation()) {
+                gpuModel.hasAnimatedBones = true;
+            }
+            gpuModel.bones.push_back(std::move(rb));
+        }
+
+        gpuModel.colorTracks.reserve(colorDefs.size());
+        for (const auto& cd : colorDefs) {
+            RuntimeM2Color rc{};
+            rc.color = ExtractTrack<glm::vec3, glm::vec3>(m2Bytes, cd.color, sequences,
+                          [](const glm::vec3& v) { return glm::clamp(v, glm::vec3(0.0f), glm::vec3(2.0f)); });
+            rc.alpha = ExtractTrack<uint16_t, float>(m2Bytes, cd.alpha, sequences,
+                          [](uint16_t a) { return glm::clamp(static_cast<float>(a) / 32767.0f, 0.0f, 1.0f); });
+            gpuModel.colorTracks.push_back(std::move(rc));
+        }
+
+        gpuModel.transWeightTracks.reserve(transDefs.size());
+        for (const auto& td : transDefs) {
+            gpuModel.transWeightTracks.push_back(
+                ExtractTrack<uint16_t, float>(m2Bytes, td, sequences,
+                    [](uint16_t w) { return glm::clamp(static_cast<float>(w) / 32767.0f, 0.0f, 1.0f); })
+            );
+        }
+
+        gpuModel.uvTransTracks.reserve(uvTransDefs.size());
+        for (const auto& ut : uvTransDefs) {
+            gpuModel.uvTransTracks.push_back(
+                ExtractTrack<glm::vec3, glm::vec3>(m2Bytes, ut.translation, sequences,
+                    [](const glm::vec3& v) { return v; })
+            );
+        }
+
+        // 将 M2Batch 材质与 M2SkinSection 子网格配对组装
         for (size_t sIdx = 0; sIdx < skinSubmeshes.size(); ++sIdx) {
             const auto& sec = skinSubmeshes[sIdx];
             uint32_t firstIdx = static_cast<uint32_t>(sec.indexStart);
@@ -298,11 +642,23 @@ public:
                 sub.blendMode  = 0;
 
                 if (batch.materialIndex < m2Mats.size()) {
-                    sub.blendMode = m2Mats[batch.materialIndex].blendMode;
+                    sub.blendMode     = m2Mats[batch.materialIndex].blendMode;
+                    sub.materialFlags = m2Mats[batch.materialIndex].flags;
+                }
+                if (batch.colorIndex >= 0 && static_cast<size_t>(batch.colorIndex) < gpuModel.colorTracks.size()) {
+                    sub.colorIndex = batch.colorIndex;
+                }
+                if (batch.textureWeightComboIndex < transLut.size()) {
+                    uint16_t twIdx = transLut[batch.textureWeightComboIndex];
+                    if (twIdx < gpuModel.transWeightTracks.size()) {
+                        sub.transWeightIndex = static_cast<int16_t>(twIdx);
+                    }
                 }
                 if (m2Hdr.textureTransforms.count > 0 && batch.textureTransformComboIndex < uvAnimLut.size()) {
-                    if (uvAnimLut[batch.textureTransformComboIndex] < m2Hdr.textureTransforms.count) {
-                        sub.blendMode = 10; // 10 = 启用 UV 动态滚动的瀑布/水幕层
+                    uint16_t uvIdx = uvAnimLut[batch.textureTransformComboIndex];
+                    if (uvIdx < gpuModel.uvTransTracks.size()) {
+                        sub.uvTransIndex = static_cast<int16_t>(uvIdx);
+                        sub.blendMode    = 10; // 启用 UV 动画的瀑布/特效层
                     }
                 }
                 if (batch.textureComboIndex < m2TexLut.size()) {
@@ -326,7 +682,174 @@ public:
             }
         }
 
+        // ==================== 解析 3.3.5a 粒子发射器 (476 字节 M2ParticleDefV264) ====================
+        auto particleDefs = getSpan.template operator()<M2ParticleDefV264>(m2Bytes, m2Hdr.particleEmitters);
+        if (!particleDefs.empty()) {
+            // 浮点轨统一取前 4 帧均值，抑制异常单帧；结果为 0 时回落到合理默认值
+            auto sampleTrackFloat = [&](const M2TrackBase& track, float fallback, float defaultIfZero) -> float {
+                auto anim = ExtractTrack<float, float>(m2Bytes, track, sequences, [](float v) { return v; });
+                if (anim.values.empty()) return fallback;
+                const size_t n = std::min<size_t>(anim.values.size(), 4);
+                float sum = 0.0f;
+                for (size_t k = 0; k < n; ++k) sum += anim.values[k];
+                const float v = sum / static_cast<float>(n);
+                if (std::fabs(v) < 1e-6f && defaultIfZero != 0.0f) return defaultIfZero;
+                return v;
+            };
+            // M2FakeAnimBlock 与 M2TrackBase 前 16 字节布局一致，仅缺少插值类型与全局序列号
+            auto fakeToTrack = [](const M2FakeAnimBlock& blk) {
+                M2TrackBase t{};
+                t.interpolationType = 1;
+                t.globalSequence    = -1;
+                t.timestamps        = blk.timestamps;
+                t.values            = blk.values;
+                return t;
+            };
+            auto applyColorTriple = [](const std::vector<glm::vec3>& vals, RuntimeM2ParticleEmitter& em) {
+                if (vals.empty()) return;
+                glm::vec3 src[3] = {vals.front(), vals[vals.size() / 2], vals.back()};
+                for (auto& c : src) {
+                    if (c.r > 2.0f || c.g > 2.0f || c.b > 2.0f) c /= 255.0f;
+                    c = glm::clamp(c, glm::vec3(0.0f), glm::vec3(1.0f));
+                }
+                em.colorStart = src[0];
+                em.colorMid   = src[1];
+                em.colorEnd   = src[2];
+            };
+            auto applyAlphaTriple = [](const std::vector<float>& vals, RuntimeM2ParticleEmitter& em) {
+                if (vals.empty()) return;
+                em.alphaStart = glm::clamp(vals.front(), 0.0f, 1.0f);
+                em.alphaMid   = glm::clamp(vals[vals.size() / 2], 0.0f, 1.0f);
+                em.alphaEnd   = glm::clamp(vals.back(), 0.0f, 1.0f);
+            };
+            auto applyScaleTriple = [](const std::vector<glm::vec2>& vals, RuntimeM2ParticleEmitter& em) {
+                if (vals.empty()) return;
+                em.scaleStart = vals.front().x;
+                em.scaleMid   = vals[vals.size() / 2].x;
+                em.scaleEnd   = vals.back().x;
+            };
+
+            gpuModel.particleEmitters.reserve(particleDefs.size());
+            for (const auto& pDef : particleDefs) {
+                RuntimeM2ParticleEmitter em{};
+                em.localPos     = pDef.position;
+                em.boneIndex    = pDef.bone;
+                em.blendingType = pDef.blendingType;
+                em.emitterType  = pDef.emitterType;
+                em.texRows      = (pDef.texRows > 0) ? pDef.texRows : 1;
+                em.texCols      = (pDef.texCols > 0) ? pDef.texCols : 1;
+
+                const uint16_t texIdx = static_cast<uint16_t>(pDef.texture & 0x1Fu);
+                em.textureId = (texIdx < loadedTexHandles.size()) ? loadedTexHandles[texIdx] : fallbackWhiteTex;
+
+                em.speed        = sampleTrackFloat(pDef.emissionSpeed,      2.5f,  2.5f);
+                em.speedVary    = sampleTrackFloat(pDef.speedVariation,     0.2f,  0.0f);
+                em.vertRange    = sampleTrackFloat(pDef.verticalRange,      0.2f,  0.0f);
+                em.horizRange   = sampleTrackFloat(pDef.horizontalRange,    0.2f,  0.0f);
+                em.gravity      = sampleTrackFloat(pDef.gravity,            0.0f,  0.0f);
+                em.lifespan     = std::max(sampleTrackFloat(pDef.lifespan,      2.5f,  2.5f),  0.25f);
+                em.emissionRate = std::max(sampleTrackFloat(pDef.emissionRate, 12.0f, 12.0f), 0.0f);
+                em.areaLength   = sampleTrackFloat(pDef.emissionAreaLength, 0.5f,  0.0f);
+                em.areaWidth    = sampleTrackFloat(pDef.emissionAreaWidth,  0.5f,  0.0f);
+
+                applyColorTriple(
+                    ExtractTrack<glm::vec3, glm::vec3>(m2Bytes, fakeToTrack(pDef.colorTrack), sequences,
+                        [](const glm::vec3& v) { return v; }).values, em);
+                applyAlphaTriple(
+                    ExtractTrack<uint16_t, float>(m2Bytes, fakeToTrack(pDef.alphaTrack), sequences,
+                        [](uint16_t a) { return std::clamp(static_cast<float>(a) / 32767.0f, 0.0f, 1.0f); }).values, em);
+                applyScaleTriple(
+                    ExtractTrack<glm::vec2, glm::vec2>(m2Bytes, fakeToTrack(pDef.scaleTrack), sequences,
+                        [](const glm::vec2& v) { return v; }).values, em);
+
+                gpuModel.particleEmitters.push_back(em);
+            }
+
+            std::printf("[M2] %s -> %zu particle emitters (hasMesh=%d)\n",
+                        normPath.c_str(), gpuModel.particleEmitters.size(), hasMesh ? 1 : 0);
+        }
+
         return gpuModel;
+    }
+
+private:
+    static glm::quat DecompressQuat(const M2CompQuat& cq) noexcept {
+        auto conv = [](int16_t v) -> float {
+            return static_cast<float>(v < 0 ? (static_cast<int32_t>(v) + 32768)
+                                            : (static_cast<int32_t>(v) - 32767)) / 32767.0f;
+        };
+        glm::quat q(conv(cq.w), conv(cq.x), conv(cq.y), conv(cq.z));
+        float len2 = glm::dot(q, q);
+        return (len2 > 1e-8f) ? (q * (1.0f / std::sqrt(len2))) : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    template <typename DiskT, typename OutT, typename ConvFn>
+    static M2AnimTrack<OutT> ExtractTrack(
+        std::span<const uint8_t> m2Bytes,
+        const M2TrackBase& raw,
+        std::span<const M2Sequence> sequences,
+        ConvFn conv)
+    {
+        M2AnimTrack<OutT> out{};
+        out.interpType = raw.interpolationType;
+        out.globalSeq  = raw.globalSequence;
+
+        if (raw.timestamps.count == 0 || raw.values.count == 0) return out;
+        const size_t outerCount = std::min(raw.timestamps.count, raw.values.count);
+        if (static_cast<size_t>(raw.timestamps.offset) + outerCount * sizeof(M2Array) > m2Bytes.size()) return out;
+        if (static_cast<size_t>(raw.values.offset)     + outerCount * sizeof(M2Array) > m2Bytes.size()) return out;
+
+        const auto* tsOuter  = reinterpret_cast<const M2Array*>(m2Bytes.data() + raw.timestamps.offset);
+        const auto* valOuter = reinterpret_cast<const M2Array*>(m2Bytes.data() + raw.values.offset);
+
+        // 仅在 Stand (animId == 0) 待机序列中挑选多关键帧轨道；
+        // 严禁误选 Open/Destroy/Death 等一次性动作序列，避免木桶、吊桥等物件异常摆动
+        size_t chosenSeq = 0;
+        if (raw.globalSequence < 0 && !sequences.empty()) {
+            const size_t seqLimit      = std::min(outerCount, sequences.size());
+            size_t       firstStandSeq = seqLimit; // 首个 animId == 0 的序列
+            size_t       multiStandSeq = seqLimit; // 首个含多关键帧的 Stand 序列
+            for (size_t s = 0; s < seqLimit; ++s) {
+                if (sequences[s].animId != 0) continue;
+                if (firstStandSeq == seqLimit) firstStandSeq = s;
+                if (tsOuter[s].count > 1 && valOuter[s].count > 1) {
+                    multiStandSeq = s;
+                    break;
+                }
+            }
+            if (multiStandSeq != seqLimit)      chosenSeq = multiStandSeq;
+            else if (firstStandSeq != seqLimit) chosenSeq = firstStandSeq;
+            else                                chosenSeq = 0;
+        } else {
+            for (size_t s = 0; s < outerCount; ++s) {
+                if (tsOuter[s].count > 1 && valOuter[s].count > 1) {
+                    chosenSeq = s;
+                    break;
+                }
+            }
+        }
+
+        if (chosenSeq < sequences.size() && sequences[chosenSeq].duration > 0) {
+            out.seqDurationMs = sequences[chosenSeq].duration;
+        }
+
+        const M2Array tsArr  = tsOuter[chosenSeq];
+        const M2Array valArr = valOuter[chosenSeq];
+        const size_t  kCount = std::min(tsArr.count, valArr.count);
+        if (kCount == 0) return out;
+
+        if (static_cast<size_t>(tsArr.offset)  + kCount * sizeof(uint32_t) > m2Bytes.size()) return out;
+        if (static_cast<size_t>(valArr.offset) + kCount * sizeof(DiskT)    > m2Bytes.size()) return out;
+
+        const auto* tsPtr  = reinterpret_cast<const uint32_t*>(m2Bytes.data() + tsArr.offset);
+        const auto* valPtr = reinterpret_cast<const DiskT*>(m2Bytes.data() + valArr.offset);
+
+        out.times.assign(tsPtr, tsPtr + kCount);
+        out.values.reserve(kCount);
+        for (size_t k = 0; k < kCount; ++k) {
+            out.values.push_back(conv(valPtr[k]));
+        }
+        return out;
     }
 };
 

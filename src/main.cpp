@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cmath>
 #include <vector>
+#include <array>
+#include <algorithm>
 #include <unordered_set>
 #include "rhi/rhi_gl.hpp"
 #include "vfs/vfs.hpp"
@@ -45,6 +47,21 @@ struct alignas(16) FrameUniforms {
     glm::vec4 skyHorizon;         // rgb = 地平线色
     glm::vec4 waterShallow;       // rgb = 动态浅水色
     glm::vec4 waterDeep;          // rgb = 动态深水色
+};
+
+// 单个公告板粒子的 GPU 实例数据 (48 字节，std430 紧凑排布，对应 kParticleVertShader)
+struct alignas(16) GpuParticleQuad {
+    glm::vec4 worldPosAndSize; // xyz = 世界坐标, w = 半径尺寸
+    glm::vec4 color;           // rgba = 颜色与透明度
+    glm::vec4 uvRect;          // xy = UV 起点, zw = UV 缩放 (子图格)
+};
+static_assert(sizeof(GpuParticleQuad) == 48, "GpuParticleQuad must be 48 bytes");
+
+struct ParticleBatchCmd {
+    GLuint   texId     = 0;
+    uint8_t  blendType = 2;
+    uint32_t firstQuad = 0;
+    uint32_t quadCount = 0;
 };
 
 struct Frustum {
@@ -97,9 +114,10 @@ inline bool IsInstanceVisible(const Frustum& frustum, const glm::vec3& camPos,
 inline bool IsCameraUnderwater(const glm::vec3& camPos, const std::vector<coa::assets::GpuAdtTile>& tiles) {
     for (const auto& tile : tiles) {
         for (const auto& lc : tile.liquidChunks) {
+            const float surfaceZ = std::max(lc.aabbMin.z, lc.aabbMax.z - 0.45f);
             if (camPos.x >= lc.aabbMin.x && camPos.x <= lc.aabbMax.x &&
                 camPos.y >= lc.aabbMin.y && camPos.y <= lc.aabbMax.y &&
-                camPos.z < lc.aabbMax.z && camPos.z > lc.aabbMin.z - 25.0f) {
+                camPos.z < surfaceZ && camPos.z > lc.aabbMin.z - 35.0f) {
                 return true;
             }
         }
@@ -166,17 +184,27 @@ void main() {
     float sunAmt = pow(max(dot(dir, sunDir), 0.0), 96.0);
     sky += uSunColor.rgb * sunAmt * 0.75 * smoothstep(-0.05, 0.12, dir.z);
 
+    if (uFogColorAndParams.w < 1.0) {
+        // 水下视角：将远景背景混入水下深蓝绿体积雾色，仅天顶保留微弱天光透射
+        float upTransmit = smoothstep(0.15, 0.95, dir.z) * 0.35;
+        sky = mix(uFogColorAndParams.rgb, sky, upTransmit);
+    }
+
     FragColor = vec4(sky, 1.0);
 }
 )GLSL";
 
-// 顶点着色器：通过 gl_BaseInstance + gl_InstanceID 从 0 号 SSBO 提取实例世界变换矩阵
-// 标准 GLSL 4.60 着色器：支持魔兽 Z-Up 半兰伯特光照 + 三色天光环境反射 + Alpha Cutout 树叶镂空
+// 顶点着色器：支持 SSBO 硬件实例化 (binding = 0) + M2 骨骼蒙皮 (binding = 1) + UV 动画偏移
 constexpr std::string_view kWorldVertShader = R"GLSL(
 #version 460 core
-layout(location = 0) in vec3 aPos;
-layout(location = 1) in vec3 aNormal;
-layout(location = 2) in vec2 aUV;
+layout(location = 0) in vec3  aPos;
+layout(location = 1) in vec3  aNormal;
+layout(location = 2) in vec2  aUV;
+layout(location = 3) in vec4  aBoneWeights;
+layout(location = 4) in uvec4 aBoneIndices;
+
+layout(location = 2) uniform int  uBoneBaseIndex;
+layout(location = 3) uniform vec2 uUvOffset;
 
 layout(std140, binding = 0) uniform FrameBlock {
     mat4 uView;
@@ -200,21 +228,40 @@ layout(std430, binding = 0) readonly buffer InstanceBuffer {
     mat4 uInstanceMatrices[];
 };
 
+layout(std430, binding = 1) readonly buffer BoneBuffer {
+    mat4 uBoneMatrices[];
+};
+
 out vec3 vWorldPos;
 out vec3 vNormal;
 out vec2 vUV;
 
 void main() {
+    vec3 localPos = aPos;
+    vec3 localNrm = aNormal;
+
+    if (uBoneBaseIndex > 0) {
+        float wSum = aBoneWeights.x + aBoneWeights.y + aBoneWeights.z + aBoneWeights.w;
+        if (wSum > 0.001) {
+            mat4 skinMat = (aBoneWeights.x * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.x)]
+                          + aBoneWeights.y * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.y)]
+                          + aBoneWeights.z * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.z)]
+                          + aBoneWeights.w * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.w)]) / wSum;
+            localPos = (skinMat * vec4(aPos, 1.0)).xyz;
+            localNrm = mat3(skinMat) * aNormal;
+        }
+    }
+
     mat4 modelMat = uInstanceMatrices[gl_BaseInstance + gl_InstanceID];
-    vec4 worldPos = modelMat * vec4(aPos, 1.0);
+    vec4 worldPos = modelMat * vec4(localPos, 1.0);
     vWorldPos = worldPos.xyz;
-    vNormal   = normalize(mat3(modelMat) * aNormal);
-    vUV       = aUV;
+    vNormal   = normalize(mat3(modelMat) * localNrm);
+    vUV       = aUV + uUvOffset;
     gl_Position = uViewProj * worldPos;
 }
 )GLSL";
 
-// 片段着色器：半兰伯特光照 + 双色天光 + 远景大气指数雾
+// 片段着色器：支持 TwoSided 背面法线翻转、Unlit 自发光、M2 批次颜色/透明度动画与指数距离雾
 constexpr std::string_view kWorldFragShader = R"GLSL(
 #version 460 core
 in vec3 vWorldPos;
@@ -227,7 +274,9 @@ layout(binding = 2) uniform sampler2D uTexLayer2;   // 地形 Layer 2
 layout(binding = 3) uniform sampler2D uTexLayer3;   // 地形 Layer 3
 layout(binding = 4) uniform sampler2D uTexAlphaMap; // 64x64 RGB Alpha 遮罩 (M2 模型绑定全黑纹理，alpha=0)
 
-layout(location = 0) uniform int uAlphaCutout; // 0 = 不透明 (不裁切), 1 = Alpha Cutout
+layout(location = 0) uniform int  uAlphaCutout;   // 0 = Opaque, 1 = Cutout, 2 = Blend, 3 = UV Scroll
+layout(location = 1) uniform int  uMaterialFlags; // bit 0 = TwoSided, bit 1 = Unlit
+layout(location = 4) uniform vec4 uBatchColor;    // M2Track 颜色与透明度调制
 
 layout(std140, binding = 0) uniform FrameBlock {
     mat4 uView;
@@ -249,20 +298,17 @@ layout(std140, binding = 0) uniform FrameBlock {
 
 out vec4 FragColor;
 
-// 辅助函数：提取像素感知亮度作为微表面高度，并用平滑混合替换线性 mix
 float GetLuma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
 vec3 HeightBlend(vec3 baseCol, vec3 overCol, float alpha) {
     float hBase = GetLuma(baseCol);
     float hOver = GetLuma(overCol);
-    // 让上层材质优先填充下层材质的暗部缝隙 (0.25 控制咬合锐度)
     float w = clamp((alpha * 1.4 - 0.2) + (hOver - hBase) * 0.35, 0.0, 1.0);
     return mix(baseCol, overCol, smoothstep(0.0, 1.0, w));
 }
 
 void main() {
-    vec2 sampleUV = (uAlphaCutout == 3) ? (vUV + vec2(0.0, -0.75 * uCameraPos.w)) : vUV;
-    vec4 texColor = texture(uTexAlbedo, sampleUV);
+    vec4 texColor = texture(uTexAlbedo, vUV);
     vec3 alphaWeights = texture(uTexAlphaMap, clamp(vUV / 8.0, 0.0, 1.0)).rgb;
     if (dot(alphaWeights, vec3(1.0)) > 0.001) {
         vec3 c1 = texture(uTexLayer1, vUV).rgb;
@@ -272,42 +318,51 @@ void main() {
         texColor.rgb = HeightBlend(texColor.rgb, c2, alphaWeights.g);
         texColor.rgb = HeightBlend(texColor.rgb, c3, alphaWeights.b);
     }
-    if (uAlphaCutout != 0 && texColor.a < 0.5) {
+    if (uAlphaCutout == 1 && (texColor.a * uBatchColor.a) < 0.5) {
         discard;
     }
 
-    // 1. 利用屏幕空间偏导数 (dFdx/dFdy) 从贴图亮度实时重建凹凸法线
-    vec3 N = normalize(vNormal);
-    float height = GetLuma(texColor.rgb);
-    vec3 dPdx = dFdx(vWorldPos);
-    vec3 dPdy = dFdy(vWorldPos);
-    vec3 r1 = cross(dPdy, N);
-    vec3 r2 = cross(N, dPdx);
-    float det = dot(dPdx, r1);
-    vec3 surfGrad = ( abs(det) > 1e-8 ) ? ((r1 * dFdx(height) + r2 * dFdy(height)) / det) : vec3(0.0);
-    N = normalize(N - surfGrad * 0.35); // 0.35 为凹凸强度，可按喜好调节
+    vec3 litColor;
+    if ((uMaterialFlags & 2) != 0) {
+        // Unlit 自发光材质 (火盆火焰/窗户夜景/瀑布水花)：不受背光阴影影响
+        litColor = texColor.rgb * uBatchColor.rgb;
+    } else {
+        vec3 N = normalize(vNormal);
+        // TwoSided 双面材质 (树冠/灌木/旗帜)：当观察背面时翻转法线，避免向光面树叶背光死黑
+        if ((uMaterialFlags & 1) != 0 && !gl_FrontFacing) {
+            N = -N;
+        }
 
-    // 2. 半兰伯特漫反射 + Blinn-Phong 阳光微表面高光
-    vec3 L = normalize(uSunDirAndIntensity.xyz);
-    vec3 V = normalize(uCameraPos.xyz - vWorldPos);
-    vec3 H = normalize(L + V);
+        float height = GetLuma(texColor.rgb);
+        vec3 dPdx = dFdx(vWorldPos);
+        vec3 dPdy = dFdy(vWorldPos);
+        vec3 r1 = cross(dPdy, N);
+        vec3 r2 = cross(N, dPdx);
+        float det = dot(dPdx, r1);
+        vec3 surfGrad = (abs(det) > 1e-8) ? ((r1 * dFdx(height) + r2 * dFdy(height)) / det) : vec3(0.0);
+        N = normalize(N - surfGrad * 0.35);
 
-    float ndotl = max(dot(N, L), 0.0);
-    float halfLambert = ndotl * 0.65 + 0.35;
-    float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.28 * ndotl;
+        vec3 L = normalize(uSunDirAndIntensity.xyz);
+        vec3 V = normalize(uCameraPos.xyz - vWorldPos);
+        vec3 H = normalize(L + V);
 
-    vec3 skyAmbient    = uAmbientSky.rgb;
-    vec3 groundAmbient = uAmbientGround.rgb;
-    vec3 ambient = mix(groundAmbient, skyAmbient, N.z * 0.5 + 0.5);
+        float ndotl = max(dot(N, L), 0.0);
+        float halfLambert = ndotl * 0.65 + 0.35;
+        float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.28 * ndotl;
 
-    vec3 sunColor = uSunColor.rgb * uSunDirAndIntensity.w;
-    vec3 litColor = texColor.rgb * (ambient + sunColor * halfLambert) + sunColor * spec;
+        vec3 skyAmbient    = uAmbientSky.rgb;
+        vec3 groundAmbient = uAmbientGround.rgb;
+        vec3 ambient = mix(groundAmbient, skyAmbient, N.z * 0.5 + 0.5);
+
+        vec3 sunColor = uSunColor.rgb * uSunDirAndIntensity.w;
+        litColor = (texColor.rgb * uBatchColor.rgb) * (ambient + sunColor * halfLambert) + sunColor * spec;
+    }
 
     float dist = length(vWorldPos - uCameraPos.xyz);
     float fogFactor = clamp(exp(-max(dist - uFogColorAndParams.w, 0.0) * uSkyTopAndDensity.w), 0.0, 1.0);
     vec3 fogColor = uFogColorAndParams.rgb;
 
-    float outAlpha = (uAlphaCutout >= 2) ? clamp(texColor.a * 0.85, 0.0, 0.95) : 1.0;
+    float outAlpha = (uAlphaCutout >= 2) ? clamp(texColor.a * uBatchColor.a * 0.85, 0.0, 0.95) : 1.0;
     FragColor = vec4(mix(fogColor, litColor, fogFactor), outAlpha);
 }
 )GLSL";
@@ -443,6 +498,116 @@ void main() {
 }
 )GLSL";
 
+// 粒子顶点着色器：gl_VertexID 展开 6 顶点公告板四边形，从 SSBO (binding = 2) 读取实例数据
+constexpr std::string_view kParticleVertShader = R"GLSL(
+#version 460 core
+struct GpuParticleQuad {
+    vec4 worldPosAndSize; // xyz = 世界坐标, w = 半径尺寸
+    vec4 color;           // rgba = 颜色与透明度
+    vec4 uvRect;          // xy = UV 起点, zw = UV 缩放 (子图格)
+};
+
+layout(std430, binding = 2) readonly buffer ParticleBuffer {
+    GpuParticleQuad uParticles[];
+};
+
+layout(std140, binding = 0) uniform FrameBlock {
+    mat4 uView;
+    mat4 uProj;
+    mat4 uViewProj;
+    vec4 uCameraPos;
+    vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
+};
+
+layout(location = 0) out vec2 vUV;
+layout(location = 1) out vec2 vCorner;
+layout(location = 2) out vec4 vColor;
+layout(location = 3) out vec3 vWorldPos;
+
+const vec2 kQuadCorners[6] = vec2[6](
+    vec2(-0.5, -0.5), vec2( 0.5, -0.5), vec2( 0.5,  0.5),
+    vec2(-0.5, -0.5), vec2( 0.5,  0.5), vec2(-0.5,  0.5)
+);
+
+void main() {
+    vec2 corner = kQuadCorners[gl_VertexID % 6];
+    vec2 uv     = vec2(corner.x + 0.5, 1.0 - (corner.y + 0.5));
+
+    GpuParticleQuad p = uParticles[gl_BaseInstance + gl_InstanceID];
+
+    // 视图矩阵前两列即相机右向量与上向量 (世界空间)，使公告板始终正对镜头
+    vec3 camRight = vec3(uView[0][0], uView[1][0], uView[2][0]);
+    vec3 camUp    = vec3(uView[0][1], uView[1][1], uView[2][1]);
+
+    vec3 worldPos = p.worldPosAndSize.xyz
+                  + (camRight * corner.x + camUp * corner.y) * p.worldPosAndSize.w;
+
+    vUV       = p.uvRect.xy + uv * p.uvRect.zw;
+    vCorner   = corner;
+    vColor    = p.color;
+    vWorldPos = worldPos;
+    gl_Position = uViewProj * vec4(worldPos, 1.0);
+}
+)GLSL";
+
+// 粒子片段着色器：径向软边衰减 + 指数距离雾 (Additive 仅对 rgb 乘 fogFactor)
+constexpr std::string_view kParticleFragShader = R"GLSL(
+#version 460 core
+in vec2 vUV;
+in vec2 vCorner;
+in vec4 vColor;
+in vec3 vWorldPos;
+
+layout(binding = 0) uniform sampler2D uTexAlbedo;
+layout(location = 0) uniform int uAdditive; // 1 = 叠加混合, 0 = 常规 AlphaBlend
+
+layout(std140, binding = 0) uniform FrameBlock {
+    mat4 uView;
+    mat4 uProj;
+    mat4 uViewProj;
+    vec4 uCameraPos;
+    vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
+};
+
+out vec4 FragColor;
+
+void main() {
+    vec4 c = texture(uTexAlbedo, vUV) * vColor;
+
+    // 无贴图 / 纯白贴图时避免硬边方块，保证炊烟与火苗边缘柔和
+    float radial = 1.0 - smoothstep(0.35, 0.5, length(vCorner));
+    c.a *= radial;
+    if (c.a < 0.004) discard;
+
+    float dist      = length(vWorldPos - uCameraPos.xyz);
+    float fogFactor = clamp(exp(-max(dist - uFogColorAndParams.w, 0.0) * uSkyTopAndDensity.w), 0.0, 1.0);
+
+    vec3 litRgb = (uAdditive != 0) ? (c.rgb * fogFactor)
+                                   : mix(uFogColorAndParams.rgb, c.rgb, fogFactor);
+    FragColor = vec4(litRgb, c.a);
+}
+)GLSL";
+
 int main(int /*argc*/, char* /*argv*/[]) {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
 
@@ -478,14 +643,20 @@ int main(int /*argc*/, char* /*argv*/[]) {
         coa::rhi::GlShaderProgram worldShader(kWorldVertShader, kWorldFragShader);
         coa::rhi::GlShaderProgram waterShader(kWaterVertShader, kWaterFragShader);
         coa::rhi::GlShaderProgram skyShader(kSkyVertShader, kSkyFragShader);
+        coa::rhi::GlShaderProgram particleShader(kParticleVertShader, kParticleFragShader);
         GLuint sharedM2Vao = coa::assets::GpuM2Model::CreateSharedVAO();
         GLuint terrainVao  = coa::assets::GpuAdtTile::CreateTerrainVAO();
         GLuint skyVao      = 0;
         glCreateVertexArrays(1, &skyVao);
 
-        // 每帧动态上传可见实例矩阵的 SSBO (binding = 0，与 FrameBlock UBO 空间相互独立)
+        // 每帧动态上传可见实例矩阵的 SSBO (binding = 0) 与 M2 骨骼蒙皮矩阵的 SSBO (binding = 1)
         coa::rhi::GlBuffer instanceSsbo(sizeof(glm::mat4), nullptr, GL_DYNAMIC_STORAGE_BIT);
         instanceSsbo.BindAsStorageBuffer(0);
+        coa::rhi::GlBuffer boneSsbo(sizeof(glm::mat4), nullptr, GL_DYNAMIC_STORAGE_BIT);
+        boneSsbo.BindAsStorageBuffer(1);
+        // binding = 2: 本帧全部公告板粒子实例数据
+        coa::rhi::GlBuffer particleSsbo(sizeof(GpuParticleQuad), nullptr, GL_DYNAMIC_STORAGE_BIT);
+        particleSsbo.BindAsStorageBuffer(2);
 
         coa::rhi::GlTexture2D whiteFallbackTex(1, 1, 1, coa::rhi::PixelFormat::RGBA8, true);
         const uint8_t whitePixel[4] = {180, 210, 140, 255}; // 浅草绿兜底色
@@ -519,6 +690,30 @@ int main(int /*argc*/, char* /*argv*/[]) {
         );
         if (tile2) adtTiles.push_back(std::move(*tile2));
 
+        // 跨 ADT 全局 M2 合批桶：将所有已加载 ADT 中指向同一个 GpuM2Model 的实例列表聚合到一起
+        struct GlobalM2Bucket {
+            const coa::assets::GpuM2Model* model = nullptr;
+            std::vector<const std::vector<coa::assets::M2Instance>*> instanceLists;
+        };
+        std::vector<GlobalM2Bucket> globalM2Buckets;
+        {
+            std::unordered_map<const coa::assets::GpuM2Model*, size_t> bucketMap;
+            for (const auto& tile : adtTiles) {
+                for (const auto& batch : tile.doodadBatches) {
+                    const auto* modelPtr = batch.model.get();
+                    if (!modelPtr) continue;
+                    auto [it, inserted] = bucketMap.try_emplace(modelPtr, globalM2Buckets.size());
+                    if (inserted) {
+                        globalM2Buckets.push_back(GlobalM2Bucket{modelPtr, {}});
+                    }
+                    globalM2Buckets[it->second].instanceLists.push_back(&batch.instances);
+                }
+            }
+            std::printf("[Global Batcher] Merged M2 across %zu ADTs into %zu unique buckets (VRAM Cache: %zu M2, %zu WMO, %zu BLP)\n",
+                        adtTiles.size(), globalM2Buckets.size(),
+                        assets.CachedM2Count(), assets.CachedWmoCount(), assets.CachedTextureCount());
+        }
+
         // 自动将摄像机瞬移至首个成功加载的 ADT 地形中心上空
         glm::vec3 camPos = (!adtTiles.empty()) ? adtTiles.front().suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
         float camYaw   = 0.0f;
@@ -536,6 +731,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
         std::vector<coa::rhi::DrawCommand> renderQueue;
         std::vector<glm::mat4> visibleMatrices;
+        std::vector<glm::mat4> visibleBoneMatrices;
+        std::vector<GpuParticleQuad>  visibleParticles;
+        std::vector<ParticleBatchCmd> particleBatches;
         bool running = true;
 
         while (running) {
@@ -644,8 +842,13 @@ int main(int /*argc*/, char* /*argv*/[]) {
             glEnable(GL_DEPTH_TEST);
 
             renderQueue.clear();
+            visibleParticles.clear();
+            particleBatches.clear();
             visibleMatrices.clear();
             visibleMatrices.push_back(glm::mat4(1.0f)); // 下标 0 固定为单位阵，供 MCNK 地形复用
+            visibleBoneMatrices.clear();
+            visibleBoneMatrices.push_back(glm::mat4(1.0f)); // 下标 0 固定为单位阵，供静态无骨骼网格占位
+            const float animTimeSec = static_cast<float>(nowTicks) * 1e-9f;
 
             // 每帧提取 Reverse-Z 视锥体
             Frustum camFrustum = Frustum::ExtractFromViewProj(uboData.viewProj);
@@ -685,13 +888,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 }
             }
 
-            // 2. M2 按模型分桶硬件实例化：每个 doodadBatch 的 model 指针即为唯一桶键
-            for (const auto& tile : adtTiles) {
-                for (const auto& batch : tile.doodadBatches) {
-                    uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
-                    uint32_t visibleCount  = 0;
+            // 2. 跨 ADT 全局 M2 单次合批硬件实例化 + 全局单次骨骼/UV/颜色关键帧评估
+            for (const auto& bucket : globalM2Buckets) {
+                const auto& model = *bucket.model;
+                uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
+                uint32_t visibleCount  = 0;
 
-                    for (const auto& inst : batch.instances) {
+                for (const auto* instList : bucket.instanceLists) {
+                    for (const auto& inst : *instList) {
                         if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
                                                inst.worldCenter, inst.worldRadius)) {
                             continue;
@@ -699,44 +903,184 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         visibleMatrices.push_back(inst.model);
                         ++visibleCount;
                     }
-                    if (visibleCount == 0) continue;
-                    visibleM2Instances += static_cast<int>(visibleCount);
+                }
+                if (visibleCount == 0) continue;
+                visibleM2Instances += static_cast<int>(visibleCount);
 
-                    // 同一 M2 模型的每个子网格仅生成 1 条实例化 DrawCommand
-                    for (const auto& sub : batch.model.submeshes) {
-                        coa::rhi::DrawCommand cmd{};
-                        uint8_t pass = 2;
-                        if (sub.blendMode == 1) {
-                            pass = 3; // Alpha Cutout (树叶/栅栏)
-                        } else if (sub.blendMode == 2) {
-                            pass = 5; // Alpha Blend (瀑布水幕/半透明薄纱)
-                        } else if (sub.blendMode == 10) {
-                            pass = 7; // UV 动态滚动的瀑布水幕
-                        } else if (sub.blendMode >= 3) {
-                            pass = 6; // Additive / Mod (火盆光晕/魔法水花)
+                // ---- 粒子发射器：为每个可见实例生成确定性公告板粒子 (屋顶炊烟 / 火把火苗) ----
+                if (!model.particleEmitters.empty()) {
+                    auto hash01 = [](uint32_t n) {
+                        n ^= n >> 16; n *= 2246822519u;
+                        n ^= n >> 13; n *= 3266489917u;
+                        n ^= n >> 16;
+                        return static_cast<float>(n & 0xFFFFFFu) / 16777216.0f;
+                    };
+
+                    const glm::mat4* visMats = visibleMatrices.data() + firstInstance;
+                    for (uint32_t k = 0; k < visibleCount; ++k) {
+                        const glm::mat4& instMat = visMats[k];
+                        const glm::vec3  instWorld(instMat[3].x, instMat[3].y, instMat[3].z);
+                        if (glm::distance(instWorld, camPos) > 220.0f) continue;
+
+                        const float instHash = std::fabs(std::fmod(
+                            instWorld.x * 0.137f + instWorld.y * 0.311f + instWorld.z * 0.733f, 1.0f));
+
+                        for (size_t emi = 0; emi < model.particleEmitters.size(); ++emi) {
+                            const auto& em    = model.particleEmitters[emi];
+                            const float life  = std::max(em.lifespan, 0.25f);
+                            const int   count = std::clamp(static_cast<int>(em.emissionRate * life), 6, 32);
+                            const int   rows  = std::max(1, static_cast<int>(em.texRows));
+                            const int   cols  = std::max(1, static_cast<int>(em.texCols));
+                            const int   frames = rows * cols;
+                            const uint32_t firstQuad = static_cast<uint32_t>(visibleParticles.size());
+
+                            for (int p = 0; p < count; ++p) {
+                                const uint32_t seed = static_cast<uint32_t>(p) * 9781u
+                                                    + k * 6271u
+                                                    + static_cast<uint32_t>(emi) * 4099u;
+                                const float r1 = hash01(seed + 11u);
+                                const float r2 = hash01(seed + 29u);
+                                const float r3 = hash01(seed + 47u);
+
+                                float u = std::fmod(animTimeSec / life
+                                                    + static_cast<float>(p) / static_cast<float>(count)
+                                                    + instHash, 1.0f);
+                                if (u < 0.0f) u += 1.0f;
+
+                                // 发射点：发射器局部位置 + 发射面积抖动
+                                const glm::vec3 localStart = em.localPos + glm::vec3(
+                                    (r1 - 0.5f) * std::max(em.areaLength, 0.0f),
+                                    (r2 - 0.5f) * std::max(em.areaWidth, 0.0f),
+                                    0.0f);
+                                const glm::vec4 start4 = instMat * glm::vec4(localStart, 1.0f);
+                                const glm::vec3 startWorld(start4.x, start4.y, start4.z);
+
+                                // 初速度：以向上为主 + 横向扩散，受速度变化率扰动
+                                const float spd = em.speed * (1.0f - em.speedVary * 0.5f + em.speedVary * r3);
+                                const glm::vec4 vel4 = instMat * glm::vec4(
+                                    (r1 - 0.5f) * em.horizRange,
+                                    (r2 - 0.5f) * em.horizRange,
+                                    spd, 0.0f);
+                                const glm::vec3 velWorld(vel4.x, vel4.y, vel4.z);
+
+                                const float t = u * life;
+                                glm::vec3 worldPos = startWorld + velWorld * t;
+                                worldPos.z += 0.5f * em.gravity * t * t;
+
+                                // 三段插值：起始 -> 中段 -> 结束
+                                glm::vec3 col; float alp; float scl;
+                                if (u < 0.35f) {
+                                    const float a = u / 0.35f;
+                                    col = glm::mix(em.colorStart, em.colorMid, a);
+                                    alp = glm::mix(em.alphaStart, em.alphaMid, a);
+                                    scl = glm::mix(em.scaleStart, em.scaleMid, a);
+                                } else {
+                                    const float a = (u - 0.35f) / 0.65f;
+                                    col = glm::mix(em.colorMid, em.colorEnd, a);
+                                    alp = glm::mix(em.alphaMid, em.alphaEnd, a);
+                                    scl = glm::mix(em.scaleMid, em.scaleEnd, a);
+                                }
+                                if (alp < 0.004f) continue;
+
+                                // texRows x texCols 子图格：随寿命推进帧
+                                const int   frame = std::min(frames - 1, static_cast<int>(u * static_cast<float>(frames)));
+                                const float cellW = 1.0f / static_cast<float>(cols);
+                                const float cellH = 1.0f / static_cast<float>(rows);
+                                const int   colIdx = frame % cols;
+                                const int   rowIdx = frame / cols;
+
+                                GpuParticleQuad quad{};
+                                quad.worldPosAndSize = glm::vec4(worldPos, std::max(scl, 0.05f));
+                                quad.color           = glm::vec4(col, alp);
+                                quad.uvRect          = glm::vec4(colIdx * cellW, rowIdx * cellH, cellW, cellH);
+                                visibleParticles.push_back(quad);
+                            }
+
+                            const uint32_t emitted = static_cast<uint32_t>(visibleParticles.size()) - firstQuad;
+                            if (emitted > 0) {
+                                particleBatches.push_back(ParticleBatchCmd{
+                                    em.textureId != 0 ? em.textureId : whiteFallbackTex.Handle(),
+                                    em.blendingType,
+                                    firstQuad,
+                                    emitted
+                                });
+                            }
                         }
-                        cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sub.textureId), 0);
-                        cmd.program       = worldShader.Handle();
-                        cmd.vao           = sharedM2Vao;
-                        cmd.vbo           = batch.model.vbo.Handle();
-                        cmd.ibo           = batch.model.ibo.Handle();
-                        cmd.stride        = sizeof(coa::assets::M2Vertex);
-                        cmd.texAlbedo     = sub.textureId;
-                        cmd.firstIndex    = sub.firstIndex;
-                        cmd.indexCount    = sub.indexCount;
-                        cmd.baseVertex    = 0;
-                        cmd.instanceCount = visibleCount;
-                        cmd.baseInstance  = firstInstance;
-                        cmd.texAlphaMap   = blackAlphaTex.Handle();
-                        renderQueue.push_back(cmd);
                     }
+                }
+
+                // 全场景同一种 M2 模型每帧仅评估 1 次骨骼矩阵栈
+                uint32_t boneBaseIndex = 0;
+                if (model.hasAnimatedBones) {
+                    boneBaseIndex = model.EvaluateBones(animTimeSec, visibleBoneMatrices);
+                }
+
+                // 跨所有已加载 ADT 的同种 M2 子网格仅生成 1 条实例化 DrawCommand
+                for (const auto& sub : model.submeshes) {
+                    glm::vec4 batchColor(1.0f);
+                    if (sub.colorIndex >= 0 && static_cast<size_t>(sub.colorIndex) < model.colorTracks.size()) {
+                        const auto& ct = model.colorTracks[sub.colorIndex];
+                        glm::vec3 rgb = ct.color.SampleLinear(animTimeSec, model.globalSequences, glm::vec3(1.0f));
+                        float     alp = ct.alpha.SampleLinear(animTimeSec, model.globalSequences, 1.0f);
+                        batchColor = glm::vec4(rgb, alp);
+                    }
+                    if (sub.transWeightIndex >= 0 && static_cast<size_t>(sub.transWeightIndex) < model.transWeightTracks.size()) {
+                        const auto& tw = model.transWeightTracks[sub.transWeightIndex];
+                        batchColor.a *= tw.SampleLinear(animTimeSec, model.globalSequences, 1.0f);
+                    }
+                    if (batchColor.a < 0.01f) continue;
+
+                    glm::vec2 uvOffset(0.0f);
+                    if (sub.uvTransIndex >= 0 && static_cast<size_t>(sub.uvTransIndex) < model.uvTransTracks.size()) {
+                        const auto& ut = model.uvTransTracks[sub.uvTransIndex];
+                        if (ut.HasAnimation()) {
+                            glm::vec3 uv3 = ut.SampleLinear(animTimeSec, model.globalSequences, glm::vec3(0.0f));
+                            uvOffset = glm::vec2(uv3.x, uv3.y);
+                        } else {
+                            uvOffset = glm::vec2(0.0f, -0.75f * animTimeSec);
+                        }
+                    } else if (sub.blendMode == 10) {
+                        uvOffset = glm::vec2(0.0f, -0.75f * animTimeSec);
+                    }
+
+                    coa::rhi::DrawCommand cmd{};
+                    uint8_t pass = 2;
+                    if (sub.blendMode == 1) {
+                        pass = 3; // Alpha Cutout (树叶/栅栏)
+                    } else if (sub.blendMode == 2) {
+                        pass = 5; // Alpha Blend (半透明水幕/薄纱)
+                    } else if (sub.blendMode == 10) {
+                        pass = 7; // UV 动态滚动的瀑布水幕
+                    } else if (sub.blendMode >= 3) {
+                        pass = 6; // Additive / Mod (火盆光晕/魔法水花)
+                    }
+                    cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sub.textureId), 0);
+                    cmd.program       = worldShader.Handle();
+                    cmd.vao           = sharedM2Vao;
+                    cmd.vbo           = model.vbo.Handle();
+                    cmd.ibo           = model.ibo.Handle();
+                    cmd.stride        = sizeof(coa::assets::M2Vertex);
+                    cmd.texAlbedo     = sub.textureId;
+                    cmd.firstIndex    = sub.firstIndex;
+                    cmd.indexCount    = sub.indexCount;
+                    cmd.baseVertex    = 0;
+                    cmd.instanceCount = visibleCount;
+                    cmd.baseInstance  = firstInstance;
+                    cmd.boneBaseIndex = boneBaseIndex;
+                    cmd.isTwoSided    = ((sub.materialFlags & 0x04u) != 0) ? 1 : 0;
+                    cmd.isUnlit       = ((sub.materialFlags & 0x01u) != 0 || pass >= 6) ? 1 : 0;
+                    cmd.uvOffset      = uvOffset;
+                    cmd.batchColor    = batchColor;
+                    cmd.texAlphaMap   = blackAlphaTex.Handle();
+                    renderQueue.push_back(cmd);
                 }
             }
 
             // 3. WMO 两级层次化裁剪：先整栋建筑，再逐个子房间
             for (const auto& tile : adtTiles) {
                 for (const auto& wmoBatch : tile.wmoBatches) {
-                    const auto& model = wmoBatch.model;
+                    if (!wmoBatch.model) continue;
+                    const auto& model = *wmoBatch.model;
                     for (const auto& inst : wmoBatch.instances) {
                         // 3.1 整栋建筑不可见 -> 直接跳过其所有子房间
                         if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
@@ -818,6 +1162,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
             }
             instanceSsbo.UpdateSubData(0, neededBytes, visibleMatrices.data());
 
+            // 将本帧活动 M2 骨骼矩阵上传至 SSBO (binding = 1)
+            size_t neededBoneBytes = visibleBoneMatrices.size() * sizeof(glm::mat4);
+            if (neededBoneBytes > boneSsbo.Size()) {
+                boneSsbo = coa::rhi::GlBuffer(neededBoneBytes, nullptr, GL_DYNAMIC_STORAGE_BIT);
+                boneSsbo.BindAsStorageBuffer(1);
+            }
+            boneSsbo.UpdateSubData(0, neededBoneBytes, visibleBoneMatrices.data());
+
             // 每 0.25 秒更新一次窗口标题，观察视锥裁剪统计
             titleTimer += dt;
             if (titleTimer >= 0.25f) {
@@ -836,6 +1188,50 @@ int main(int /*argc*/, char* /*argv*/[]) {
             }
 
             coa::rhi::SubmitDrawCommands(renderQueue);
+
+            // ---- 粒子公告板渲染：AlphaBlend 炊烟与 Additive 火苗，硬件实例化单次提交 ----
+            if (!visibleParticles.empty()) {
+                const size_t particleBytes = visibleParticles.size() * sizeof(GpuParticleQuad);
+                if (particleBytes > particleSsbo.Size()) {
+                    particleSsbo = coa::rhi::GlBuffer(particleBytes, nullptr, GL_DYNAMIC_STORAGE_BIT);
+                    particleSsbo.BindAsStorageBuffer(2);
+                }
+                particleSsbo.UpdateSubData(0, particleBytes, visibleParticles.data());
+
+                glUseProgram(particleShader.Handle());
+                glBindVertexArray(skyVao);
+                glEnable(GL_BLEND);
+                glDepthMask(GL_FALSE);
+                glDisable(GL_CULL_FACE);
+
+                GLuint lastParticleTex   = 0;
+                int    lastParticleBlend = -1;
+                for (const auto& pb : particleBatches) {
+                    if (lastParticleBlend != static_cast<int>(pb.blendType)) {
+                        const bool additive = (pb.blendType >= 3);
+                        if (additive) {
+                            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                        } else {
+                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                        }
+                        glUniform1i(0, additive ? 1 : 0);
+                        lastParticleBlend = static_cast<int>(pb.blendType);
+                    }
+                    if (pb.texId != lastParticleTex) {
+                        glBindTextureUnit(0, pb.texId);
+                        lastParticleTex = pb.texId;
+                    }
+                    glDrawArraysInstancedBaseInstance(
+                        GL_TRIANGLES, 0, 6,
+                        static_cast<GLsizei>(pb.quadCount),
+                        pb.firstQuad
+                    );
+                }
+
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+
             SDL_GL_SwapWindow(window);
         }
 
