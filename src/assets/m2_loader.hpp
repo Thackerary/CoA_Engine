@@ -696,14 +696,26 @@ public:
                 if (std::fabs(v) < 1e-6f && defaultIfZero != 0.0f) return defaultIfZero;
                 return v;
             };
-            // M2FakeAnimBlock 与 M2TrackBase 前 16 字节布局一致，仅缺少插值类型与全局序列号
-            auto fakeToTrack = [](const M2FakeAnimBlock& blk) {
-                M2TrackBase t{};
-                t.interpolationType = 1;
-                t.globalSequence    = -1;
-                t.timestamps        = blk.timestamps;
-                t.values            = blk.values;
-                return t;
+            // M2FakeAnimBlock 的值数组存在两种落盘布局：
+            //   1) 一维直接存储: values 直接指向 DiskT[kCount]
+            //   2) 单元素二次间接: values 指向 1 个 M2Array，该内层 M2Array 再指向 DiskT[kCount]
+            // 统一按 DiskT 读出为连续的 std::vector<DiskT>，并做严格越界校验
+            auto extractFakeValues = [&]<typename DiskT>(const M2FakeAnimBlock& blk) -> std::vector<DiskT> {
+                if (blk.values.count == 0) return std::vector<DiskT>{};
+
+                if (blk.timestamps.count == 1 && blk.values.count == 1 &&
+                    static_cast<size_t>(blk.values.offset) + sizeof(M2Array) <= m2Bytes.size()) {
+                    M2Array innerVal{};
+                    std::memcpy(&innerVal, m2Bytes.data() + blk.values.offset, sizeof(M2Array));
+                    if (innerVal.count > 0 && innerVal.count <= 32 &&
+                        static_cast<size_t>(innerVal.offset) + static_cast<size_t>(innerVal.count) * sizeof(DiskT) <= m2Bytes.size()) {
+                        const auto* p = reinterpret_cast<const DiskT*>(m2Bytes.data() + innerVal.offset);
+                        return std::vector<DiskT>(p, p + innerVal.count);
+                    }
+                }
+
+                auto spanVals = getSpan.template operator()<DiskT>(m2Bytes, blk.values);
+                return std::vector<DiskT>(spanVals.begin(), spanVals.end());
             };
             auto applyColorTriple = [](const std::vector<glm::vec3>& vals, RuntimeM2ParticleEmitter& em) {
                 if (vals.empty()) return;
@@ -753,14 +765,18 @@ public:
                 em.areaWidth    = sampleTrackFloat(pDef.emissionAreaWidth,  0.5f,  0.0f);
 
                 applyColorTriple(
-                    ExtractTrack<glm::vec3, glm::vec3>(m2Bytes, fakeToTrack(pDef.colorTrack), sequences,
-                        [](const glm::vec3& v) { return v; }).values, em);
-                applyAlphaTriple(
-                    ExtractTrack<uint16_t, float>(m2Bytes, fakeToTrack(pDef.alphaTrack), sequences,
-                        [](uint16_t a) { return std::clamp(static_cast<float>(a) / 32767.0f, 0.0f, 1.0f); }).values, em);
+                    extractFakeValues.template operator()<glm::vec3>(pDef.colorTrack), em);
+
+                const auto alphaRaw = extractFakeValues.template operator()<uint16_t>(pDef.alphaTrack);
+                std::vector<float> alphaNorm;
+                alphaNorm.reserve(alphaRaw.size());
+                for (uint16_t a : alphaRaw) {
+                    alphaNorm.push_back(std::clamp(static_cast<float>(a) / 32767.0f, 0.0f, 1.0f));
+                }
+                applyAlphaTriple(alphaNorm, em);
+
                 applyScaleTriple(
-                    ExtractTrack<glm::vec2, glm::vec2>(m2Bytes, fakeToTrack(pDef.scaleTrack), sequences,
-                        [](const glm::vec2& v) { return v; }).values, em);
+                    extractFakeValues.template operator()<glm::vec2>(pDef.scaleTrack), em);
 
                 gpuModel.particleEmitters.push_back(em);
             }

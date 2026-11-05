@@ -529,10 +529,10 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterDeep;
 };
 
-layout(location = 0) out vec2 vUV;
-layout(location = 1) out vec2 vCorner;
-layout(location = 2) out vec4 vColor;
-layout(location = 3) out vec3 vWorldPos;
+out vec2 vUV;
+out vec2 vCorner;
+out vec4 vColor;
+out vec3 vWorldPos;
 
 const vec2 kQuadCorners[6] = vec2[6](
     vec2(-0.5, -0.5), vec2( 0.5, -0.5), vec2( 0.5,  0.5),
