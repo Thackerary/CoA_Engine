@@ -784,6 +784,13 @@ public:
                 applyScaleTriple(
                     extractFakeValues.template operator()<glm::vec2>(pDef.scaleTrack), em);
 
+                // 长寿命烟雾 (housesmoke.m2 等)：略微提升上升速度、中段透明度与发射率，增强可见度
+                if (em.blendingType <= 2 && em.lifespan >= 5.0f) {
+                    em.speed        = std::max(em.speed, 1.2f);
+                    em.alphaMid     = std::max(em.alphaMid, 0.42f);
+                    em.emissionRate = std::max(em.emissionRate, 1.5f);
+                }
+
                 // 可见性兜底：动画数据缺失/全零时给出柔和且合理的三段默认曲线
                 if (std::max({em.alphaStart, em.alphaMid, em.alphaEnd}) < 0.05f) {
                     em.alphaStart = 0.2f;

@@ -928,7 +928,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         for (size_t emi = 0; emi < model.particleEmitters.size(); ++emi) {
                             const auto& em    = model.particleEmitters[emi];
                             const float life  = std::max(em.lifespan, 0.25f);
-                            const int   count = std::clamp(static_cast<int>(em.emissionRate * life), 6, 32);
+                            int count = std::clamp(static_cast<int>(em.emissionRate * life), 6, 32);
+                            // 静止灯笼光晕 (speed≈0)：限制层数，避免多层半透明叠加过曝
+                            if (em.speed < 0.05f) {
+                                count = std::min(count, 2);
+                            }
                             const int   rows  = std::max(1, static_cast<int>(em.texRows));
                             const int   cols  = std::max(1, static_cast<int>(em.texCols));
                             const int   frames = rows * cols;
@@ -957,15 +961,17 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
                                 // 初速度：以向上为主 + 横向扩散，受速度变化率扰动
                                 const float spd = em.speed * (1.0f - em.speedVary * 0.5f + em.speedVary * r3);
+                                // 横向分量按 spd 缩放，避免低速光晕出现水平喷雾
                                 const glm::vec4 vel4 = instMat * glm::vec4(
-                                    (r1 - 0.5f) * em.horizRange,
-                                    (r2 - 0.5f) * em.horizRange,
+                                    (r1 - 0.5f) * em.horizRange * spd,
+                                    (r2 - 0.5f) * em.horizRange * spd,
                                     spd, 0.0f);
                                 const glm::vec3 velWorld(vel4.x, vel4.y, vel4.z);
 
                                 const float t = u * life;
                                 glm::vec3 worldPos = startWorld + velWorld * t;
-                                worldPos.z += 0.5f * em.gravity * t * t;
+                                // 重力方向向下：Z-Up 世界空间需取负
+                                worldPos.z -= 0.5f * em.gravity * t * t;
 
                                 // 三段插值：起始 -> 中段 -> 结束
                                 glm::vec3 col; float alp; float scl;
@@ -979,6 +985,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
                                     col = glm::mix(em.colorMid, em.colorEnd, a);
                                     alp = glm::mix(em.alphaMid, em.alphaEnd, a);
                                     scl = glm::mix(em.scaleMid, em.scaleEnd, a);
+                                }
+                                // 静止灯笼光晕：压低单层透明度，防止多层叠加过曝
+                                if (em.speed < 0.05f) {
+                                    alp *= 0.25f;
                                 }
                                 if (alp < 0.004f) continue;
 

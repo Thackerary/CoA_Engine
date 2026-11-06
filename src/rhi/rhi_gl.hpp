@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 #include <algorithm>
+#include <glm/glm.hpp>
 
 namespace coa::rhi {
 
@@ -216,7 +217,7 @@ private:
     }
 };
 
-// ==================== 4. 64 位 Sort-Key 渲染队列指令 (支持硬件 Instancing) ====================
+// ==================== 4. 64 位 Sort-Key 渲染队列指令 (支持硬件 Instancing 与 M2 动画) ====================
 struct DrawCommand {
     uint64_t sortKey       = 0;
     GLuint   program       = 0;
@@ -225,13 +226,18 @@ struct DrawCommand {
     GLuint   ibo           = 0;
     GLsizei  stride        = 0;
     GLuint   texAlbedo     = 0;          // 纹理单元 0: 主贴图 / 地形 Layer 0
-    GLuint   texLayers[3]  = {0, 0, 0};  // 【新增】纹理单元 1..3: 地形 Layer 1..3
-    GLuint   texAlphaMap   = 0;          // 【新增】纹理单元 4: 地形 64x64 RGB Alpha 遮罩图
+    GLuint   texLayers[3]  = {0, 0, 0};  // 纹理单元 1..3: 地形 Layer 1..3
+    GLuint   texAlphaMap   = 0;          // 纹理单元 4: 地形 64x64 RGB Alpha 遮罩图
     uint32_t indexCount    = 0;
     uint32_t firstIndex    = 0;
     int32_t  baseVertex    = 0;
     uint32_t instanceCount = 1; // 实例化绘制数量
-    uint32_t baseInstance  = 0; // 在 1 号 SSBO 矩阵数组中的起始下标
+    uint32_t baseInstance  = 0; // 在 0 号 SSBO 实例矩阵数组中的起始下标
+    uint32_t boneBaseIndex = 0; // 在 1 号 SSBO 骨骼矩阵数组中的起始下标 (0 = 静态无蒙皮)
+    uint8_t  isTwoSided    = 0; // 1 = 双面材质 (翻转背面法线)
+    uint8_t  isUnlit       = 0; // 1 = 自发光无光照材质 (火焰/路灯/水花)
+    glm::vec2 uvOffset{0.0f, 0.0f};               // M2Track 实时采样的 UV 动画偏移
+    glm::vec4 batchColor{1.0f, 1.0f, 1.0f, 1.0f}; // M2Track 实时采样的颜色与透明度
 
     static uint64_t MakeKey(uint8_t pass, uint16_t progId, uint16_t texId, uint32_t depthBits) noexcept {
         return (static_cast<uint64_t>(pass & 0xF) << 60) |
@@ -247,24 +253,24 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
     });
 
     GLuint lastProg = 0, lastVao = 0, lastVbo = 0, lastIbo = 0, lastTex0 = 0;
-    uint8_t lastPass = 0xFF; // 0xFF = 尚未向当前 program 下发过 Cutout 开关
+    uint8_t lastPass = 0xFF;
     for (const auto& c : cmds) {
         if (c.program != lastProg) {
             glUseProgram(c.program);
             lastProg = c.program;
-            lastPass = 0xFF; // 新着色器必须重新下发一次 uniform
+            lastPass = 0xFF;
         }
-        // sortKey 高 4 位即 Pass ID (2=Opaque, 3=AlphaCutout, 4=MH2O水体, 5=M2半透明瀑布, 6=M2发光叠加)
+        // sortKey 高 4 位即 Pass ID (2=Opaque, 3=AlphaCutout, 4=MH2O水体, 5=M2半透明, 6=M2发光叠加, 7=M2瀑布UV滚动)
         uint8_t pass = static_cast<uint8_t>(c.sortKey >> 60);
         if (pass != lastPass) {
             if (pass == 4) {
-                // Pass 4: MH2O 半透明水体 (使用专属 waterShader，无 location 0 uniform)
+                // Pass 4: MH2O 半透明水体 (使用专属 waterShader)
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDepthMask(GL_FALSE);
                 glDisable(GL_CULL_FACE);
             } else if (pass == 5 || pass == 6 || pass == 7) {
-                // Pass 5=M2半透明, Pass 6=M2发光叠加, Pass 7=M2带UV滚动动画的瀑布水幕
+                // Pass 5=M2半透明, Pass 6=M2发光叠加, Pass 7=M2瀑布动画
                 glEnable(GL_BLEND);
                 if (pass == 6) {
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
@@ -275,13 +281,31 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
                 glDisable(GL_CULL_FACE);
                 glUniform1i(0, (pass == 7) ? 3 : 2);
             } else {
-                // Pass 2 / 3: 不透明与 Alpha Cutout —— 关闭混合、恢复深度写入，并下发镂空开关
+                // Pass 2 / 3: 不透明与 Alpha Cutout
                 glDisable(GL_BLEND);
                 glDepthMask(GL_TRUE);
+                // 双面材质 (树冠/窗框/旗帜) 关闭剔除；单面材质开启背面剔除，
+                // 避免窗户内外两层共面重叠产生蓝色闪烁 Z-Fighting
+                if (c.isTwoSided != 0) {
+                    glDisable(GL_CULL_FACE);
+                } else {
+                    glEnable(GL_CULL_FACE);
+                    glCullFace(GL_BACK);
+                }
                 glUniform1i(0, (pass == 3) ? 1 : 0);
             }
             lastPass = pass;
         }
+
+        // 对使用 worldShader 的批次 (pass != 4)，下发双面/自发光标志、骨骼起始下标、UV偏移与动画颜色
+        if (pass != 4) {
+            int matFlags = (c.isTwoSided ? 1 : 0) | (c.isUnlit ? 2 : 0);
+            glUniform1i(1, matFlags);
+            glUniform1i(2, static_cast<int>(c.boneBaseIndex));
+            glUniform2f(3, c.uvOffset.x, c.uvOffset.y);
+            glUniform4f(4, c.batchColor.r, c.batchColor.g, c.batchColor.b, c.batchColor.a);
+        }
+
         if (c.vao != lastVao) {
             glBindVertexArray(c.vao);
             lastVao = c.vao;
@@ -300,7 +324,6 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
             glBindTextureUnit(0, c.texAlbedo);
             lastTex0 = c.texAlbedo;
         }
-		// 【新增】若该指令携带了地形多层遮罩图，则绑定 Layer 1..3 与 Alpha 遮罩到单元 1..4
         if (c.texAlphaMap != 0) {
             glBindTextureUnit(1, c.texLayers[0]);
             glBindTextureUnit(2, c.texLayers[1]);
@@ -308,7 +331,6 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
             glBindTextureUnit(4, c.texAlphaMap);
         }
         const void* indexOffsetPtr = reinterpret_cast<const void*>(static_cast<uintptr_t>(c.firstIndex) * sizeof(uint16_t));
-        // 使用 OpenGL 4.2+ BaseInstance 指令，让着色器通过 gl_BaseInstance + gl_InstanceID 直接寻址 SSBO
         glDrawElementsInstancedBaseVertexBaseInstance(
             GL_TRIANGLES,
             static_cast<GLsizei>(c.indexCount),
@@ -320,7 +342,6 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
         );
     }
 
-    // 关键状态恢复：防止下一帧 glClear(GL_DEPTH_BUFFER_BIT) 因深度写入关闭而失效
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 }
