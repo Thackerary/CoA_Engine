@@ -829,6 +829,13 @@ public:
             }
         }
 
+        // particleemitters/ 目录下的模型自身仅含编辑器占位方块网格：
+        // 若已成功解析出粒子发射器，则清空 submeshes，只保留粒子渲染避免出现白盒
+        if (normPath.find("particleemitters/") != std::string::npos &&
+            !gpuModel.particleEmitters.empty()) {
+            gpuModel.submeshes.clear();
+        }
+
         return gpuModel;
     }
 

@@ -594,8 +594,9 @@ out vec4 FragColor;
 void main() {
     vec4 c = texture(uTexAlbedo, vUV) * vColor;
 
-    // 无贴图 / 纯白贴图时避免硬边方块，保证炊烟与火苗边缘柔和
-    float radial = 1.0 - smoothstep(0.35, 0.5, length(vCorner));
+    // 高斯云团衰减：中心实、边缘柔和消散，避免炊烟出现硬边白块
+    float r = clamp(length(vCorner) * 2.0, 0.0, 1.0);
+    float radial = pow(1.0 - r * r, 2.2);
     c.a *= radial;
     if (c.a < 0.004) discard;
 
@@ -926,11 +927,15 @@ int main(int /*argc*/, char* /*argv*/[]) {
                             instWorld.x * 0.137f + instWorld.y * 0.311f + instWorld.z * 0.733f, 1.0f));
 
                         for (size_t emi = 0; emi < model.particleEmitters.size(); ++emi) {
-                            const auto& em    = model.particleEmitters[emi];
-                            const float life  = std::max(em.lifespan, 0.25f);
-                            int count = std::clamp(static_cast<int>(em.emissionRate * life), 6, 32);
+                            const auto& em  = model.particleEmitters[emi];
+                            // 长寿命 AlphaBlend 发射器视为炊烟：固定模拟周期并采用蓬松扩散的柔和烟雾形态
+                            const bool  isSmoke = (em.blendingType <= 2 && em.lifespan >= 4.0f);
+                            const float life    = isSmoke ? 4.2f : std::max(em.lifespan, 0.25f);
+                            int count = isSmoke
+                                      ? 28
+                                      : std::clamp(static_cast<int>(em.emissionRate * life), 6, 32);
                             // 静止灯笼光晕 (speed≈0)：限制层数，避免多层半透明叠加过曝
-                            if (em.speed < 0.05f) {
+                            if (!isSmoke && em.speed < 0.05f) {
                                 count = std::min(count, 2);
                             }
                             const int   rows  = std::max(1, static_cast<int>(em.texRows));
@@ -989,6 +994,19 @@ int main(int /*argc*/, char* /*argv*/[]) {
                                 // 静止灯笼光晕：压低单层透明度，防止多层叠加过曝
                                 if (em.speed < 0.05f) {
                                     alp *= 0.25f;
+                                }
+                                if (isSmoke) {
+                                    // 炊烟：以 u 驱动的平滑上升 + 微风摆动替代重力抛物线，避免横向喷雾与瞬移感
+                                    worldPos = startWorld + glm::vec3(
+                                        std::sin(u * 6.28f + r1 * 6.28f) * (0.35f * u),
+                                        std::cos(u * 6.28f + r2 * 6.28f) * (0.35f * u),
+                                        u * 7.5f);
+                                    // 尺寸随高度自然蓬松放大
+                                    scl = glm::mix(1.1f, 3.4f, u);
+                                    // 透明度两头淡入淡出
+                                    alp = std::sin(u * 3.14159f) * 0.32f;
+                                    // 烟色柔和偏暖灰
+                                    col = glm::mix(glm::vec3(0.82f), glm::vec3(0.62f), u);
                                 }
                                 if (alp < 0.004f) continue;
 
