@@ -2,11 +2,13 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <span>
 #include <optional>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <glm/glm.hpp>
@@ -123,6 +125,10 @@ struct GpuMcnkChunk {
     GLuint   alphaMapTex  = 0;            // 【新增】当前块的 64x64 RGB Alpha 遮罩纹理句柄
     glm::vec3 aabbMin{0.0f};
     glm::vec3 aabbMax{0.0f};
+    // 方向 G：CPU 侧地形高度碰撞数据 (MCNK 西北角世界坐标 + 4x4 洞口掩码 + 145 个世界高度)
+    glm::vec3 originPos{0.0f};
+    uint16_t  holeMask = 0;
+    float     worldHeights[145]{};
 };
 
 // 单个 MH2O 水体实例在合并液态 VBO/IBO 中的绘制区间
@@ -154,6 +160,7 @@ struct WmoGroupCull {
 // WMO 大型建筑单实例：整栋包围盒 + 各子房间包围盒
 struct WmoInstance {
     glm::mat4 model{1.0f};
+    glm::mat4 invModel{1.0f}; // 世界空间 -> WMO 局部空间的逆变换，用于地板射线检测
     glm::vec3 worldBoundsMin{0.0f};
     glm::vec3 worldBoundsMax{0.0f};
     glm::vec3 worldCenter{0.0f};
@@ -161,14 +168,14 @@ struct WmoInstance {
     std::vector<WmoGroupCull> groupBounds;
 };
 
-// 同种 M2 装饰物的实例化批次
+// 同种 M2 装饰物的实例化批次 (共享 AssetManager 缓存池中的 GpuM2Model)
 struct GpuDoodadBatch {
-    GpuM2Model               model;
-    std::vector<M2Instance>  instances;
+    std::shared_ptr<const GpuM2Model> model;
+    std::vector<M2Instance>           instances;
 };
 struct GpuWmoBatch {
-    GpuWmoModel               model;
-    std::vector<WmoInstance>  instances;
+    std::shared_ptr<const GpuWmoModel> model;
+    std::vector<WmoInstance>           instances;
 };
 struct GpuAdtTile {
     rhi::GlBuffer               terrainVbo;
@@ -387,28 +394,27 @@ public:
         }
 
         for (auto& [wmoPath, placements] : wmoGroups) {
-            auto wmoOpt = WmoLoader::LoadWmo(wmoPath, vfs, assets, fallbackWhiteTex);
-            if (!wmoOpt) {
-                std::fprintf(stderr, "[ADT Warning] Failed or skipped WMO building: %s (%zu instances)\n",
-                             wmoPath.c_str(), placements.size());
+            auto wmoPtr = assets.GetOrLoadWmo(wmoPath, fallbackWhiteTex);
+            if (!wmoPtr) {
                 continue;
             }
 
             GpuWmoBatch batch;
-            batch.model = std::move(*wmoOpt);
+            batch.model = std::move(wmoPtr);
             batch.instances.reserve(placements.size());
 
             // 每个建筑实例一次性预计算整栋 + 各子房间的世界空间 AABB
             for (const auto& p : placements) {
                 WmoInstance inst{};
-                inst.model = p.mat;
-                TransformLocalAABB(batch.model.localBoundsMin, batch.model.localBoundsMax, p.mat,
+                inst.model    = p.mat;
+                inst.invModel = glm::inverse(p.mat);
+                TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, p.mat,
                                    inst.worldBoundsMin, inst.worldBoundsMax,
                                    inst.worldCenter, inst.worldRadius);
 
-                inst.groupBounds.resize(batch.model.groups.size());
-                for (size_t g = 0; g < batch.model.groups.size(); ++g) {
-                    const auto& grp = batch.model.groups[g];
+                inst.groupBounds.resize(batch.model->groups.size());
+                for (size_t g = 0; g < batch.model->groups.size(); ++g) {
+                    const auto& grp = batch.model->groups[g];
                     TransformLocalAABB(grp.localBoundsMin, grp.localBoundsMax, p.mat,
                                        inst.groupBounds[g].worldBoundsMin, inst.groupBounds[g].worldBoundsMax,
                                        inst.groupBounds[g].worldCenter, inst.groupBounds[g].worldRadius);
@@ -418,11 +424,11 @@ public:
 
             // 将 WMO 内部 MODD 家具按每个建筑实例激活的 doodadSet 展开，并入统一的 M2 实例化分组
             auto appendDoodadSet = [&](uint16_t setIdx, const glm::mat4& wmoWorldMat) {
-                if (setIdx >= batch.model.doodadSets.size()) return;
-                const auto& ds = batch.model.doodadSets[setIdx];
-                size_t endIdx = std::min<size_t>(ds.startIndex + ds.count, batch.model.doodads.size());
+                if (setIdx >= batch.model->doodadSets.size()) return;
+                const auto& ds = batch.model->doodadSets[setIdx];
+                size_t endIdx = std::min<size_t>(ds.startIndex + ds.count, batch.model->doodads.size());
                 for (size_t i = ds.startIndex; i < endIdx; ++i) {
-                    const auto& d = batch.model.doodads[i];
+                    const auto& d = batch.model->doodads[i];
                     if (!d.m2Path.empty()) {
                         doodadGroups[d.m2Path].push_back(wmoWorldMat * d.localMatrix);
                     }
@@ -437,23 +443,21 @@ public:
         }
         std::printf("[ADT Loader] Loaded %zu WMO building types\n", tile.wmoBatches.size());
 
-        // 5. 统一加载户外树木与 WMO 室内家具的 M2 模型，并逐实例预计算世界空间 AABB
+        // 5. 通过 AssetManager 全局缓存获取或加载 M2 模型，并逐实例预计算世界空间 AABB
         for (auto& [m2Path, mats] : doodadGroups) {
-            auto modelOpt = M2Loader::LoadModel(m2Path, vfs, assets, fallbackWhiteTex);
-            if (!modelOpt) {
-                std::fprintf(stderr, "[ADT Warning] Failed or skipped M2 model: %s (%zu instances)\n",
-                             m2Path.c_str(), mats.size());
+            auto modelPtr = assets.GetOrLoadM2(m2Path, fallbackWhiteTex);
+            if (!modelPtr) {
                 continue;
             }
 
             GpuDoodadBatch batch;
-            batch.model = std::move(*modelOpt);
+            batch.model = std::move(modelPtr);
             batch.instances.reserve(mats.size());
 
             for (const auto& instMat : mats) {
                 M2Instance inst{};
                 inst.model = instMat;
-                TransformLocalAABB(batch.model.localBoundsMin, batch.model.localBoundsMax, instMat,
+                TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, instMat,
                                    inst.worldBoundsMin, inst.worldBoundsMax,
                                    inst.worldCenter, inst.worldRadius);
                 batch.instances.push_back(std::move(inst));
@@ -464,9 +468,116 @@ public:
         size_t totalM2Instances = 0;
         for (const auto& b : tile.doodadBatches) totalM2Instances += b.instances.size();
 
-        std::printf("[ADT Loader] Loaded %zu MCNK chunks, %zu unique M2 doodad types (%zu total instances)\n",
-                    tile.chunks.size(), tile.doodadBatches.size(), totalM2Instances);
+        std::printf("[ADT Loader] Loaded %zu MCNK chunks, %zu tile M2 types (%zu instances) | Global VRAM Pool: %zu M2, %zu WMO\n",
+                    tile.chunks.size(), tile.doodadBatches.size(), totalM2Instances,
+                    assets.CachedM2Count(), assets.CachedWmoCount());
         return tile;
+    }
+
+    // 方向 G：查询 (worldX, worldY) 处脚下最高可行走地面世界 Z
+    // 1) MCNK 地形四角双线性插值 (跳过洞口子格)；2) WMO 室内地板 / 楼梯竖直射线求交
+    [[nodiscard]] static bool SampleGroundHeight(const std::vector<GpuAdtTile>& tiles,
+                                                 float worldX, float worldY,
+                                                 float currentFootZ, float& outGroundZ)
+    {
+        float bestZ = -1e30f;
+
+        // 1. MCNK 地形采样
+        for (const auto& tile : tiles) {
+            for (const auto& chunk : tile.chunks) {
+                if (worldX > chunk.originPos.x || worldX < chunk.originPos.x - kChunkSize) continue;
+                if (worldY > chunk.originPos.y || worldY < chunk.originPos.y - kChunkSize) continue;
+
+                const float rf = (chunk.originPos.x - worldX) / kUnitSize;
+                const float cf = (chunk.originPos.y - worldY) / kUnitSize;
+                const int   r  = std::clamp(static_cast<int>(rf), 0, 7);
+                const int   c  = std::clamp(static_cast<int>(cf), 0, 7);
+
+                // 4x4 洞口掩码：被挖空的子格不提供地面
+                if ((chunk.holeMask & (1u << ((r / 2) * 4 + (c / 2)))) != 0) continue;
+
+                const float fr = std::clamp(rf - static_cast<float>(r), 0.0f, 1.0f);
+                const float fc = std::clamp(cf - static_cast<float>(c), 0.0f, 1.0f);
+
+                const float tl = chunk.worldHeights[r * 17 + c];
+                const float tr = chunk.worldHeights[r * 17 + c + 1];
+                const float bl = chunk.worldHeights[(r + 1) * 17 + c];
+                const float br = chunk.worldHeights[(r + 1) * 17 + c + 1];
+
+                const float zNorth = tl + (tr - tl) * fc;
+                const float zSouth = bl + (br - bl) * fc;
+                const float terrainZ = zNorth + (zSouth - zNorth) * fr;
+                bestZ = std::max(bestZ, terrainZ);
+            }
+        }
+
+        // 2. WMO 建筑地板射线检测：世界竖直向下射线变换到子房间局部空间做 Möller–Trumbore
+        const glm::vec3 worldRayOrigin(worldX, worldY, currentFootZ + 1.8f);
+        for (const auto& tile : tiles) {
+            for (const auto& wmoBatch : tile.wmoBatches) {
+                if (!wmoBatch.model) continue;
+                for (const auto& inst : wmoBatch.instances) {
+                    if (worldX < inst.worldBoundsMin.x || worldX > inst.worldBoundsMax.x) continue;
+                    if (worldY < inst.worldBoundsMin.y || worldY > inst.worldBoundsMax.y) continue;
+                    if (inst.groupBounds.size() != wmoBatch.model->groups.size()) continue;
+
+                    const glm::vec3 localOrigin = glm::vec3(inst.invModel * glm::vec4(worldRayOrigin, 1.0f));
+                    const glm::vec3 localDir    = glm::vec3(inst.invModel * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));
+
+                    for (size_t g = 0; g < wmoBatch.model->groups.size(); ++g) {
+                        const auto& gc = inst.groupBounds[g];
+                        if (worldX < gc.worldBoundsMin.x || worldX > gc.worldBoundsMax.x) continue;
+                        if (worldY < gc.worldBoundsMin.y || worldY > gc.worldBoundsMax.y) continue;
+
+                        const auto& grp = wmoBatch.model->groups[g];
+                        if (grp.cpuPositions.empty() || grp.cpuIndices.size() < 3) continue;
+
+                        for (size_t i = 0; i + 2 < grp.cpuIndices.size(); i += 3) {
+                            const uint16_t i0 = grp.cpuIndices[i + 0];
+                            const uint16_t i1 = grp.cpuIndices[i + 1];
+                            const uint16_t i2 = grp.cpuIndices[i + 2];
+                            if (i0 >= grp.cpuPositions.size() ||
+                                i1 >= grp.cpuPositions.size() ||
+                                i2 >= grp.cpuPositions.size()) continue;
+
+                            const glm::vec3& v0 = grp.cpuPositions[i0];
+                            const glm::vec3& v1 = grp.cpuPositions[i1];
+                            const glm::vec3& v2 = grp.cpuPositions[i2];
+
+                            const glm::vec3 e1   = v1 - v0;
+                            const glm::vec3 e2   = v2 - v0;
+                            const glm::vec3 pvec = glm::cross(localDir, e2);
+                            const float det = glm::dot(e1, pvec);
+                            if (std::fabs(det) < 1e-8f) continue;
+                            const float invDet = 1.0f / det;
+
+                            const glm::vec3 tvec = localOrigin - v0;
+                            const float uu = glm::dot(tvec, pvec) * invDet;
+                            if (uu < 0.0f || uu > 1.0f) continue;
+
+                            const glm::vec3 qvec = glm::cross(tvec, e1);
+                            const float vv = glm::dot(localDir, qvec) * invDet;
+                            if (vv < 0.0f || uu + vv > 1.0f) continue;
+
+                            const float tHit = glm::dot(e2, qvec) * invDet;
+                            if (tHit < 0.0f) continue;
+
+                            const glm::vec3 hitLocal = localOrigin + localDir * tHit;
+                            const glm::vec3 hitWorld = glm::vec3(inst.model * glm::vec4(hitLocal, 1.0f));
+
+                            // 仅接受头部以下 (地板/楼梯) 的交点，忽略头顶屋顶与过高装饰面
+                            if (hitWorld.z > currentFootZ + 1.8f) continue;
+                            if (hitWorld.z < currentFootZ - 30.0f) continue;
+                            bestZ = std::max(bestZ, hitWorld.z);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (bestZ <= -1e29f) return false;
+        outGroundZ = bestZ;
+        return true;
     }
 
 private:
@@ -655,6 +766,7 @@ private:
                 ));
                 v.uv = glm::vec2(static_cast<float>(c), static_cast<float>(r));
                 allVerts.push_back(v);
+                gpuChunk.worldHeights[vIdx] = v.pos.z;
                 ++vIdx;
             }
 
@@ -673,6 +785,7 @@ private:
                     ));
                     v.uv = glm::vec2(static_cast<float>(c) + 0.5f, static_cast<float>(r) + 0.5f);
                     allVerts.push_back(v);
+                    gpuChunk.worldHeights[vIdx] = v.pos.z;
                     ++vIdx;
                 }
             }
@@ -680,6 +793,8 @@ private:
         // 解析 1~4 层 MCLY 纹理与 MCAL Alpha 遮罩
         GpuMcnkChunk gpuChunk{};
         gpuChunk.baseVertex = baseVert;
+        gpuChunk.originPos  = hdr.pos;
+        gpuChunk.holeMask   = static_cast<uint16_t>(hdr.holes & 0xFFFFu);
 
         // 计算当前 MCNK 145 个顶点的世界空间 AABB
         size_t aabbStart = static_cast<size_t>(baseVert);

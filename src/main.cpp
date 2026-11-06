@@ -721,6 +721,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
         float camPitch = -0.25f;
         float gameTimeHalfMin = 1560.0f; // 默认 13:00，金色阳光
         bool rightMouseDown = false;
+        // 方向 G：角色贴地行走 / 自由飞行双模式
+        bool  walkMode    = false;
+        float verticalVel = 0.0f;
+        bool  isGrounded  = false;
+        constexpr float kEyeHeight = 1.85f;
         uint64_t lastTicks = SDL_GetTicksNS();
 
         int visibleChunks = 0;
@@ -763,6 +768,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         }
                     }
                     std::printf("========================================================\n\n");
+                } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_TAB) {
+                    walkMode    = !walkMode;
+                    verticalVel = 0.0f;
+                    isGrounded  = false;
                 } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_RIGHT) {
                     rightMouseDown = true;
                     SDL_SetWindowRelativeMouseMode(window, true);
@@ -784,14 +793,51 @@ int main(int /*argc*/, char* /*argv*/[]) {
             glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
 
             const bool* keys = SDL_GetKeyboardState(nullptr);
-            // 按住 Shift 高速飞行 (120码/秒)，方便跨越 533x533 码的 ADT 大地图
-            float moveSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 120.0f : 25.0f) * dt;
-            if (keys[SDL_SCANCODE_W]) camPos += forward * moveSpeed;
-            if (keys[SDL_SCANCODE_S]) camPos -= forward * moveSpeed;
-            if (keys[SDL_SCANCODE_D]) camPos += right * moveSpeed;
-            if (keys[SDL_SCANCODE_A]) camPos -= right * moveSpeed;
-            if (keys[SDL_SCANCODE_SPACE]) camPos += worldUp * moveSpeed;
-            if (keys[SDL_SCANCODE_LCTRL]) camPos -= worldUp * moveSpeed;
+            if (walkMode) {
+                // ---- 贴地行走模式：水平移动 + 跳跃 + 重力 + 地面吸附 ----
+                glm::vec3 fwdFlat(forward.x, forward.y, 0.0f);
+                if (glm::length(fwdFlat) > 1e-4f) fwdFlat = glm::normalize(fwdFlat);
+                glm::vec3 flatRight = glm::normalize(glm::cross(fwdFlat, worldUp));
+
+                const float walkSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 14.0f : 7.0f) * dt;
+                if (keys[SDL_SCANCODE_W]) camPos += fwdFlat * walkSpeed;
+                if (keys[SDL_SCANCODE_S]) camPos -= fwdFlat * walkSpeed;
+                if (keys[SDL_SCANCODE_D]) camPos += flatRight * walkSpeed;
+                if (keys[SDL_SCANCODE_A]) camPos -= flatRight * walkSpeed;
+
+                if (keys[SDL_SCANCODE_SPACE] && isGrounded) {
+                    verticalVel = 8.2f;
+                    isGrounded  = false;
+                }
+
+                verticalVel -= 22.0f * dt;
+                float footZ   = (camPos.z - kEyeHeight) + verticalVel * dt;
+                float groundZ = camPos.z - kEyeHeight;
+
+                if (coa::assets::AdtLoader::SampleGroundHeight(adtTiles, camPos.x, camPos.y,
+                                                              camPos.z - kEyeHeight, groundZ)) {
+                    if (footZ <= groundZ + 0.08f && verticalVel <= 0.0f) {
+                        footZ       = groundZ;
+                        verticalVel = 0.0f;
+                        isGrounded  = true;
+                    } else {
+                        isGrounded = false;
+                    }
+                } else {
+                    isGrounded = false;
+                }
+
+                camPos.z = footZ + kEyeHeight;
+            } else {
+                // ---- 自由飞行模式：按住 Shift 高速飞行 (120 码/秒)，方便跨越 533x533 码的 ADT 大地图 ----
+                float moveSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 120.0f : 25.0f) * dt;
+                if (keys[SDL_SCANCODE_W]) camPos += forward * moveSpeed;
+                if (keys[SDL_SCANCODE_S]) camPos -= forward * moveSpeed;
+                if (keys[SDL_SCANCODE_D]) camPos += right * moveSpeed;
+                if (keys[SDL_SCANCODE_A]) camPos -= right * moveSpeed;
+                if (keys[SDL_SCANCODE_SPACE]) camPos += worldUp * moveSpeed;
+                if (keys[SDL_SCANCODE_LCTRL]) camPos -= worldUp * moveSpeed;
+            }
 
             if (keys[SDL_SCANCODE_LEFTBRACKET])  gameTimeHalfMin -= 360.0f * dt;
             if (keys[SDL_SCANCODE_RIGHTBRACKET]) gameTimeHalfMin += 360.0f * dt;
@@ -1207,8 +1253,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
                 char titleBuf[320];
                 std::snprintf(titleBuf, sizeof(titleBuf),
-                              "CoA Engine | Time: %02d:%02d | %s | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
+                              "CoA Engine | Time: %02d:%02d | %s | [Mode: %s] | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
                               hh, mm, underwater ? "UNDERWATER" : "Surface",
+                              walkMode ? "WALK" : "FLY",
                               visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances,
                               visibleWaterChunks, renderQueue.size());
                 SDL_SetWindowTitle(window, titleBuf);

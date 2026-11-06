@@ -101,6 +101,9 @@ struct GpuWmoGroup {
     std::vector<GpuWmoSubBatch> batches;
     glm::vec3                   localBoundsMin{-1.0f};
     glm::vec3                   localBoundsMax{1.0f};
+    // 保留 CPU 侧碰撞网格，供角色行走模式的竖直射线检测使用 (子房间局部空间)
+    std::vector<glm::vec3>      cpuPositions;
+    std::vector<uint16_t>       cpuIndices;
 };
 
 // WMO 内部家具模板 (M2 虚拟路径 + 已换算好的 WMO 局部空间变换矩阵)
@@ -335,6 +338,10 @@ private:
         group.localBoundsMax = gmax;
         group.vbo = rhi::GlBuffer(verts.size() * sizeof(WmoVertex), verts.data(), 0);
         group.ibo = rhi::GlBuffer(moviIndices.size() * sizeof(uint16_t), moviIndices.data(), 0);
+
+        // 保留原始 MOVT/MOVI 供地面高度射线检测，索引已从 0 开始 (baseVertex = 0)
+        group.cpuPositions.assign(movtPositions.begin(), movtPositions.end());
+        group.cpuIndices.assign(moviIndices.begin(), moviIndices.end());
 
         for (const auto& b : mobaBatches) {
             if (static_cast<size_t>(b.firstIndex) + b.indexCount > moviIndices.size()) continue;
