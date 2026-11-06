@@ -10,7 +10,7 @@
 
 #include <glm/glm.hpp>
 
-#include "vfs/vfs.hpp"
+#include "../vfs/vfs.hpp"
 
 namespace coa::assets {
 
@@ -126,53 +126,49 @@ public:
         glm::vec3 sumDeep(0.0f);
 
         float totalWeight = 0.0f;
+        uint32_t globalParamsId = 0;
 
+        auto accumulateLight = [&](uint32_t paramsId, float w) {
+            sumDirect   += SampleBand(paramsId, 0,  timeHalfMinutes, defDirect)   * w;
+            sumAmbient  += SampleBand(paramsId, 1,  timeHalfMinutes, defAmbient)  * w;
+            sumSkyTop   += SampleBand(paramsId, 2,  timeHalfMinutes, defSkyTop)   * w;
+            sumSkyMid   += SampleBand(paramsId, 3,  timeHalfMinutes, defSkyMid)   * w;
+            sumSkyBand1 += SampleBand(paramsId, 4,  timeHalfMinutes, defSkyBand1) * w;
+            sumSkyBand2 += SampleBand(paramsId, 5,  timeHalfMinutes, defSkyBand2) * w;
+            sumHorizon  += SampleBand(paramsId, 6,  timeHalfMinutes, defHorizon)  * w;
+            sumFog      += SampleBand(paramsId, 7,  timeHalfMinutes, defFog)      * w;
+            sumShallow  += SampleBand(paramsId, 16, timeHalfMinutes, defShallow)  * w;
+            sumDeep     += SampleBand(paramsId, 17, timeHalfMinutes, defDeep)     * w;
+            totalWeight += w;
+        };
+
+        // 1. 先累加所有局部区域光源 (如北郡山谷、艾尔文森林、闪金镇)
         for (const auto& lp : m_lights) {
-            float weight = 0.0f;
-
-            if (lp.isGlobal) {
-                weight = 1.0f;
-            } else {
-                const float dist = glm::length(camPos - lp.worldPos);
-                const float outer = std::max(lp.rOuter, lp.rInner + 1e-3f);
-                weight = 1.0f - glm::smoothstep(lp.rInner, outer, dist);
-            }
-
-            if (weight <= 1e-4f) continue;
-
             uint32_t paramsId = isUnderwater ? lp.underwaterParamsId : lp.clearParamsId;
             if (paramsId == 0) paramsId = lp.clearParamsId;
             if (paramsId == 0) continue;
 
-            sumDirect   += SampleBand(paramsId, 0,  defDirect)   * weight;
-            sumAmbient  += SampleBand(paramsId, 1,  defAmbient)  * weight;
-            sumSkyTop   += SampleBand(paramsId, 2,  defSkyTop)   * weight;
-            sumSkyMid   += SampleBand(paramsId, 3,  defSkyMid)   * weight;
-            sumSkyBand1 += SampleBand(paramsId, 4,  defSkyBand1) * weight;
-            sumSkyBand2 += SampleBand(paramsId, 5,  defSkyBand2) * weight;
-            sumHorizon  += SampleBand(paramsId, 6,  defHorizon)  * weight;
-            sumFog      += SampleBand(paramsId, 7,  defFog)      * weight;
-            sumShallow  += SampleBand(paramsId, 16, defShallow)  * weight;
-            sumDeep     += SampleBand(paramsId, 17, defDeep)     * weight;
+            if (lp.isGlobal) {
+                if (globalParamsId == 0) globalParamsId = paramsId;
+                continue;
+            }
 
-            totalWeight += weight;
+            const float dist  = glm::length(camPos - lp.worldPos);
+            const float outer = std::max(lp.rOuter, lp.rInner + 1e-3f);
+            const float weight = 1.0f - glm::smoothstep(lp.rInner, outer, dist);
+            if (weight <= 1e-4f) continue;
+
+            accumulateLight(paramsId, weight);
         }
 
-        if (totalWeight <= 1e-4f) {
-            sumDirect   = SampleBand(1, 0,  defDirect);
-            sumAmbient  = SampleBand(1, 1,  defAmbient);
-            sumSkyTop   = SampleBand(1, 2,  defSkyTop);
-            sumSkyMid   = SampleBand(1, 3,  defSkyMid);
-            sumSkyBand1 = SampleBand(1, 4,  defSkyBand1);
-            sumSkyBand2 = SampleBand(1, 5,  defSkyBand2);
-            sumHorizon  = SampleBand(1, 6,  defHorizon);
-            sumFog      = SampleBand(1, 7,  defFog);
-            sumShallow  = SampleBand(1, 16, defShallow);
-            sumDeep     = SampleBand(1, 17, defDeep);
-            totalWeight = 1.0f;
+        // 2. 若局部区域光总权重不足 1.0，用地图全局默认光补齐剩余权重
+        if (totalWeight < 1.0f) {
+            const float remainW = 1.0f - totalWeight;
+            const uint32_t fallbackParams = (globalParamsId != 0) ? globalParamsId : 1u;
+            accumulateLight(fallbackParams, remainW);
         }
 
-        const float invW = 1.0f / totalWeight;
+        const float invW = 1.0f / std::max(totalWeight, 1e-4f);
 
         out.directColor  = sumDirect   * invW;
         out.ambientColor = sumAmbient  * invW;
@@ -185,7 +181,7 @@ public:
         out.riverShallow = sumShallow  * invW;
         out.riverDeep    = sumDeep     * invW;
 
-        constexpr float kTwoPi = 6.28318530718f;
+        constexpr float kTwoPi  = 6.28318530718f;
         constexpr float kHalfPi = 1.57079632679f;
         const float phase = (timeHalfMinutes / 2880.0f) * kTwoPi;
         const float elev  = std::sin(phase - kHalfPi);
@@ -214,13 +210,13 @@ private:
     std::vector<LightPoint> m_lights;
     std::unordered_map<uint32_t, ColorTrack> m_bands;
 
-    [[nodiscard]] glm::vec3 SampleBand(uint32_t paramsId, uint32_t k, const glm::vec3& fallback) const {
+    [[nodiscard]] glm::vec3 SampleBand(uint32_t paramsId, uint32_t k, float timeHalfMinutes, const glm::vec3& fallback) const {
         if (paramsId == 0) return fallback;
 
         const uint32_t bandId = (paramsId - 1) * 18 + 1 + k;
         auto it = m_bands.find(bandId);
         if (it == m_bands.end()) return fallback;
-        return it->second.Sample(0.0f, fallback);
+        return it->second.Sample(timeHalfMinutes, fallback);
     }
 
     static glm::vec3 DecodeColor(uint32_t c) {

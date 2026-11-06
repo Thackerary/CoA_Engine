@@ -748,7 +748,11 @@ private:
         const auto* normals = reinterpret_cast<const int8_t*>(mcnkFullSpan.data() + hdr.ofsNormal + 8);
 
         int32_t baseVert = static_cast<int32_t>(allVerts.size());
-
+		// 解析 1~4 层 MCLY 纹理与 MCAL Alpha 遮罩
+        GpuMcnkChunk gpuChunk{};
+        gpuChunk.baseVertex = baseVert;
+        gpuChunk.originPos  = hdr.pos;
+        gpuChunk.holeMask   = static_cast<uint16_t>(hdr.holes & 0xFFFFu);
         // 按 9 外 + 8 内 交错生成 145 个顶点
         size_t vIdx = 0;
         for (int r = 0; r < 9; ++r) {
@@ -790,12 +794,6 @@ private:
                 }
             }
         }
-        // 解析 1~4 层 MCLY 纹理与 MCAL Alpha 遮罩
-        GpuMcnkChunk gpuChunk{};
-        gpuChunk.baseVertex = baseVert;
-        gpuChunk.originPos  = hdr.pos;
-        gpuChunk.holeMask   = static_cast<uint16_t>(hdr.holes & 0xFFFFu);
-
         // 计算当前 MCNK 145 个顶点的世界空间 AABB
         size_t aabbStart = static_cast<size_t>(baseVert);
         glm::vec3 vMin = allVerts[aabbStart].pos;
