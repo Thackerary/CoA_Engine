@@ -680,11 +680,19 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::vector<coa::assets::GpuAdtTile> adtTiles;
         std::unordered_set<uint32_t> seenUniqueIds;
 
-        static constexpr std::array<const char*, 6> kAdtPaths = {
-            "world/maps/azeroth/azeroth_32_48.adt", // 北郡 (初始出生点)
+        static constexpr std::array<const char*, 14> kAdtPaths = {
+            "world/maps/azeroth/azeroth_32_48.adt", // 北郡 (初始出生点，保持首位)
             "world/maps/azeroth/azeroth_32_49.adt", // 闪金镇
+            "world/maps/azeroth/azeroth_29_47.adt",
+            "world/maps/azeroth/azeroth_30_47.adt",
+            "world/maps/azeroth/azeroth_31_47.adt",
+            "world/maps/azeroth/azeroth_32_47.adt",
+            "world/maps/azeroth/azeroth_29_48.adt",
+            "world/maps/azeroth/azeroth_30_48.adt",
             "world/maps/azeroth/azeroth_31_48.adt",
             "world/maps/azeroth/azeroth_33_48.adt",
+            "world/maps/azeroth/azeroth_29_49.adt",
+            "world/maps/azeroth/azeroth_30_49.adt",
             "world/maps/azeroth/azeroth_31_49.adt",
             "world/maps/azeroth/azeroth_33_49.adt",
         };
@@ -1160,20 +1168,23 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     if (!wmoBatch.model) continue;
                     const auto& model = *wmoBatch.model;
                     for (const auto& inst : wmoBatch.instances) {
-                        // 3.1 整栋建筑不可见 -> 直接跳过其所有子房间
-                        if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
-                                               inst.worldCenter, inst.worldRadius)) {
+                        // 3.1 整栋建筑剔除：使用宽松的固定距离阈值 (2500 码) + 视锥测试。
+                        // 不使用 IsInstanceVisible 的 80 + radius*35 自适应距离，否则高空俯瞰时
+                        // 大型主城 WMO 会被整体提前剔除，导致街道与室内小房间消失。
+                        if (glm::distance(inst.worldCenter, camPos) > 2500.0f + inst.worldRadius) {
+                            continue;
+                        }
+                        if (!camFrustum.IntersectsAABB(inst.worldBoundsMin, inst.worldBoundsMax)) {
                             continue;
                         }
                         if (inst.groupBounds.size() != model.groups.size()) continue;
 
                         uint32_t wmoBaseInstance = UINT32_MAX;
-                        // 3.2 逐个子房间测试世界空间包围盒
+                        // 3.2 逐个子房间仅做视锥测试，不再叠加距离剔除
                         for (size_t g = 0; g < model.groups.size(); ++g) {
                             const auto& grp = model.groups[g];
                             const auto& gc  = inst.groupBounds[g];
-                            if (!IsInstanceVisible(camFrustum, camPos, gc.worldBoundsMin, gc.worldBoundsMax,
-                                                   gc.worldCenter, gc.worldRadius)) {
+                            if (!camFrustum.IntersectsAABB(gc.worldBoundsMin, gc.worldBoundsMax)) {
                                 continue;
                             }
                             ++visibleWmoGroups;

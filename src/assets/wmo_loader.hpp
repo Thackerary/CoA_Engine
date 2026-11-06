@@ -178,7 +178,8 @@ public:
             cursor = dataStart + size;
         }
 
-        if (mohd.nGroups == 0 || mohd.nGroups > 512) return std::nullopt;
+        // 放宽上限至 2048，兼容 CoA 魔改的超大型主城 WMO (暴风城等)
+        if (mohd.nGroups == 0 || mohd.nGroups > 2048) return std::nullopt;
 
         // 2. 加载 MOMT 材质引用的所有 BLP 纹理
         std::vector<GLuint> matTextures(momtMats.size(), fallbackWhiteTex);

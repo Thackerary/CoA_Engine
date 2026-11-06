@@ -189,11 +189,20 @@ TEST_PATTERNS = [
     'world/azeroth/elwynn/*',
     'world/generic/*',
     'world/wmo/*',
-    'world/maps/azeroth/azeroth_32_48.adt',
-    'world/maps/azeroth/azeroth_32_49.adt',
+    # 暴风城全境 + 港口 + 北郡 + 闪金镇 + 水晶湖 (3 行 x 5 列中的 14 块)
+    'world/maps/azeroth/azeroth_29_47.adt',
+    'world/maps/azeroth/azeroth_30_47.adt',
+    'world/maps/azeroth/azeroth_31_47.adt',
+    'world/maps/azeroth/azeroth_32_47.adt',
+    'world/maps/azeroth/azeroth_29_48.adt',
+    'world/maps/azeroth/azeroth_30_48.adt',
     'world/maps/azeroth/azeroth_31_48.adt',
+    'world/maps/azeroth/azeroth_32_48.adt',
     'world/maps/azeroth/azeroth_33_48.adt',
+    'world/maps/azeroth/azeroth_29_49.adt',
+    'world/maps/azeroth/azeroth_30_49.adt',
     'world/maps/azeroth/azeroth_31_49.adt',
+    'world/maps/azeroth/azeroth_32_49.adt',
     'world/maps/azeroth/azeroth_33_49.adt',
 ]
 
