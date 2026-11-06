@@ -191,6 +191,10 @@ TEST_PATTERNS = [
     'world/wmo/*',
     'world/maps/azeroth/azeroth_32_48.adt',
     'world/maps/azeroth/azeroth_32_49.adt',
+    'world/maps/azeroth/azeroth_31_48.adt',
+    'world/maps/azeroth/azeroth_33_48.adt',
+    'world/maps/azeroth/azeroth_31_49.adt',
+    'world/maps/azeroth/azeroth_33_49.adt',
 ]
 
 def extract_group(storm, mpq_paths: list[Path], out_dir: Path, mode: str, custom_filter: str,

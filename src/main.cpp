@@ -675,21 +675,25 @@ int main(int /*argc*/, char* /*argv*/[]) {
         coa::assets::LightDbcManager lightMgr;
         lightMgr.Load(vfs, 0);
 
-        // 多 ADT 无缝拼接：同时加载北郡(32_48)与闪金镇(32_49)
+        // 多 ADT 无缝拼接：3x2 共 6 块艾尔文森林与暴风城周边区域
+        // 32_48 保持首位，使初始出生点仍位于北郡
         std::vector<coa::assets::GpuAdtTile> adtTiles;
         std::unordered_set<uint32_t> seenUniqueIds;
 
-        auto tile1 = coa::assets::AdtLoader::LoadAdt(
-            "world/maps/azeroth/azeroth_32_48.adt",
-            vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds
-        );
-        if (tile1) adtTiles.push_back(std::move(*tile1));
-
-        auto tile2 = coa::assets::AdtLoader::LoadAdt(
-            "world/maps/azeroth/azeroth_32_49.adt",
-            vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds
-        );
-        if (tile2) adtTiles.push_back(std::move(*tile2));
+        static constexpr std::array<const char*, 6> kAdtPaths = {
+            "world/maps/azeroth/azeroth_32_48.adt", // 北郡 (初始出生点)
+            "world/maps/azeroth/azeroth_32_49.adt", // 闪金镇
+            "world/maps/azeroth/azeroth_31_48.adt",
+            "world/maps/azeroth/azeroth_33_48.adt",
+            "world/maps/azeroth/azeroth_31_49.adt",
+            "world/maps/azeroth/azeroth_33_49.adt",
+        };
+        for (const char* adtPath : kAdtPaths) {
+            auto tile = coa::assets::AdtLoader::LoadAdt(
+                adtPath, vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds
+            );
+            if (tile) adtTiles.push_back(std::move(*tile));
+        }
 
         // 跨 ADT 全局 M2 合批桶：将所有已加载 ADT 中指向同一个 GpuM2Model 的实例列表聚合到一起
         struct GlobalM2Bucket {
