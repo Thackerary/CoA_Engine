@@ -810,6 +810,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     walkMode    = !walkMode;
                     verticalVel = 0.0f;
                     isGrounded  = false;
+                    if (walkMode) {
+                        // 进入第三人称模式：角色出生在相机下方地面，朝向沿用当前水平视角
+                        playerPos = camPos - glm::vec3(0.0f, 0.0f, kEyeHeight);
+                        playerYaw = camYaw;
+                    }
                 } else if (ev.type == SDL_EVENT_KEY_DOWN &&
                            ev.key.scancode >= SDL_SCANCODE_F1 &&
                            ev.key.scancode <= SDL_SCANCODE_F5) {
