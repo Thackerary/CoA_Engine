@@ -685,18 +685,20 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::vector<coa::assets::GpuAdtTile> adtTiles;
         std::unordered_set<uint32_t> seenUniqueIds;
         std::unordered_set<int> failedAdtKeys; // 键值 = (tileX << 8) | tileY，避免反复重试缺失文件
+        float streamCooldown = 0.25f;          // 相邻两次流式加载之间的冷却时间，避免瞬移时卡顿
 
-        // 跨 ADT 全局 M2 合批桶：将所有已加载 ADT 中指向同一个 GpuM2Model 的实例列表聚合到一起
+        // 跨 ADT 全局 M2 合批桶：按 uniqueId 去重后直接持有实例指针，避免跨界 ADT 重复绘制同一棵树
         struct GlobalM2Bucket {
             const coa::assets::GpuM2Model* model = nullptr;
-            std::vector<const std::vector<coa::assets::M2Instance>*> instanceLists;
+            std::vector<const coa::assets::M2Instance*> instances;
         };
         std::vector<GlobalM2Bucket> globalM2Buckets;
 
-        // 流式加载 / 卸载后重建全局 M2 合批桶 (实例列表指针可能已失效)
+        // 流式加载 / 卸载后重建全局 M2 合批桶 (实例指针可能已失效)
         auto rebuildGlobalM2Buckets = [&]() {
             globalM2Buckets.clear();
             std::unordered_map<const coa::assets::GpuM2Model*, size_t> bucketMap;
+            std::unordered_set<uint32_t> seenM2Ids; // 跨界 ADT 的同一 uniqueId 仅保留一份
             for (const auto& tile : adtTiles) {
                 for (const auto& batch : tile.doodadBatches) {
                     const auto* modelPtr = batch.model.get();
@@ -705,7 +707,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     if (inserted) {
                         globalM2Buckets.push_back(GlobalM2Bucket{modelPtr, {}});
                     }
-                    globalM2Buckets[it->second].instanceLists.push_back(&batch.instances);
+                    auto& bucket = globalM2Buckets[it->second];
+                    for (const auto& inst : batch.instances) {
+                        // uniqueId == 0 为 WMO 内部 MODD 家具，没有全局唯一性，全部保留
+                        if (inst.uniqueId != 0 && !seenM2Ids.insert(inst.uniqueId).second) {
+                            continue;
+                        }
+                        bucket.instances.push_back(&inst);
+                    }
                 }
             }
             std::printf("[Global Batcher] Merged M2 across %zu ADTs into %zu unique buckets (VRAM Cache: %zu M2, %zu WMO, %zu BLP)\n",
@@ -887,56 +896,81 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 if (keys[SDL_SCANCODE_LCTRL]) camPos -= worldUp * moveSpeed;
             }
 
-            // ---- 方向 I：3x3 视野动态 ADT 流式加载与超距卸载 ----
+            // ---- 方向 I：基于真实距离的 ADT 流式加载与卸载 ----
             {
                 const glm::ivec2 curTile = coa::assets::AdtLoader::WorldToAdtIndex(camPos);
                 bool bucketsDirty = false;
 
-                // 1. 卸载超出 2 格半径的区块，并归还其占用的全局唯一 ID
+                // 冷却计时：相邻两次流式加载之间至少间隔一段时间，避免瞬移时集中解码造成卡顿
+                streamCooldown -= dt;
+                if (streamCooldown < 0.0f) streamCooldown = 0.0f;
+
+                // 1. 卸载超出 580 码的区块，并归还其占用的全局唯一 ID
                 for (auto it = adtTiles.begin(); it != adtTiles.end();) {
-                    const int dist = std::max(std::abs(it->tileX - curTile.x),
-                                              std::abs(it->tileY - curTile.y));
-                    if (dist > 2) {
+                    const bool valid = (it->tileX >= 0 && it->tileY >= 0);
+                    const float dist = valid
+                        ? coa::assets::AdtLoader::DistanceToAdtTile(camPos, it->tileX, it->tileY)
+                        : 0.0f;
+                    if (valid && dist > 580.0f) {
+                        const int unloadX = it->tileX;
+                        const int unloadY = it->tileY;
                         for (uint32_t uid : it->ownedUniqueIds) seenUniqueIds.erase(uid);
                         it = adtTiles.erase(it);
                         bucketsDirty = true;
+                        std::printf("[ADT Streamer] Unloaded azeroth_%d_%d.adt (Remaining: %zu)\n",
+                                    unloadX, unloadY, adtTiles.size());
                     } else {
                         ++it;
                     }
                 }
 
-                // 2. 分帧增量加载：每帧最多载入 1 块缺失的 3x3 邻接 ADT
-                bool loadedOne = false;
-                for (int dy = -1; dy <= 1 && !loadedOne; ++dy) {
-                    for (int dx = -1; dx <= 1 && !loadedOne; ++dx) {
-                        const int tx = curTile.x + dx;
-                        const int ty = curTile.y + dy;
-                        if (tx < 0 || tx > 63 || ty < 0 || ty > 63) continue;
-                        if (failedAdtKeys.count((tx << 8) | ty) != 0) continue;
+                // 2. 按距离加载：仅在冷却结束时加载 380 码内距离最近的一块缺失 ADT
+                if (streamCooldown <= 0.0f) {
+                    int   bestTx = -1;
+                    int   bestTy = -1;
+                    float bestDist = 380.0f;
 
-                        bool alreadyLoaded = false;
-                        for (const auto& t : adtTiles) {
-                            if (t.tileX == tx && t.tileY == ty) {
-                                alreadyLoaded = true;
-                                break;
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const int tx = curTile.x + dx;
+                            const int ty = curTile.y + dy;
+                            if (tx < 0 || tx > 63 || ty < 0 || ty > 63) continue;
+                            if (failedAdtKeys.count((tx << 8) | ty) != 0) continue;
+
+                            bool alreadyLoaded = false;
+                            for (const auto& t : adtTiles) {
+                                if (t.tileX == tx && t.tileY == ty) {
+                                    alreadyLoaded = true;
+                                    break;
+                                }
+                            }
+                            if (alreadyLoaded) continue;
+
+                            const float dist = coa::assets::AdtLoader::DistanceToAdtTile(camPos, tx, ty);
+                            if (dist > 380.0f) continue;
+                            if (dist < bestDist) {
+                                bestDist = dist;
+                                bestTx   = tx;
+                                bestTy   = ty;
                             }
                         }
-                        if (alreadyLoaded) continue;
+                    }
 
+                    if (bestTx >= 0 && bestTy >= 0) {
                         char adtPath[96];
                         std::snprintf(adtPath, sizeof(adtPath),
-                                      "world/maps/azeroth/azeroth_%d_%d.adt", tx, ty);
+                                      "world/maps/azeroth/azeroth_%d_%d.adt", bestTx, bestTy);
 
                         auto tile = coa::assets::AdtLoader::LoadAdt(
                             adtPath, vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds);
                         if (tile) {
-                            tile->tileX = tx;
-                            tile->tileY = ty;
+                            tile->tileX = bestTx;
+                            tile->tileY = bestTy;
                             adtTiles.push_back(std::move(*tile));
-                            bucketsDirty = true;
-                            loadedOne    = true;
+                            bucketsDirty  = true;
+                            streamCooldown = 0.15f;
                         } else {
-                            failedAdtKeys.insert((tx << 8) | ty);
+                            failedAdtKeys.insert((bestTx << 8) | bestTy);
                         }
                     }
                 }
@@ -1047,15 +1081,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
                 uint32_t visibleCount  = 0;
 
-                for (const auto* instList : bucket.instanceLists) {
-                    for (const auto& inst : *instList) {
-                        if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
-                                               inst.worldCenter, inst.worldRadius)) {
-                            continue;
-                        }
-                        visibleMatrices.push_back(inst.model);
-                        ++visibleCount;
+                for (const auto* instPtr : bucket.instances) {
+                    const auto& inst = *instPtr;
+                    if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
+                                           inst.worldCenter, inst.worldRadius)) {
+                        continue;
                     }
+                    visibleMatrices.push_back(inst.model);
+                    ++visibleCount;
                 }
                 if (visibleCount == 0) continue;
                 visibleM2Instances += static_cast<int>(visibleCount);
@@ -1261,11 +1294,15 @@ int main(int /*argc*/, char* /*argv*/[]) {
             }
 
             // 3. WMO 两级层次化裁剪：先整栋建筑，再逐个子房间
+            std::unordered_set<uint32_t> drawnWmoIds; // 跨界 WMO 的同一 uniqueId 每帧仅绘制一次
             for (const auto& tile : adtTiles) {
                 for (const auto& wmoBatch : tile.wmoBatches) {
                     if (!wmoBatch.model) continue;
                     const auto& model = *wmoBatch.model;
                     for (const auto& inst : wmoBatch.instances) {
+                        if (inst.uniqueId != 0 && !drawnWmoIds.insert(inst.uniqueId).second) {
+                            continue;
+                        }
                         // 3.1 整栋建筑剔除：使用宽松的固定距离阈值 (2500 码) + 视锥测试。
                         // 不使用 IsInstanceVisible 的 80 + radius*35 自适应距离，否则高空俯瞰时
                         // 大型主城 WMO 会被整体提前剔除，导致街道与室内小房间消失。
