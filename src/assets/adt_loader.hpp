@@ -638,6 +638,171 @@ public:
         return true;
     }
 
+    // 方向 H：行走模式水平防穿墙检测与贴墙滑动 (Collide-and-Slide)
+    // 返回解析后的水平位置；moveDelta 为本帧期望的水平位移增量
+    [[nodiscard]] static glm::vec2 ResolveHorizontalCollision(
+        const std::vector<GpuAdtTile>& tiles,
+        const glm::vec2& startXY,
+        const glm::vec2& moveDelta,
+        float footZ)
+    {
+        if (glm::length(moveDelta) < 1e-5f) return startXY;
+
+        const float kRadius = 0.55f;
+
+        // 内部辅助：从 origXY 沿 dirXY 发射水平射线，命中陡峭墙壁时返回 true 并输出水平法线
+        auto castHorizontalRay = [&](const glm::vec2& origXY, const glm::vec2& dirXY,
+                                     float maxDist, glm::vec2& outHitNormal) -> bool {
+            outHitNormal = glm::vec2(0.0f);
+            if (maxDist <= 1e-5f) return false;
+
+            // 在膝盖与胸口两个高度各发射一条水平射线，避免台阶与矮墙漏检
+            const float heights[2] = { footZ + 0.65f, footZ + 1.45f };
+            const glm::vec3 worldDir(dirXY.x, dirXY.y, 0.0f);
+            const float expand = maxDist + kRadius;
+
+            bool      found     = false;
+            float     bestDist  = maxDist;
+            glm::vec2 bestNormal(0.0f);
+
+            auto boxNear = [&](const glm::vec3& bmin, const glm::vec3& bmax) {
+                return origXY.x >= bmin.x - expand && origXY.x <= bmax.x + expand &&
+                       origXY.y >= bmin.y - expand && origXY.y <= bmax.y + expand;
+            };
+
+            // 对某个实例的碰撞网格逐三角形做 Möller–Trumbore 水平射线求交
+            auto testMesh = [&](const glm::mat4& model, const glm::mat4& invModel,
+                                const std::vector<glm::vec3>& verts,
+                                const std::vector<uint16_t>& indices) {
+                if (verts.empty() || indices.size() < 3) return;
+
+                for (float rayZ : heights) {
+                    const glm::vec3 worldOrigin(origXY.x, origXY.y, rayZ);
+                    const glm::vec3 localOrigin = glm::vec3(invModel * glm::vec4(worldOrigin, 1.0f));
+                    const glm::vec3 localDir    = glm::vec3(invModel * glm::vec4(worldDir, 0.0f));
+
+                    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                        const uint16_t i0 = indices[i + 0];
+                        const uint16_t i1 = indices[i + 1];
+                        const uint16_t i2 = indices[i + 2];
+                        if (i0 >= verts.size() || i1 >= verts.size() || i2 >= verts.size()) continue;
+
+                        const glm::vec3& v0 = verts[i0];
+                        const glm::vec3& v1 = verts[i1];
+                        const glm::vec3& v2 = verts[i2];
+
+                        const glm::vec3 e1   = v1 - v0;
+                        const glm::vec3 e2   = v2 - v0;
+                        const glm::vec3 pvec = glm::cross(localDir, e2);
+                        const float det = glm::dot(e1, pvec);
+                        if (std::fabs(det) < 1e-8f) continue;
+                        const float invDet = 1.0f / det;
+
+                        const glm::vec3 tvec = localOrigin - v0;
+                        const float uu = glm::dot(tvec, pvec) * invDet;
+                        if (uu < 0.0f || uu > 1.0f) continue;
+
+                        const glm::vec3 qvec = glm::cross(tvec, e1);
+                        const float vv = glm::dot(localDir, qvec) * invDet;
+                        if (vv < 0.0f || uu + vv > 1.0f) continue;
+
+                        const float tHit = glm::dot(e2, qvec) * invDet;
+                        if (tHit < 0.0f) continue;
+
+                        // 仅陡峭墙面 (|n.z| < 0.55) 视为水平阻挡，斜坡与地板不参与
+                        const glm::vec3 nWorld =
+                            glm::normalize(glm::mat3(model) * glm::cross(v1 - v0, v2 - v0));
+                        if (std::fabs(nWorld.z) >= 0.55f) continue;
+
+                        const glm::vec3 hitLocal = localOrigin + localDir * tHit;
+                        const glm::vec3 hitWorld = glm::vec3(model * glm::vec4(hitLocal, 1.0f));
+                        const float worldDist =
+                            glm::length(glm::vec2(hitWorld.x, hitWorld.y) - origXY);
+                        if (worldDist > maxDist || worldDist >= bestDist) continue;
+
+                        glm::vec2 n2(nWorld.x, nWorld.y);
+                        const float nLen = glm::length(n2);
+                        if (nLen < 1e-5f) continue;
+                        n2 /= nLen;
+                        if (glm::dot(n2, dirXY) > 0.0f) n2 = -n2; // 法线须朝向射线来向
+
+                        bestDist   = worldDist;
+                        bestNormal = n2;
+                        found      = true;
+                    }
+                }
+            };
+
+            // 1. WMO 建筑：整栋包围盒 + 逐子房间包围盒快速筛除
+            for (const auto& tile : tiles) {
+                for (const auto& wmoBatch : tile.wmoBatches) {
+                    if (!wmoBatch.model) continue;
+                    for (const auto& inst : wmoBatch.instances) {
+                        if (!boxNear(inst.worldBoundsMin, inst.worldBoundsMax)) continue;
+                        const bool hasGroups =
+                            (inst.groupBounds.size() == wmoBatch.model->groups.size());
+                        for (size_t g = 0; g < wmoBatch.model->groups.size(); ++g) {
+                            if (hasGroups) {
+                                const auto& gc = inst.groupBounds[g];
+                                if (!boxNear(gc.worldBoundsMin, gc.worldBoundsMax)) continue;
+                            }
+                            const auto& grp = wmoBatch.model->groups[g];
+                            testMesh(inst.model, inst.invModel, grp.cpuPositions, grp.cpuIndices);
+                        }
+                    }
+                }
+            }
+
+            // 2. M2 装饰物：仅测试带碰撞网格的模型 (木板 / 桥梁 / 巨石)
+            for (const auto& tile : tiles) {
+                for (const auto& batch : tile.doodadBatches) {
+                    if (!batch.model || batch.model->collisionIndices.empty()) continue;
+                    for (const auto& inst : batch.instances) {
+                        if (!boxNear(inst.worldBoundsMin, inst.worldBoundsMax)) continue;
+                        testMesh(inst.model, inst.invModel,
+                                 batch.model->collisionVerts, batch.model->collisionIndices);
+                    }
+                }
+            }
+
+            if (!found) return false;
+            outHitNormal = bestNormal;
+            return true;
+        };
+
+        // 最多 2 次贴墙滑动迭代；第 2 次仍受阻即判定卡墙角并保持原地
+        glm::vec2 remDelta = moveDelta;
+        for (int iter = 0; iter < 2; ++iter) {
+            const float stepLen = glm::length(remDelta);
+            if (stepLen < 1e-5f) break;
+
+            const glm::vec2 dir = remDelta / stepLen;
+            const float angles[3] = { 0.0f, 0.5f, -0.5f };
+            glm::vec2 hitNormal(0.0f);
+            bool blocked = false;
+            for (float a : angles) {
+                const float cs = std::cos(a);
+                const float sn = std::sin(a);
+                const glm::vec2 rayDir(dir.x * cs - dir.y * sn, dir.x * sn + dir.y * cs);
+                if (castHorizontalRay(startXY, rayDir, stepLen + kRadius, hitNormal)) {
+                    blocked = true;
+                    break;
+                }
+            }
+
+            if (!blocked) return startXY + remDelta;
+
+            if (iter == 0) {
+                // 将剩余位移投影到墙面切线，沿墙滑行
+                remDelta -= glm::dot(remDelta, hitNormal) * hitNormal;
+            } else {
+                return startXY;
+            }
+        }
+
+        return startXY + remDelta;
+    }
+
 private:
     // 解析 MH2O 水体：还原每层子格水面高度，按河床高度计算精确水深，生成 Pass 4 几何
     static void ParseMh2oChunk(

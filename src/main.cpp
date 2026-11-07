@@ -816,10 +816,29 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 glm::vec3 flatRight = glm::normalize(glm::cross(fwdFlat, worldUp));
 
                 const float walkSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 14.0f : 7.0f) * dt;
-                if (keys[SDL_SCANCODE_W]) camPos += fwdFlat * walkSpeed;
-                if (keys[SDL_SCANCODE_S]) camPos -= fwdFlat * walkSpeed;
-                if (keys[SDL_SCANCODE_D]) camPos += flatRight * walkSpeed;
-                if (keys[SDL_SCANCODE_A]) camPos -= flatRight * walkSpeed;
+
+                // 方向 H：先累积期望水平位移，再交给 Collide-and-Slide 解析
+                glm::vec2 moveDelta(0.0f);
+                if (keys[SDL_SCANCODE_W]) moveDelta += glm::vec2(fwdFlat.x, fwdFlat.y) * walkSpeed;
+                if (keys[SDL_SCANCODE_S]) moveDelta -= glm::vec2(fwdFlat.x, fwdFlat.y) * walkSpeed;
+                if (keys[SDL_SCANCODE_D]) moveDelta += glm::vec2(flatRight.x, flatRight.y) * walkSpeed;
+                if (keys[SDL_SCANCODE_A]) moveDelta -= glm::vec2(flatRight.x, flatRight.y) * walkSpeed;
+
+                const float curFootZ = camPos.z - kEyeHeight;
+                const glm::vec2 resolvedXY = coa::assets::AdtLoader::ResolveHorizontalCollision(
+                    adtTiles, glm::vec2(camPos.x, camPos.y), moveDelta, curFootZ);
+
+                // 陡坡防穿模保护：贴地状态下前方地面骤升过高 (超过 60 度陡崖) 时保持原地
+                float nextGroundZ = curFootZ;
+                const bool hasNextGround = coa::assets::AdtLoader::SampleGroundHeight(
+                    adtTiles, resolvedXY.x, resolvedXY.y, curFootZ, nextGroundZ);
+
+                if (isGrounded && hasNextGround && (nextGroundZ - curFootZ) > 1.15f) {
+                    // 目标点地面过高：拒绝该水平位移
+                } else {
+                    camPos.x = resolvedXY.x;
+                    camPos.y = resolvedXY.y;
+                }
 
                 if (keys[SDL_SCANCODE_SPACE] && isGrounded) {
                     verticalVel = 8.2f;
