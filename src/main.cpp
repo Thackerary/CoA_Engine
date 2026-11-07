@@ -328,8 +328,8 @@ void main() {
         litColor = texColor.rgb * uBatchColor.rgb;
     } else {
         vec3 N = normalize(vNormal);
-        // TwoSided 双面材质 (树冠/灌木/旗帜)：当观察背面时翻转法线，避免向光面树叶背光死黑
-        if ((uMaterialFlags & 1) != 0 && !gl_FrontFacing) {
+        // 统一双面光照：观察背面时翻转法线，避免树冠/旗帜/羽毛背光死黑
+        if (!gl_FrontFacing) {
             N = -N;
         }
 
@@ -340,7 +340,7 @@ void main() {
         vec3 r2 = cross(N, dPdx);
         float det = dot(dPdx, r1);
         vec3 surfGrad = (abs(det) > 1e-8) ? ((r1 * dFdx(height) + r2 * dFdy(height)) / det) : vec3(0.0);
-        N = normalize(N - surfGrad * 0.35);
+        N = normalize(N - surfGrad * 0.04);
 
         vec3 L = normalize(uSunDirAndIntensity.xyz);
         vec3 V = normalize(uCameraPos.xyz - vWorldPos);
@@ -348,7 +348,7 @@ void main() {
 
         float ndotl = max(dot(N, L), 0.0);
         float halfLambert = ndotl * 0.65 + 0.35;
-        float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.28 * ndotl;
+        float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.04 * ndotl;
 
         vec3 skyAmbient    = uAmbientSky.rgb;
         vec3 groundAmbient = uAmbientGround.rgb;
@@ -592,7 +592,11 @@ layout(std140, binding = 0) uniform FrameBlock {
 out vec4 FragColor;
 
 void main() {
-    vec4 c = texture(uTexAlbedo, vUV) * vColor;
+    // 粒子贴图普遍以 RGB 亮度携带形状、alpha 恒为 1：按亮度重建透明度以抠除黑底
+    vec4  tex      = texture(uTexAlbedo, vUV);
+    float luma     = max(tex.r, max(tex.g, tex.b));
+    float texAlpha = (tex.a < 0.96) ? tex.a : luma;
+    vec4  c        = vec4(tex.rgb * vColor.rgb, texAlpha * vColor.a);
 
     // 高斯云团衰减：中心实、边缘柔和消散，避免炊烟出现硬边白块
     float r = clamp(length(vCorner) * 2.0, 0.0, 1.0);
@@ -633,7 +637,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
     glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
     glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_GREATER);
+    glDepthFunc(GL_GEQUAL);
     glClearDepth(0.0);
     glEnable(GL_MULTISAMPLE);
 
@@ -1065,6 +1069,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
                                     alp = std::sin(u * 3.14159f) * 0.32f;
                                     // 烟色柔和偏暖灰
                                     col = glm::mix(glm::vec3(0.82f), glm::vec3(0.62f), u);
+                                }
+                                if (!isSmoke) {
+                                    // 非炊烟粒子 (火星/水花/光晕) 随实例缩放折算尺寸，并限制最大半径避免白团过曝
+                                    scl = glm::clamp(scl * glm::length(glm::vec3(instMat[0])), 0.05f, 0.35f);
                                 }
                                 if (alp < 0.004f) continue;
 

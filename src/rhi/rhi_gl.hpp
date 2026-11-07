@@ -263,12 +263,14 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
         // sortKey 高 4 位即 Pass ID (2=Opaque, 3=AlphaCutout, 4=MH2O水体, 5=M2半透明, 6=M2发光叠加, 7=M2瀑布UV滚动)
         uint8_t pass = static_cast<uint8_t>(c.sortKey >> 60);
         if (pass != lastPass) {
+            // 所有 Pass 统一关闭背面剔除：树冠 / 羽毛 / 旗帜 / 双面窗框在视角变化时不再整片消失
+            glDisable(GL_CULL_FACE);
+
             if (pass == 4) {
                 // Pass 4: MH2O 半透明水体 (使用专属 waterShader)
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDepthMask(GL_FALSE);
-                glDisable(GL_CULL_FACE);
             } else if (pass == 5 || pass == 6 || pass == 7) {
                 // Pass 5=M2半透明, Pass 6=M2发光叠加, Pass 7=M2瀑布动画
                 glEnable(GL_BLEND);
@@ -278,22 +280,22 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 }
                 glDepthMask(GL_FALSE);
-                glDisable(GL_CULL_FACE);
                 glUniform1i(0, (pass == 7) ? 3 : 2);
             } else {
                 // Pass 2 / 3: 不透明与 Alpha Cutout
                 glDisable(GL_BLEND);
                 glDepthMask(GL_TRUE);
-                // 双面材质 (树冠/窗框/旗帜) 关闭剔除；单面材质开启背面剔除，
-                // 避免窗户内外两层共面重叠产生蓝色闪烁 Z-Fighting
-                if (c.isTwoSided != 0) {
-                    glDisable(GL_CULL_FACE);
-                } else {
-                    glEnable(GL_CULL_FACE);
-                    glCullFace(GL_BACK);
-                }
                 glUniform1i(0, (pass == 3) ? 1 : 0);
             }
+
+            // Alpha Cutout 使用多边形偏移，避免树叶 / 栅栏裁剪面与地面共面产生 Z-Fighting
+            if (pass == 3) {
+                glEnable(GL_POLYGON_OFFSET_FILL);
+                glPolygonOffset(1.0f, 1.0f);
+            } else {
+                glDisable(GL_POLYGON_OFFSET_FILL);
+            }
+
             lastPass = pass;
         }
 

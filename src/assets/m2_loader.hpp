@@ -347,6 +347,8 @@ struct GpuM2Model {
     rhi::GlBuffer                       vbo;
     rhi::GlBuffer                       ibo;
     std::vector<GpuM2Submesh>           submeshes;
+    std::vector<glm::vec3>              collisionVerts;    // M2 局部空间碰撞网格顶点 (MD20.boundingVertices)
+    std::vector<uint16_t>               collisionIndices;  // 碰撞网格三角形索引 (MD20.boundingTriangles)
     glm::vec3                           localBoundsMin{-1.0f};
     glm::vec3                           localBoundsMax{1.0f};
     std::vector<uint32_t>               globalSequences;
@@ -500,6 +502,8 @@ public:
         };
 
         auto m2Verts     = getSpan.template operator()<M2Vertex>(m2Bytes, m2Hdr.vertices);
+        auto m2BoundVerts = getSpan.template operator()<glm::vec3>(m2Bytes, m2Hdr.boundingVertices);
+        auto m2BoundTris  = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.boundingTriangles);
         auto m2TexDefs   = getSpan.template operator()<M2TextureDef>(m2Bytes, m2Hdr.textures);
         auto m2Mats      = getSpan.template operator()<M2Material>(m2Bytes, m2Hdr.renderFlags);
         auto m2TexLut    = getSpan.template operator()<uint16_t>(m2Bytes, m2Hdr.texLookupTable);
@@ -573,6 +577,16 @@ public:
         gpuModel.localBoundsMin = localMin;
         gpuModel.localBoundsMax = localMax;
         gpuModel.globalSequences.assign(globalSeqs.begin(), globalSeqs.end());
+
+        // 碰撞网格：优先使用 MD20 内嵌的 boundingVertices / boundingTriangles (渡口木板 / 桥梁 / 巨石)
+        gpuModel.collisionVerts.assign(m2BoundVerts.begin(), m2BoundVerts.end());
+        gpuModel.collisionIndices.assign(m2BoundTris.begin(), m2BoundTris.end());
+        if (gpuModel.collisionVerts.empty() && hasMesh) {
+            // 兜底：直接复用实体网格顶点与全局索引，保证仍可站立
+            gpuModel.collisionVerts.reserve(safeVerts.size());
+            for (const auto& v : safeVerts) gpuModel.collisionVerts.push_back(v.pos);
+            gpuModel.collisionIndices = globalIndices;
+        }
 
         // 解析骨骼、颜色、透明度与 UV 变换关键帧轨道
         gpuModel.bones.reserve(compBones.size());
@@ -683,8 +697,12 @@ public:
         }
 
         // ==================== 解析 3.3.5a 粒子发射器 (476 字节 M2ParticleDefV264) ====================
+        // 光柱 / 光束类模型 (lightshaft / lightray) 的叠加粒子会铺满整个屏幕，直接跳过
+        const bool isLightBeamModel = normPath.find("lightshaft") != std::string::npos ||
+                                      normPath.find("lightray")  != std::string::npos;
+
         auto particleDefs = getSpan.template operator()<M2ParticleDefV264>(m2Bytes, m2Hdr.particleEmitters);
-        if (!particleDefs.empty()) {
+        if (!particleDefs.empty() && !isLightBeamModel) {
             // 浮点轨统一取前 4 帧均值，抑制异常单帧；无关键帧才回落到 fallback，
             // 真实值 0 必须保留，用于识别 Stand 待机状态下的休眠发射器
             auto sampleTrackFloat = [&](const M2TrackBase& track, float fallback) -> float {
@@ -797,10 +815,10 @@ public:
                     em.alphaMid   = 0.65f;
                     em.alphaEnd   = 0.0f;
                 }
-                if (std::max({em.scaleStart, em.scaleMid, em.scaleEnd}) < 0.05f) {
-                    em.scaleStart = 0.4f;
-                    em.scaleMid   = 1.2f;
-                    em.scaleEnd   = 2.2f;
+                if (std::max({em.scaleStart, em.scaleMid, em.scaleEnd}) <= 1e-4f) {
+                    em.scaleStart = 0.15f;
+                    em.scaleMid   = 0.30f;
+                    em.scaleEnd   = 0.45f;
                 }
                 if (glm::length(em.colorStart) + glm::length(em.colorMid) < 0.05f) {
                     em.colorStart = glm::vec3(0.75f);
@@ -829,11 +847,11 @@ public:
             }
         }
 
-        // particleemitters/ 目录下的模型自身仅含编辑器占位方块网格：
-        // 若已成功解析出粒子发射器，则清空 submeshes，只保留粒子渲染避免出现白盒
+        // particleemitters/ 目录下的模型自身仅含编辑器占位白盒网格：
+        // 仅剔除不透明 (blendMode == 0) 占位面，保留 fountainparticles.m2 的半透明水流柱网格
         if (normPath.find("particleemitters/") != std::string::npos &&
             !gpuModel.particleEmitters.empty()) {
-            gpuModel.submeshes.clear();
+            std::erase_if(gpuModel.submeshes, [](const GpuM2Submesh& s) { return s.blendMode == 0; });
         }
 
         return gpuModel;

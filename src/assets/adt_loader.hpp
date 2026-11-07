@@ -143,6 +143,7 @@ struct GpuLiquidChunk {
 // M2 装饰物单实例：加载期已预计算世界空间裁剪数据
 struct M2Instance {
     glm::mat4 model{1.0f};
+    glm::mat4 invModel{1.0f}; // 世界空间 -> M2 局部空间，用于地面射线拾取
     glm::vec3 worldBoundsMin{0.0f};
     glm::vec3 worldBoundsMax{0.0f};
     glm::vec3 worldCenter{0.0f};
@@ -456,7 +457,8 @@ public:
 
             for (const auto& instMat : mats) {
                 M2Instance inst{};
-                inst.model = instMat;
+                inst.model    = instMat;
+                inst.invModel = glm::inverse(instMat);
                 TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, instMat,
                                    inst.worldBoundsMin, inst.worldBoundsMax,
                                    inst.worldCenter, inst.worldRadius);
@@ -570,6 +572,62 @@ public:
                             if (hitWorld.z < currentFootZ - 30.0f) continue;
                             bestZ = std::max(bestZ, hitWorld.z);
                         }
+                    }
+                }
+            }
+        }
+
+        // 3. M2 装饰物碰撞网格射线检测：渡口木板 / 桥梁 / 巨石 (依赖 MD20 boundingVertices/Triangles)
+        for (const auto& tile : tiles) {
+            for (const auto& doodadBatch : tile.doodadBatches) {
+                if (!doodadBatch.model) continue;
+                const auto& mdl = *doodadBatch.model;
+                if (mdl.collisionVerts.empty() || mdl.collisionIndices.size() < 3) continue;
+
+                for (const auto& inst : doodadBatch.instances) {
+                    if (worldX < inst.worldBoundsMin.x || worldX > inst.worldBoundsMax.x) continue;
+                    if (worldY < inst.worldBoundsMin.y || worldY > inst.worldBoundsMax.y) continue;
+
+                    const glm::vec3 localOrigin = glm::vec3(inst.invModel * glm::vec4(worldRayOrigin, 1.0f));
+                    const glm::vec3 localDir    = glm::vec3(inst.invModel * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));
+
+                    for (size_t i = 0; i + 2 < mdl.collisionIndices.size(); i += 3) {
+                        const uint16_t i0 = mdl.collisionIndices[i + 0];
+                        const uint16_t i1 = mdl.collisionIndices[i + 1];
+                        const uint16_t i2 = mdl.collisionIndices[i + 2];
+                        if (i0 >= mdl.collisionVerts.size() ||
+                            i1 >= mdl.collisionVerts.size() ||
+                            i2 >= mdl.collisionVerts.size()) continue;
+
+                        const glm::vec3& v0 = mdl.collisionVerts[i0];
+                        const glm::vec3& v1 = mdl.collisionVerts[i1];
+                        const glm::vec3& v2 = mdl.collisionVerts[i2];
+
+                        const glm::vec3 e1   = v1 - v0;
+                        const glm::vec3 e2   = v2 - v0;
+                        const glm::vec3 pvec = glm::cross(localDir, e2);
+                        const float det = glm::dot(e1, pvec);
+                        if (std::fabs(det) < 1e-8f) continue;
+                        const float invDet = 1.0f / det;
+
+                        const glm::vec3 tvec = localOrigin - v0;
+                        const float uu = glm::dot(tvec, pvec) * invDet;
+                        if (uu < 0.0f || uu > 1.0f) continue;
+
+                        const glm::vec3 qvec = glm::cross(tvec, e1);
+                        const float vv = glm::dot(localDir, qvec) * invDet;
+                        if (vv < 0.0f || uu + vv > 1.0f) continue;
+
+                        const float tHit = glm::dot(e2, qvec) * invDet;
+                        if (tHit < 0.0f) continue;
+
+                        const glm::vec3 hitLocal = localOrigin + localDir * tHit;
+                        const glm::vec3 hitWorld = glm::vec3(inst.model * glm::vec4(hitLocal, 1.0f));
+
+                        // 仅接受头部以下 (木板 / 桥面) 的交点，忽略上方枝叶与装饰
+                        if (hitWorld.z > currentFootZ + 1.8f) continue;
+                        if (hitWorld.z < currentFootZ - 30.0f) continue;
+                        bestZ = std::max(bestZ, hitWorld.z);
                     }
                 }
             }
