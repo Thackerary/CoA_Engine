@@ -681,31 +681,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
         // 多 ADT 无缝拼接：3x2 共 6 块艾尔文森林与暴风城周边区域
         // 32_48 保持首位，使初始出生点仍位于北郡
+        // 方向 I：基于相机坐标的 3x3 动态 ADT 流式加载与卸载
         std::vector<coa::assets::GpuAdtTile> adtTiles;
         std::unordered_set<uint32_t> seenUniqueIds;
-
-        static constexpr std::array<const char*, 14> kAdtPaths = {
-            "world/maps/azeroth/azeroth_32_48.adt", // 北郡 (初始出生点，保持首位)
-            "world/maps/azeroth/azeroth_32_49.adt", // 闪金镇
-            "world/maps/azeroth/azeroth_29_47.adt",
-            "world/maps/azeroth/azeroth_30_47.adt",
-            "world/maps/azeroth/azeroth_31_47.adt",
-            "world/maps/azeroth/azeroth_32_47.adt",
-            "world/maps/azeroth/azeroth_29_48.adt",
-            "world/maps/azeroth/azeroth_30_48.adt",
-            "world/maps/azeroth/azeroth_31_48.adt",
-            "world/maps/azeroth/azeroth_33_48.adt",
-            "world/maps/azeroth/azeroth_29_49.adt",
-            "world/maps/azeroth/azeroth_30_49.adt",
-            "world/maps/azeroth/azeroth_31_49.adt",
-            "world/maps/azeroth/azeroth_33_49.adt",
-        };
-        for (const char* adtPath : kAdtPaths) {
-            auto tile = coa::assets::AdtLoader::LoadAdt(
-                adtPath, vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds
-            );
-            if (tile) adtTiles.push_back(std::move(*tile));
-        }
+        std::unordered_set<int> failedAdtKeys; // 键值 = (tileX << 8) | tileY，避免反复重试缺失文件
 
         // 跨 ADT 全局 M2 合批桶：将所有已加载 ADT 中指向同一个 GpuM2Model 的实例列表聚合到一起
         struct GlobalM2Bucket {
@@ -713,7 +692,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
             std::vector<const std::vector<coa::assets::M2Instance>*> instanceLists;
         };
         std::vector<GlobalM2Bucket> globalM2Buckets;
-        {
+
+        // 流式加载 / 卸载后重建全局 M2 合批桶 (实例列表指针可能已失效)
+        auto rebuildGlobalM2Buckets = [&]() {
+            globalM2Buckets.clear();
             std::unordered_map<const coa::assets::GpuM2Model*, size_t> bucketMap;
             for (const auto& tile : adtTiles) {
                 for (const auto& batch : tile.doodadBatches) {
@@ -729,7 +711,21 @@ int main(int /*argc*/, char* /*argv*/[]) {
             std::printf("[Global Batcher] Merged M2 across %zu ADTs into %zu unique buckets (VRAM Cache: %zu M2, %zu WMO, %zu BLP)\n",
                         adtTiles.size(), globalM2Buckets.size(),
                         assets.CachedM2Count(), assets.CachedWmoCount(), assets.CachedTextureCount());
+        };
+
+        // 初始仅加载出生点所在的北郡 (32, 48)，其余区块由主循环按 3x3 视野动态流式加载
+        {
+            auto tile = coa::assets::AdtLoader::LoadAdt(
+                "world/maps/azeroth/azeroth_32_48.adt", vfs, assets,
+                whiteFallbackTex.Handle(), seenUniqueIds
+            );
+            if (tile) {
+                tile->tileX = 32;
+                tile->tileY = 48;
+                adtTiles.push_back(std::move(*tile));
+            }
         }
+        rebuildGlobalM2Buckets();
 
         // 自动将摄像机瞬移至首个成功加载的 ADT 地形中心上空
         glm::vec3 camPos = (!adtTiles.empty()) ? adtTiles.front().suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
@@ -788,6 +784,23 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     walkMode    = !walkMode;
                     verticalVel = 0.0f;
                     isGrounded  = false;
+                } else if (ev.type == SDL_EVENT_KEY_DOWN &&
+                           ev.key.scancode >= SDL_SCANCODE_F1 &&
+                           ev.key.scancode <= SDL_SCANCODE_F5) {
+                    // F1~F5 地标瞬移热键
+                    static const glm::vec3 kLandmarks[5] = {
+                        glm::vec3(-8915.0f, -155.0f,  85.0f), // F1 北郡修道院
+                        glm::vec3(-9460.0f,   62.0f,  60.0f), // F2 闪金镇
+                        glm::vec3(-9065.0f,  435.0f,  96.0f), // F3 暴风城英雄谷大门
+                        glm::vec3(-8540.0f,  845.0f, 110.0f), // F4 暴风城大教堂广场
+                        glm::vec3(-9260.0f, -210.0f,  62.0f), // F5 水晶湖渡口
+                    };
+                    const int idx = static_cast<int>(ev.key.scancode) - static_cast<int>(SDL_SCANCODE_F1);
+                    camPos      = kLandmarks[idx];
+                    verticalVel = 0.0f;
+                    isGrounded  = false;
+                    std::printf("[Teleport] Landmark F%d -> (%.1f, %.1f, %.1f)\n",
+                                idx + 1, camPos.x, camPos.y, camPos.z);
                 } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_RIGHT) {
                     rightMouseDown = true;
                     SDL_SetWindowRelativeMouseMode(window, true);
@@ -872,6 +885,64 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 if (keys[SDL_SCANCODE_A]) camPos -= right * moveSpeed;
                 if (keys[SDL_SCANCODE_SPACE]) camPos += worldUp * moveSpeed;
                 if (keys[SDL_SCANCODE_LCTRL]) camPos -= worldUp * moveSpeed;
+            }
+
+            // ---- 方向 I：3x3 视野动态 ADT 流式加载与超距卸载 ----
+            {
+                const glm::ivec2 curTile = coa::assets::AdtLoader::WorldToAdtIndex(camPos);
+                bool bucketsDirty = false;
+
+                // 1. 卸载超出 2 格半径的区块，并归还其占用的全局唯一 ID
+                for (auto it = adtTiles.begin(); it != adtTiles.end();) {
+                    const int dist = std::max(std::abs(it->tileX - curTile.x),
+                                              std::abs(it->tileY - curTile.y));
+                    if (dist > 2) {
+                        for (uint32_t uid : it->ownedUniqueIds) seenUniqueIds.erase(uid);
+                        it = adtTiles.erase(it);
+                        bucketsDirty = true;
+                    } else {
+                        ++it;
+                    }
+                }
+
+                // 2. 分帧增量加载：每帧最多载入 1 块缺失的 3x3 邻接 ADT
+                bool loadedOne = false;
+                for (int dy = -1; dy <= 1 && !loadedOne; ++dy) {
+                    for (int dx = -1; dx <= 1 && !loadedOne; ++dx) {
+                        const int tx = curTile.x + dx;
+                        const int ty = curTile.y + dy;
+                        if (tx < 0 || tx > 63 || ty < 0 || ty > 63) continue;
+                        if (failedAdtKeys.count((tx << 8) | ty) != 0) continue;
+
+                        bool alreadyLoaded = false;
+                        for (const auto& t : adtTiles) {
+                            if (t.tileX == tx && t.tileY == ty) {
+                                alreadyLoaded = true;
+                                break;
+                            }
+                        }
+                        if (alreadyLoaded) continue;
+
+                        char adtPath[96];
+                        std::snprintf(adtPath, sizeof(adtPath),
+                                      "world/maps/azeroth/azeroth_%d_%d.adt", tx, ty);
+
+                        auto tile = coa::assets::AdtLoader::LoadAdt(
+                            adtPath, vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds);
+                        if (tile) {
+                            tile->tileX = tx;
+                            tile->tileY = ty;
+                            adtTiles.push_back(std::move(*tile));
+                            bucketsDirty = true;
+                            loadedOne    = true;
+                        } else {
+                            failedAdtKeys.insert((tx << 8) | ty);
+                        }
+                    }
+                }
+
+                // 3. 本帧发生加载或卸载：重建 M2 合批桶
+                if (bucketsDirty) rebuildGlobalM2Buckets();
             }
 
             if (keys[SDL_SCANCODE_LEFTBRACKET])  gameTimeHalfMin -= 360.0f * dt;
@@ -1293,11 +1364,13 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 int hh = totalMinutes / 60;
                 int mm = totalMinutes % 60;
 
-                char titleBuf[320];
+                const glm::ivec2 curTileTitle = coa::assets::AdtLoader::WorldToAdtIndex(camPos);
+                char titleBuf[384];
                 std::snprintf(titleBuf, sizeof(titleBuf),
-                              "CoA Engine | Time: %02d:%02d | %s | [Mode: %s] | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
+                              "CoA Engine | Time: %02d:%02d | %s | [Mode: %s] | Tile:(%d,%d) [%zu ADTs] | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
                               hh, mm, underwater ? "UNDERWATER" : "Surface",
                               walkMode ? "WALK" : "FLY",
+                              curTileTitle.x, curTileTitle.y, adtTiles.size(),
                               visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances,
                               visibleWaterChunks, renderQueue.size());
                 SDL_SetWindowTitle(window, titleBuf);

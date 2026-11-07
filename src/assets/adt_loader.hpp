@@ -189,6 +189,10 @@ struct GpuAdtTile {
     rhi::GlBuffer               liquidIbo;       // 【新增】MH2O 水面合并索引缓冲
     std::vector<GpuLiquidChunk> liquidChunks;    // 【新增】所有水体绘制区间
     glm::vec3                   suggestedCamPos{0.0f};
+    // 方向 I：网格坐标与去重 ID 归属记录，供动态流式加载 / 卸载使用
+    int                         tileX = -1;      // ADT 网格 X 索引 (文件名的第一个数字)
+    int                         tileY = -1;      // ADT 网格 Y 索引 (文件名的第二个数字)
+    std::vector<uint32_t>       ownedUniqueIds;  // 本块占用的全局唯一 ID，卸载时归还 seenUniqueIds
 
     struct DebugPlacement {
         std::string path;
@@ -223,6 +227,15 @@ public:
     static constexpr float kMapHalfSize = 32.0f * (1600.0f / 3.0f); // 17066.66656 码
     static constexpr float kChunkSize   = (1600.0f / 3.0f) / 16.0f; // 33.333333 码
     static constexpr float kUnitSize    = kChunkSize / 8.0f;        // 4.1666665 码
+    static constexpr float kTileSize    = 1600.0f / 3.0f;           // 533.33333 码 (单块 ADT 边长)
+
+    // 方向 I：世界坐标 -> ADT 网格索引 (与 azeroth_X_Y.adt 文件命名保持一致)
+    [[nodiscard]] static glm::ivec2 WorldToAdtIndex(const glm::vec3& worldPos) noexcept {
+        return glm::ivec2(
+            static_cast<int>(std::floor((kMapHalfSize - worldPos.y) / kTileSize)),
+            static_cast<int>(std::floor((kMapHalfSize - worldPos.x) / kTileSize))
+        );
+    }
 
     [[nodiscard]] static constexpr uint32_t FourCC(const char (&tag)[5]) noexcept {
         // 匹配磁盘小端序读取后的Reversed FourCC
@@ -351,6 +364,7 @@ public:
             if (!seenUniqueIds.insert(entry.uniqueId).second) {
                 continue;
             }
+            tile.ownedUniqueIds.push_back(entry.uniqueId);
 
             // 将 MDDF 左上角编辑器坐标转换为魔兽 Z-Up 世界坐标
             glm::vec3 worldPos(
@@ -382,6 +396,7 @@ public:
 
             std::string wmoPath = vfs::VirtualFileSystem::NormalizeVirtualPath(mwmoBlob.data() + strOffset);
             if (!seenUniqueIds.insert(entry.uniqueId).second) continue;
+            tile.ownedUniqueIds.push_back(entry.uniqueId);
 
             glm::vec3 worldPos(kMapHalfSize - entry.pos.z, kMapHalfSize - entry.pos.x, entry.pos.y);
             glm::mat4 mat(1.0f);
