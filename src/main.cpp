@@ -736,6 +736,18 @@ int main(int /*argc*/, char* /*argv*/[]) {
         }
         rebuildGlobalM2Buckets();
 
+        // 方向 J：第三人称角色模型 (优先阿尔萨斯，回退农民 / 狮鹫)
+        std::shared_ptr<const coa::assets::GpuM2Model> playerModel =
+            assets.GetOrLoadM2("creature/arthas/arthas.m2", whiteFallbackTex.Handle());
+        if (!playerModel || playerModel->submeshes.empty()) {
+            playerModel = assets.GetOrLoadM2("creature/peasant/peasant.m2", whiteFallbackTex.Handle());
+        }
+        if (!playerModel || playerModel->submeshes.empty()) {
+            playerModel = assets.GetOrLoadM2(
+                "world/generic/human/passive doodads/gryphonroost/gryphonroost01.m2",
+                whiteFallbackTex.Handle());
+        }
+
         // 自动将摄像机瞬移至首个成功加载的 ADT 地形中心上空
         glm::vec3 camPos = (!adtTiles.empty()) ? adtTiles.front().suggestedCamPos : glm::vec3(0.0f, 0.0f, 20.0f);
         float camYaw   = 0.0f;
@@ -747,6 +759,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
         float verticalVel = 0.0f;
         bool  isGrounded  = false;
         constexpr float kEyeHeight = 1.85f;
+        // 方向 J：第三人称角色状态 (playerPos.z 直接代表脚底高度)
+        glm::vec3 playerPos = camPos - glm::vec3(0.0f, 0.0f, kEyeHeight);
+        float     playerYaw = 0.0f;
+        float     camDist   = 4.5f;
+        int       playerAnimAction = 0;
         uint64_t lastTicks = SDL_GetTicksNS();
 
         int visibleChunks = 0;
@@ -808,6 +825,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     camPos      = kLandmarks[idx];
                     verticalVel = 0.0f;
                     isGrounded  = false;
+                    playerPos   = camPos - glm::vec3(0.0f, 0.0f, kEyeHeight);
                     std::printf("[Teleport] Landmark F%d -> (%.1f, %.1f, %.1f)\n",
                                 idx + 1, camPos.x, camPos.y, camPos.z);
                 } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_RIGHT) {
@@ -819,6 +837,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 } else if (ev.type == SDL_EVENT_MOUSE_MOTION && rightMouseDown) {
                     camYaw   -= ev.motion.xrel * 0.0025f;
                     camPitch  = std::clamp(camPitch - ev.motion.yrel * 0.0025f, -1.5f, 1.5f);
+                } else if (ev.type == SDL_EVENT_MOUSE_WHEEL && walkMode) {
+                    // 方向 J：滚轮缩放第三人称弹簧臂相机距离
+                    camDist = std::clamp(camDist - ev.wheel.y * 0.6f, 0.0f, 12.0f);
                 }
             }
 
@@ -832,7 +853,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             const bool* keys = SDL_GetKeyboardState(nullptr);
             if (walkMode) {
-                // ---- 贴地行走模式：水平移动 + 跳跃 + 重力 + 地面吸附 ----
+                // ---- 第三人称角色移动：水平碰撞 + 跳跃 + 重力 + 地面吸附 (playerPos.z 即脚底高度) ----
                 glm::vec3 fwdFlat(forward.x, forward.y, 0.0f);
                 if (glm::length(fwdFlat) > 1e-4f) fwdFlat = glm::normalize(fwdFlat);
                 glm::vec3 flatRight = glm::normalize(glm::cross(fwdFlat, worldUp));
@@ -846,9 +867,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 if (keys[SDL_SCANCODE_D]) moveDelta += glm::vec2(flatRight.x, flatRight.y) * walkSpeed;
                 if (keys[SDL_SCANCODE_A]) moveDelta -= glm::vec2(flatRight.x, flatRight.y) * walkSpeed;
 
-                const float curFootZ = camPos.z - kEyeHeight;
+                const float curFootZ = playerPos.z;
                 const glm::vec2 resolvedXY = coa::assets::AdtLoader::ResolveHorizontalCollision(
-                    adtTiles, glm::vec2(camPos.x, camPos.y), moveDelta, curFootZ);
+                    adtTiles, glm::vec2(playerPos.x, playerPos.y), moveDelta, curFootZ);
 
                 // 陡坡防穿模保护：贴地状态下前方地面骤升过高 (超过 60 度陡崖) 时保持原地
                 float nextGroundZ = curFootZ;
@@ -858,8 +879,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 if (isGrounded && hasNextGround && (nextGroundZ - curFootZ) > 1.15f) {
                     // 目标点地面过高：拒绝该水平位移
                 } else {
-                    camPos.x = resolvedXY.x;
-                    camPos.y = resolvedXY.y;
+                    playerPos.x = resolvedXY.x;
+                    playerPos.y = resolvedXY.y;
                 }
 
                 if (keys[SDL_SCANCODE_SPACE] && isGrounded) {
@@ -868,11 +889,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 }
 
                 verticalVel -= 22.0f * dt;
-                float footZ   = (camPos.z - kEyeHeight) + verticalVel * dt;
-                float groundZ = camPos.z - kEyeHeight;
+                float footZ   = playerPos.z + verticalVel * dt;
+                float groundZ = playerPos.z;
 
-                if (coa::assets::AdtLoader::SampleGroundHeight(adtTiles, camPos.x, camPos.y,
-                                                              camPos.z - kEyeHeight, groundZ)) {
+                if (coa::assets::AdtLoader::SampleGroundHeight(adtTiles, playerPos.x, playerPos.y,
+                                                              playerPos.z, groundZ)) {
                     if (footZ <= groundZ + 0.08f && verticalVel <= 0.0f) {
                         footZ       = groundZ;
                         verticalVel = 0.0f;
@@ -884,7 +905,31 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     isGrounded = false;
                 }
 
-                camPos.z = footZ + kEyeHeight;
+                playerPos.z = footZ;
+
+                // 角色朝向与骨骼动作状态机：Stand(0) / Walk(1) / Run(2) / Jump(3)
+                if (glm::length(moveDelta) > 1e-4f) {
+                    playerYaw = std::atan2(moveDelta.y, moveDelta.x);
+                }
+                if (!isGrounded) {
+                    playerAnimAction = 3;
+                } else if (glm::length(moveDelta) > 1e-4f) {
+                    playerAnimAction = keys[SDL_SCANCODE_LSHIFT] ? 2 : 1;
+                } else {
+                    playerAnimAction = 0;
+                }
+
+                // 第三人称弹簧臂相机：从头顶枢轴沿视线后退 camDist，并防止镜头穿入地面
+                const glm::vec3 pivotPos = playerPos + glm::vec3(0.0f, 0.0f, kEyeHeight);
+                camPos = pivotPos - forward * camDist;
+                if (camDist > 0.2f) {
+                    float camGroundZ = camPos.z;
+                    if (coa::assets::AdtLoader::SampleGroundHeight(adtTiles, camPos.x, camPos.y,
+                                                                  camPos.z, camGroundZ) &&
+                        camGroundZ + 0.35f > camPos.z) {
+                        camPos.z = camGroundZ + 0.35f;
+                    }
+                }
             } else {
                 // ---- 自由飞行模式：按住 Shift 高速飞行 (120 码/秒)，方便跨越 533x533 码的 ADT 大地图 ----
                 float moveSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 120.0f : 25.0f) * dt;
@@ -1284,6 +1329,78 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.instanceCount = visibleCount;
                     cmd.baseInstance  = firstInstance;
                     cmd.boneBaseIndex = boneBaseIndex;
+                    cmd.isTwoSided    = ((sub.materialFlags & 0x04u) != 0) ? 1 : 0;
+                    cmd.isUnlit       = ((sub.materialFlags & 0x01u) != 0 || pass >= 6) ? 1 : 0;
+                    cmd.uvOffset      = uvOffset;
+                    cmd.batchColor    = batchColor;
+                    cmd.texAlphaMap   = blackAlphaTex.Handle();
+                    renderQueue.push_back(cmd);
+                }
+            }
+
+            // 2.5 第三人称角色实体：独立骨骼姿态，不参与跨 ADT 合批
+            if (walkMode && playerModel && camDist > 0.4f && !playerModel->submeshes.empty()) {
+                const uint32_t playerInstIdx = static_cast<uint32_t>(visibleMatrices.size());
+                const glm::mat4 playerMat =
+                    glm::translate(glm::mat4(1.0f), playerPos) *
+                    glm::rotate(glm::mat4(1.0f), playerYaw, glm::vec3(0.0f, 0.0f, 1.0f));
+                visibleMatrices.push_back(playerMat);
+
+                const uint32_t playerBoneBase =
+                    playerModel->EvaluateBones(animTimeSec, visibleBoneMatrices, playerAnimAction);
+
+                for (const auto& sub : playerModel->submeshes) {
+                    glm::vec4 batchColor(1.0f);
+                    if (sub.colorIndex >= 0 &&
+                        static_cast<size_t>(sub.colorIndex) < playerModel->colorTracks.size()) {
+                        const auto& ct = playerModel->colorTracks[sub.colorIndex];
+                        glm::vec3 rgb = ct.color.SampleLinear(animTimeSec, playerModel->globalSequences,
+                                                              glm::vec3(1.0f));
+                        float     alp = ct.alpha.SampleLinear(animTimeSec, playerModel->globalSequences, 1.0f);
+                        batchColor = glm::vec4(rgb, alp);
+                    }
+                    if (sub.transWeightIndex >= 0 &&
+                        static_cast<size_t>(sub.transWeightIndex) < playerModel->transWeightTracks.size()) {
+                        const auto& tw = playerModel->transWeightTracks[sub.transWeightIndex];
+                        batchColor.a *= tw.SampleLinear(animTimeSec, playerModel->globalSequences, 1.0f);
+                    }
+                    if (batchColor.a < 0.01f) continue;
+
+                    glm::vec2 uvOffset(0.0f);
+                    if (sub.uvTransIndex >= 0 &&
+                        static_cast<size_t>(sub.uvTransIndex) < playerModel->uvTransTracks.size()) {
+                        const auto& ut = playerModel->uvTransTracks[sub.uvTransIndex];
+                        if (ut.HasAnimation()) {
+                            glm::vec3 uv3 = ut.SampleLinear(animTimeSec, playerModel->globalSequences,
+                                                            glm::vec3(0.0f));
+                            uvOffset = glm::vec2(uv3.x, uv3.y);
+                        } else {
+                            uvOffset = glm::vec2(0.0f, -0.75f * animTimeSec);
+                        }
+                    } else if (sub.blendMode == 10) {
+                        uvOffset = glm::vec2(0.0f, -0.75f * animTimeSec);
+                    }
+
+                    uint8_t pass = 2;
+                    if (sub.blendMode == 1)       pass = 3;
+                    else if (sub.blendMode == 2)  pass = 5;
+                    else if (sub.blendMode == 10) pass = 7;
+                    else if (sub.blendMode >= 3)  pass = 6;
+
+                    coa::rhi::DrawCommand cmd{};
+                    cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sub.textureId), 0);
+                    cmd.program       = worldShader.Handle();
+                    cmd.vao           = sharedM2Vao;
+                    cmd.vbo           = playerModel->vbo.Handle();
+                    cmd.ibo           = playerModel->ibo.Handle();
+                    cmd.stride        = sizeof(coa::assets::M2Vertex);
+                    cmd.texAlbedo     = sub.textureId;
+                    cmd.firstIndex    = sub.firstIndex;
+                    cmd.indexCount    = sub.indexCount;
+                    cmd.baseVertex    = 0;
+                    cmd.instanceCount = 1;
+                    cmd.baseInstance  = playerInstIdx;
+                    cmd.boneBaseIndex = playerBoneBase;
                     cmd.isTwoSided    = ((sub.materialFlags & 0x04u) != 0) ? 1 : 0;
                     cmd.isUnlit       = ((sub.materialFlags & 0x01u) != 0 || pass >= 6) ? 1 : 0;
                     cmd.uvOffset      = uvOffset;

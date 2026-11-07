@@ -184,6 +184,10 @@ def parse_adt_dependencies(adt_bytes: bytes) -> list[str]:
     return deps
 # ==================== 4. 批量提取主流程 ====================
 TEST_PATTERNS = [
+    # 方向 J：第三人称角色 / 生物模型及其贴图
+    'creature/arthas/*',
+    'creature/peasant/*',
+    'creature/illidan/*',
     'dbfilesclient/light*.dbc',
     'tileset/*.blp',
     'world/azeroth/elwynn/*',

@@ -10,6 +10,7 @@
 #include <optional>
 #include <array>
 #include <algorithm>
+#include <type_traits>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -235,8 +236,20 @@ struct M2AnimTrack {
     std::vector<uint32_t> times;
     std::vector<T>        values;
 
+    // 方向 J：多动作序列 (0=Stand/animId 0, 1=Walk/animId 4, 2=Run/animId 5, 3=Jump/animId 38 或 37)
+    struct ActionSeq {
+        uint32_t              durationMs = 1000;
+        std::vector<uint32_t> times;
+        std::vector<T>        values;
+    };
+    std::array<ActionSeq, 4> actionSeqs;
+
     [[nodiscard]] bool HasAnimation() const noexcept {
-        return values.size() > 1 && times.size() >= values.size();
+        if (values.size() > 1 && times.size() >= values.size()) return true;
+        for (const auto& seq : actionSeqs) {
+            if (seq.values.size() > 1 && seq.times.size() >= seq.values.size()) return true;
+        }
+        return false;
     }
 
     [[nodiscard]] uint32_t ResolveLoopMs(const std::vector<uint32_t>& globalSeqs) const noexcept {
@@ -291,6 +304,69 @@ struct M2AnimTrack {
             }
         }
         return values.back();
+    }
+
+    // 按指定动作槽位采样标量 / 向量轨；无对应动作数据时回退到默认 Stand 采样
+    [[nodiscard]] T SampleLinearAction(float timeSec, int actionIdx,
+                                       const std::vector<uint32_t>& globalSeqs,
+                                       const T& defVal) const noexcept {
+        if (globalSeq < 0 && actionIdx >= 0 && actionIdx < 4) {
+            const auto& seq = actionSeqs[actionIdx];
+            const size_t n = std::min(seq.times.size(), seq.values.size());
+            if (n > 0) {
+                if (n == 1 || interpType == 0) return seq.values.front();
+
+                const uint32_t loopMs = std::max(seq.durationMs > 0 ? seq.durationMs : seq.times[n - 1], 1u);
+                const uint32_t tMs = static_cast<uint32_t>(
+                    std::fmod(std::max(timeSec, 0.0f) * 1000.0f, static_cast<float>(loopMs)));
+
+                if (tMs <= seq.times.front()) return seq.values.front();
+                if (tMs >= seq.times[n - 1])  return seq.values[n - 1];
+
+                for (size_t i = 0; i + 1 < n; ++i) {
+                    if (tMs >= seq.times[i] && tMs <= seq.times[i + 1]) {
+                        const uint32_t span = seq.times[i + 1] - seq.times[i];
+                        if (span == 0) return seq.values[i];
+                        const float a = static_cast<float>(tMs - seq.times[i]) / static_cast<float>(span);
+                        return glm::mix(seq.values[i], seq.values[i + 1], a);
+                    }
+                }
+                return seq.values.back();
+            }
+        }
+        return SampleLinear(timeSec, globalSeqs, defVal);
+    }
+
+    // 按指定动作槽位采样四元数轨 (球面线性插值)；无对应动作数据时回退到默认 Stand 采样
+    template <typename U = T>
+        requires std::is_same_v<U, glm::quat>
+    [[nodiscard]] glm::quat SampleQuatAction(float timeSec, int actionIdx,
+                                             const std::vector<uint32_t>& globalSeqs) const noexcept {
+        if (globalSeq < 0 && actionIdx >= 0 && actionIdx < 4) {
+            const auto& seq = actionSeqs[actionIdx];
+            const size_t n = std::min(seq.times.size(), seq.values.size());
+            if (n > 0) {
+                if (n == 1 || interpType == 0) return seq.values.front();
+
+                const uint32_t loopMs = std::max(seq.durationMs > 0 ? seq.durationMs : seq.times[n - 1], 1u);
+                const uint32_t tMs = static_cast<uint32_t>(
+                    std::fmod(std::max(timeSec, 0.0f) * 1000.0f, static_cast<float>(loopMs)));
+
+                if (tMs <= seq.times.front()) return seq.values.front();
+                if (tMs >= seq.times[n - 1])  return seq.values[n - 1];
+
+                for (size_t i = 0; i + 1 < n; ++i) {
+                    if (tMs >= seq.times[i] && tMs <= seq.times[i + 1]) {
+                        const uint32_t span = seq.times[i + 1] - seq.times[i];
+                        if (span == 0) return seq.values[i];
+                        const float a = static_cast<float>(tMs - seq.times[i]) / static_cast<float>(span);
+                        return glm::normalize(glm::slerp(seq.values[i], seq.values[i + 1], a));
+                    }
+                }
+                return seq.values.back();
+            }
+        }
+        return SampleQuat(timeSec, globalSeqs);
     }
 };
 
@@ -360,16 +436,17 @@ struct GpuM2Model {
     std::vector<RuntimeM2ParticleEmitter> particleEmitters;
 
     // 评估当前时刻整棵骨骼树的枢轴空间蒙皮矩阵，追加到 visibleBoneMatrices 并返回起始下标
-    uint32_t EvaluateBones(float timeSec, std::vector<glm::mat4>& outBoneBuffer) const {
+    // actionIdx: 0=Stand, 1=Walk, 2=Run, 3=Jump
+    uint32_t EvaluateBones(float timeSec, std::vector<glm::mat4>& outBoneBuffer, int actionIdx = 0) const {
         if (!hasAnimatedBones || bones.empty()) return 0;
         const uint32_t baseIdx = static_cast<uint32_t>(outBoneBuffer.size());
         outBoneBuffer.resize(baseIdx + bones.size(), glm::mat4(1.0f));
 
         for (size_t i = 0; i < bones.size(); ++i) {
             const auto& b = bones[i];
-            glm::vec3 tr = b.translation.SampleLinear(timeSec, globalSequences, glm::vec3(0.0f));
-            glm::quat rq = b.rotation.SampleQuat(timeSec, globalSequences);
-            glm::vec3 sc = b.scale.SampleLinear(timeSec, globalSequences, glm::vec3(1.0f));
+            glm::vec3 tr = b.translation.SampleLinearAction(timeSec, actionIdx, globalSequences, glm::vec3(0.0f));
+            glm::quat rq = b.rotation.SampleQuatAction(timeSec, actionIdx, globalSequences);
+            glm::vec3 sc = b.scale.SampleLinearAction(timeSec, actionIdx, globalSequences, glm::vec3(1.0f));
 
             glm::mat4 localMat = glm::translate(glm::mat4(1.0f), b.pivot + tr);
             localMat *= glm::mat4_cast(rq);
@@ -934,6 +1011,45 @@ private:
         for (size_t k = 0; k < kCount; ++k) {
             out.values.push_back(conv(valPtr[k]));
         }
+
+        // 额外抽取多动作骨骼序列：Stand(animId 0) / Walk(4) / Run(5) / Jump(38 或 37)
+        if (raw.globalSequence < 0 && !sequences.empty()) {
+            auto fillAction = [&](size_t seqIdx, int actionSlot) {
+                if (actionSlot < 0 || actionSlot >= 4 || seqIdx >= outerCount) return;
+
+                const M2Array tsArrA  = tsOuter[seqIdx];
+                const M2Array valArrA = valOuter[seqIdx];
+                const size_t  kCountA = std::min(tsArrA.count, valArrA.count);
+                if (kCountA == 0) return;
+                if (static_cast<size_t>(tsArrA.offset)  + kCountA * sizeof(uint32_t) > m2Bytes.size()) return;
+                if (static_cast<size_t>(valArrA.offset) + kCountA * sizeof(DiskT)    > m2Bytes.size()) return;
+
+                auto& slot = out.actionSeqs[actionSlot];
+                const auto* tsA  = reinterpret_cast<const uint32_t*>(m2Bytes.data() + tsArrA.offset);
+                const auto* valA = reinterpret_cast<const DiskT*>(m2Bytes.data() + valArrA.offset);
+                slot.times.assign(tsA, tsA + kCountA);
+                slot.values.reserve(kCountA);
+                for (size_t k = 0; k < kCountA; ++k) slot.values.push_back(conv(valA[k]));
+                slot.durationMs = (seqIdx < sequences.size() && sequences[seqIdx].duration > 0)
+                                ? sequences[seqIdx].duration
+                                : slot.durationMs;
+            };
+
+            const size_t seqLimit = std::min(outerCount, sequences.size());
+            size_t standSeq = seqLimit, walkSeq = seqLimit, runSeq = seqLimit, jumpSeq = seqLimit;
+            for (size_t s = 0; s < seqLimit; ++s) {
+                const uint16_t aid = sequences[s].animId;
+                if (aid == 0 && standSeq == seqLimit)                       standSeq = s;
+                else if (aid == 4 && walkSeq == seqLimit)                   walkSeq  = s;
+                else if (aid == 5 && runSeq == seqLimit)                    runSeq   = s;
+                else if ((aid == 38 || aid == 37) && jumpSeq == seqLimit)   jumpSeq  = s;
+            }
+            if (standSeq != seqLimit) fillAction(standSeq, 0);
+            if (walkSeq  != seqLimit) fillAction(walkSeq,  1);
+            if (runSeq   != seqLimit) fillAction(runSeq,   2);
+            if (jumpSeq  != seqLimit) fillAction(jumpSeq,  3);
+        }
+
         return out;
     }
 };
