@@ -144,6 +144,7 @@ struct GpuLiquidChunk {
 struct M2Instance {
     glm::mat4 model{1.0f};
     glm::mat4 invModel{1.0f}; // 世界空间 -> M2 局部空间，用于地面射线拾取
+    uint32_t  uniqueId = 0;   // MDDF 全局唯一 ID (由 MODD 派生的家具实例为 0)
     glm::vec3 worldBoundsMin{0.0f};
     glm::vec3 worldBoundsMax{0.0f};
     glm::vec3 worldCenter{0.0f};
@@ -162,6 +163,7 @@ struct WmoGroupCull {
 struct WmoInstance {
     glm::mat4 model{1.0f};
     glm::mat4 invModel{1.0f}; // 世界空间 -> WMO 局部空间的逆变换，用于地板射线检测
+    uint32_t  uniqueId = 0;   // MODF 全局唯一 ID
     glm::vec3 worldBoundsMin{0.0f};
     glm::vec3 worldBoundsMax{0.0f};
     glm::vec3 worldCenter{0.0f};
@@ -235,6 +237,17 @@ public:
             static_cast<int>(std::floor((kMapHalfSize - worldPos.y) / kTileSize)),
             static_cast<int>(std::floor((kMapHalfSize - worldPos.x) / kTileSize))
         );
+    }
+
+    // 相机到指定 ADT 格子水平矩形的最近距离 (格子内为 0)，用于按真实距离决定加载 / 卸载优先级
+    [[nodiscard]] static float DistanceToAdtTile(const glm::vec3& camPos, int tx, int ty) noexcept {
+        const float maxX = kMapHalfSize - static_cast<float>(ty) * kTileSize;
+        const float minX = maxX - kTileSize;
+        const float maxY = kMapHalfSize - static_cast<float>(tx) * kTileSize;
+        const float minY = maxY - kTileSize;
+        const float dx = std::max({ minX - camPos.x, 0.0f, camPos.x - maxX });
+        const float dy = std::max({ minY - camPos.y, 0.0f, camPos.y - maxY });
+        return std::sqrt(dx * dx + dy * dy);
     }
 
     [[nodiscard]] static constexpr uint32_t FourCC(const char (&tag)[5]) noexcept {
@@ -349,7 +362,12 @@ public:
         tile.suggestedCamPos = midVert.pos + glm::vec3(0.0f, 0.0f, 25.0f);
 
         // 3. 按 M2 路径分组解析 MDDF 装饰物实例，合并为 Instanced Draw Batches
-        std::unordered_map<std::string, std::vector<glm::mat4>> doodadGroups;
+        // 每个摆放同时携带 uniqueId，供实例化后保留归属信息
+        struct DoodadPlacement {
+            glm::mat4 mat{1.0f};
+            uint32_t  uniqueId = 0;
+        };
+        std::unordered_map<std::string, std::vector<DoodadPlacement>> doodadGroups;
         for (const auto& entry : mddfEntries) {
             if (entry.mmidIndex >= mmidOffsets.size()) continue;
             uint32_t strOffset = mmidOffsets[entry.mmidIndex];
@@ -361,10 +379,8 @@ public:
                 m2Path.replace(m2Path.size() - 4, 4, ".m2");
             }
 
-            if (!seenUniqueIds.insert(entry.uniqueId).second) {
-                continue;
-            }
-            tile.ownedUniqueIds.push_back(entry.uniqueId);
+            // 每块 ADT 完整自包含：不再用 seenUniqueIds 跨块去重跳过，
+            // 否则卸载相邻块时会连带让跨界建筑 (如 stormwind.wmo) 整体消失
 
             // 将 MDDF 左上角编辑器坐标转换为魔兽 Z-Up 世界坐标
             glm::vec3 worldPos(
@@ -382,12 +398,16 @@ public:
             mat = glm::rotate(mat, glm::radians(entry.rot.z),          glm::vec3(1.0f, 0.0f, 0.0f));
             mat = glm::scale(mat, glm::vec3(scale));
 
-            doodadGroups[m2Path].push_back(mat);
+            doodadGroups[m2Path].push_back(DoodadPlacement{mat, entry.uniqueId});
             tile.debugPlacements.push_back({m2Path, worldPos, scale, false});
         }
 
-        // 4. 解析 MODF 大型建筑 (WMO) 并记录每个实例的变换矩阵与 doodadSet
-        struct WmoPlacement { glm::mat4 mat; uint16_t doodadSet; };
+        // 4. 解析 MODF 大型建筑 (WMO) 并记录每个实例的变换矩阵、doodadSet 与唯一 ID
+        struct WmoPlacement {
+            glm::mat4 mat{1.0f};
+            uint16_t  doodadSet = 0;
+            uint32_t  uniqueId  = 0;
+        };
         std::unordered_map<std::string, std::vector<WmoPlacement>> wmoGroups;
         for (const auto& entry : modfEntries) {
             if (entry.mwidIndex >= mwidOffsets.size()) continue;
@@ -395,9 +415,7 @@ public:
             if (strOffset >= mwmoBlob.size()) continue;
 
             std::string wmoPath = vfs::VirtualFileSystem::NormalizeVirtualPath(mwmoBlob.data() + strOffset);
-            if (!seenUniqueIds.insert(entry.uniqueId).second) continue;
-            tile.ownedUniqueIds.push_back(entry.uniqueId);
-
+            // 与 MDDF 一致：不再跨块去重跳过，唯一 ID 仅记录到实例上
             glm::vec3 worldPos(kMapHalfSize - entry.pos.z, kMapHalfSize - entry.pos.x, entry.pos.y);
             glm::mat4 mat(1.0f);
             mat = glm::translate(mat, worldPos);
@@ -405,7 +423,7 @@ public:
             mat = glm::rotate(mat, glm::radians(entry.rot.x),          glm::vec3(0.0f, 1.0f, 0.0f));
             mat = glm::rotate(mat, glm::radians(entry.rot.z),          glm::vec3(1.0f, 0.0f, 0.0f));
 
-            wmoGroups[wmoPath].push_back({mat, entry.doodadSet});
+            wmoGroups[wmoPath].push_back(WmoPlacement{mat, entry.doodadSet, entry.uniqueId});
             tile.debugPlacements.push_back({wmoPath, worldPos, 1.0f, true});
         }
 
@@ -424,6 +442,7 @@ public:
                 WmoInstance inst{};
                 inst.model    = p.mat;
                 inst.invModel = glm::inverse(p.mat);
+                inst.uniqueId = p.uniqueId;
                 TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, p.mat,
                                    inst.worldBoundsMin, inst.worldBoundsMax,
                                    inst.worldCenter, inst.worldRadius);
@@ -446,7 +465,9 @@ public:
                 for (size_t i = ds.startIndex; i < endIdx; ++i) {
                     const auto& d = batch.model->doodads[i];
                     if (!d.m2Path.empty()) {
-                        doodadGroups[d.m2Path].push_back(wmoWorldMat * d.localMatrix);
+                        // WMO 内部 MODD 家具没有独立全局 ID，统一记为 0
+                        doodadGroups[d.m2Path].push_back(
+                            DoodadPlacement{ wmoWorldMat * d.localMatrix, 0u });
                     }
                 }
             };
@@ -460,7 +481,7 @@ public:
         std::printf("[ADT Loader] Loaded %zu WMO building types\n", tile.wmoBatches.size());
 
         // 5. 通过 AssetManager 全局缓存获取或加载 M2 模型，并逐实例预计算世界空间 AABB
-        for (auto& [m2Path, mats] : doodadGroups) {
+        for (auto& [m2Path, placements] : doodadGroups) {
             auto modelPtr = assets.GetOrLoadM2(m2Path, fallbackWhiteTex);
             if (!modelPtr) {
                 continue;
@@ -468,13 +489,14 @@ public:
 
             GpuDoodadBatch batch;
             batch.model = std::move(modelPtr);
-            batch.instances.reserve(mats.size());
+            batch.instances.reserve(placements.size());
 
-            for (const auto& instMat : mats) {
+            for (const auto& placement : placements) {
                 M2Instance inst{};
-                inst.model    = instMat;
-                inst.invModel = glm::inverse(instMat);
-                TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, instMat,
+                inst.model    = placement.mat;
+                inst.invModel = glm::inverse(placement.mat);
+                inst.uniqueId = placement.uniqueId;
+                TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, placement.mat,
                                    inst.worldBoundsMin, inst.worldBoundsMax,
                                    inst.worldCenter, inst.worldRadius);
                 batch.instances.push_back(std::move(inst));
