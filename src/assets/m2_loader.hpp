@@ -655,15 +655,10 @@ public:
         gpuModel.localBoundsMax = localMax;
         gpuModel.globalSequences.assign(globalSeqs.begin(), globalSeqs.end());
 
-        // 碰撞网格：优先使用 MD20 内嵌的 boundingVertices / boundingTriangles (渡口木板 / 桥梁 / 巨石)
+        // 碰撞网格：仅使用 MD20 内嵌的 boundingVertices / boundingTriangles (渡口木板 / 桥梁 / 巨石)。
+        // 不再用实体网格兜底，避免把花草 / 蜡烛 / 书本等无碰撞模型也变成高模碰撞体。
         gpuModel.collisionVerts.assign(m2BoundVerts.begin(), m2BoundVerts.end());
         gpuModel.collisionIndices.assign(m2BoundTris.begin(), m2BoundTris.end());
-        if (gpuModel.collisionVerts.empty() && hasMesh) {
-            // 兜底：直接复用实体网格顶点与全局索引，保证仍可站立
-            gpuModel.collisionVerts.reserve(safeVerts.size());
-            for (const auto& v : safeVerts) gpuModel.collisionVerts.push_back(v.pos);
-            gpuModel.collisionIndices = globalIndices;
-        }
 
         // 解析骨骼、颜色、透明度与 UV 变换关键帧轨道
         gpuModel.bones.reserve(compBones.size());
@@ -912,16 +907,7 @@ public:
                 gpuModel.localBoundsMax = glm::max(gpuModel.localBoundsMax, glm::vec3( 6.0f,  6.0f, 18.0f));
             }
 
-            if (!gpuModel.particleEmitters.empty()) {
-                const auto& e0 = gpuModel.particleEmitters.front();
-                std::printf("[M2] %s -> %zu particle emitters (hasMesh=%d) | rate=%.2f speed=%.2f life=%.2f "
-                            "scaleMid=%.2f alphaMid=%.2f\n",
-                            normPath.c_str(), gpuModel.particleEmitters.size(), hasMesh ? 1 : 0,
-                            e0.emissionRate, e0.speed, e0.lifespan, e0.scaleMid, e0.alphaMid);
-            } else {
-                std::printf("[M2] %s -> 0 active particle emitters (hasMesh=%d)\n",
-                            normPath.c_str(), hasMesh ? 1 : 0);
-            }
+            // 静默加载：避免主线程分步上传 M2 时被 Windows 控制台同步输出阻塞
         }
 
         // particleemitters/ 目录下的模型自身仅含编辑器占位白盒网格：

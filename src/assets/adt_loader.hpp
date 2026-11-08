@@ -237,7 +237,6 @@ public:
         };
         struct DoodadPlacement {
             glm::mat4 mat{ 1.0f };
-            glm::mat4 invMat{ 1.0f };
             uint32_t  uniqueId = 0;
         };
         struct WmoPlacement {
@@ -436,7 +435,7 @@ public:
             mat = glm::scale(mat, glm::vec3(scale));
 
             cpu.doodadGroups[m2Path].push_back(
-                CpuAdtData::DoodadPlacement{mat, glm::inverse(mat), entry.uniqueId});
+                CpuAdtData::DoodadPlacement{mat, entry.uniqueId});
             tile.debugPlacements.push_back({m2Path, worldPos, scale, false});
         }
 
@@ -528,10 +527,11 @@ public:
                 std::vector<uint8_t>().swap(ca.rgba);
 
                 ++c.cursor;
-                if ((c.cursor % 4u) == 0u && (SDL_GetTicksNS() - t0) >= budgetNs) return false;
+                if ((SDL_GetTicksNS() - t0) >= budgetNs) return false;
             }
             c.stage  = 2;
             c.cursor = 0;
+            return false; // Stage 1 已用掉本帧预算，WMO 加载留到下一帧
         }
 
         // ---- Stage 2: 分批加载 WMO 建筑，并展开其 MODD 家具到 M2 待加载队列 ----
@@ -577,7 +577,7 @@ public:
                                 const glm::mat4 world = wmoWorldMat * d.localMatrix;
                                 // WMO 内部 MODD 家具没有独立全局 ID，统一记为 0
                                 c.doodadGroups[d.m2Path].push_back(
-                                    CpuAdtData::DoodadPlacement{ world, glm::inverse(world), 0u });
+                                    CpuAdtData::DoodadPlacement{ world, 0u });
                             }
                         }
                     };
@@ -598,10 +598,10 @@ public:
                 c.m2List.emplace_back(kv.first, std::move(kv.second));
             }
             c.doodadGroups.clear();
-            std::printf("[ADT Loader] Finalized %zu WMO building types\n", c.tile.wmoBatches.size());
 
             c.stage  = 3;
             c.cursor = 0;
+            return false; // 绝不在同一帧穿透到 Stage 3
         }
 
         // ---- Stage 3: 分批加载 M2 装饰物，逐实例预计算世界空间 AABB ----
@@ -618,8 +618,11 @@ public:
                     for (const auto& placement : item.second) {
                         M2Instance inst{};
                         inst.model    = placement.mat;
-                        inst.invModel = placement.invMat;
                         inst.uniqueId = placement.uniqueId;
+                        // 仅带碰撞网格的模型才需要逆矩阵，省去 90% 的 glm::inverse 开销
+                        if (!batch.model->collisionIndices.empty()) {
+                            inst.invModel = glm::inverse(placement.mat);
+                        }
                         TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, placement.mat,
                                            inst.worldBoundsMin, inst.worldBoundsMax,
                                            inst.worldCenter, inst.worldRadius);
@@ -700,6 +703,9 @@ public:
         const glm::vec3 worldRayBottom(worldX, worldY, currentFootZ - 30.0f);
         std::unordered_set<uint32_t> testedWmoIds; // 跨界 WMO 同一 uniqueId 仅检测一次
         for (const auto& tile : tiles) {
+            // 快速剪枝：跳过远离角色的 7 块 ADT，仅检测脚下附近的建筑
+            if (tile.tileX >= 0 &&
+                DistanceToAdtTile(glm::vec3(worldX, worldY, 0.0f), tile.tileX, tile.tileY) > 25.0f) continue;
             for (const auto& wmoBatch : tile.wmoBatches) {
                 if (!wmoBatch.model) continue;
                 for (const auto& inst : wmoBatch.instances) {
@@ -776,6 +782,9 @@ public:
         // 3. M2 装饰物碰撞网格射线检测：渡口木板 / 桥梁 / 巨石 (依赖 MD20 boundingVertices/Triangles)
         std::unordered_set<uint32_t> testedM2Ids; // 跨界 M2 同一 uniqueId 仅检测一次
         for (const auto& tile : tiles) {
+            // 快速剪枝：跳过远离角色的 7 块 ADT，仅检测脚下附近的装饰物
+            if (tile.tileX >= 0 &&
+                DistanceToAdtTile(glm::vec3(worldX, worldY, 0.0f), tile.tileX, tile.tileY) > 25.0f) continue;
             for (const auto& doodadBatch : tile.doodadBatches) {
                 if (!doodadBatch.model) continue;
                 const auto& mdl = *doodadBatch.model;
@@ -954,6 +963,9 @@ public:
             // 1. WMO 建筑：整栋包围盒 + 逐子房间包围盒快速筛除
             std::unordered_set<uint32_t> testedWmoIds;
             for (const auto& tile : tiles) {
+                // 快速剪枝：跳过远离角色的 7 块 ADT，仅检测脚下附近的建筑
+                if (tile.tileX >= 0 &&
+                    DistanceToAdtTile(glm::vec3(origXY.x, origXY.y, 0.0f), tile.tileX, tile.tileY) > 25.0f) continue;
                 for (const auto& wmoBatch : tile.wmoBatches) {
                     if (!wmoBatch.model) continue;
                     for (const auto& inst : wmoBatch.instances) {
@@ -976,6 +988,9 @@ public:
             // 2. M2 装饰物：仅测试带碰撞网格的模型 (木板 / 桥梁 / 巨石)
             std::unordered_set<uint32_t> testedM2Ids;
             for (const auto& tile : tiles) {
+                // 快速剪枝：跳过远离角色的 7 块 ADT，仅检测脚下附近的装饰物
+                if (tile.tileX >= 0 &&
+                    DistanceToAdtTile(glm::vec3(origXY.x, origXY.y, 0.0f), tile.tileX, tile.tileY) > 25.0f) continue;
                 for (const auto& batch : tile.doodadBatches) {
                     if (!batch.model || batch.model->collisionIndices.empty()) continue;
                     for (const auto& inst : batch.instances) {

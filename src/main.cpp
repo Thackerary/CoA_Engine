@@ -706,6 +706,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
             globalM2Buckets.clear();
             std::unordered_map<const coa::assets::GpuM2Model*, size_t> bucketMap;
             std::unordered_set<uint32_t> seenM2Ids; // 跨界 ADT 的同一 uniqueId 仅保留一份
+            // 预分配容量：避免每次重建桶时反复 rehash 造成瞬时卡顿
+            globalM2Buckets.reserve(assets.CachedM2Count() + 16);
+            bucketMap.reserve(assets.CachedM2Count() + 16);
+            seenM2Ids.reserve(16384);
             for (const auto& tile : adtTiles) {
                 for (const auto& batch : tile.doodadBatches) {
                     const auto* modelPtr = batch.model.get();
@@ -984,7 +988,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 // 2. 主线程分步 GPU 上传：每帧最多消耗 2ms，避免贴图解码 / 建缓冲造成掉帧
                 if (pendingAdtCpu.has_value()) {
                     if (coa::assets::AdtLoader::StepFinalizeAdtGpu(
-                            *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 1'200'000ULL)) {
+                            *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 600'000ULL)) {
                         adtTiles.push_back(std::move(pendingAdtCpu->tile));
                         pendingAdtCpu.reset();
                         loadingTx = loadingTy = -1;
