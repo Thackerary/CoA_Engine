@@ -1232,27 +1232,27 @@ int main(int /*argc*/, char* /*argv*/[]) {
             uboData.waterDeep          = glm::vec4(lightState.riverDeep, 1.0f);
 
             // 方向 K：太阳方向阴影正交投影
-            // 光视图固定以世界原点为中心，仅在光空间内平移正交中心并按纹素对齐，
-            // 彻底消除相机移动/转向时阴影随位置变形与逐帧抖动，同时收紧到 42 码半径提升精度
+            // 先在光空间内对锚点做纹素级吸附（消除相机移动时的阴影抖动），
+            // 再把正交中心固定在吸附后的锚点、眼睛沿光轴后退 180 码，
+            // 使 near/far 稳定覆盖 ±45 码半径内的所有投射物，避免深度越界导致整片阴影丢失
             {
                 glm::vec3 sunDir = glm::normalize(glm::vec3(
                     lightState.sunDir.x, lightState.sunDir.y, std::max(lightState.sunDir.z, 0.28f)));
 
-                const float kShadowRad = 42.0f;
+                const float kShadowRad = 45.0f;
                 const float texelSize  = (kShadowRad * 2.0f) / 2048.0f;
 
-                const glm::vec3 anchor = walkMode ? playerPos : camPos;
+                const glm::vec3 anchor   = walkMode ? playerPos : camPos;
+                const glm::mat4 lightRot = glm::lookAt(sunDir, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+                glm::vec3 lv = glm::vec3(lightRot * glm::vec4(anchor, 1.0f));
+                lv.x = std::floor(lv.x / texelSize) * texelSize;
+                lv.y = std::floor(lv.y / texelSize) * texelSize;
+                const glm::vec3 snappedAnchor = glm::vec3(glm::transpose(glm::mat3(lightRot)) * lv);
+
                 const glm::mat4 lightView =
-                    glm::lookAt(sunDir * 160.0f, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-
-                glm::vec4 lvCenter = lightView * glm::vec4(anchor, 1.0f);
-                lvCenter.x = std::floor(lvCenter.x / texelSize) * texelSize;
-                lvCenter.y = std::floor(lvCenter.y / texelSize) * texelSize;
-
-                const glm::mat4 lightProj = glm::orthoRH_ZO(
-                    lvCenter.x - kShadowRad, lvCenter.x + kShadowRad,
-                    lvCenter.y - kShadowRad, lvCenter.y + kShadowRad,
-                    -150.0f, 320.0f);
+                    glm::lookAt(snappedAnchor + sunDir * 180.0f, snappedAnchor, glm::vec3(0.0f, 0.0f, 1.0f));
+                const glm::mat4 lightProj =
+                    glm::orthoRH_ZO(-kShadowRad, kShadowRad, -kShadowRad, kShadowRad, 10.0f, 360.0f);
                 uboData.lightViewProj = lightProj * lightView;
             }
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
@@ -1635,7 +1635,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         if (glm::distance(inst.worldCenter, camPos) > 2500.0f + inst.worldRadius) {
                             continue;
                         }
-                        if (!camFrustum.IntersectsAABB(inst.worldBoundsMin, inst.worldBoundsMax)) {
+                        // 近距建筑即使完全位于镜头背后（视锥外）也放行，交由 3.2 的距离判断
+                        // 决定是否进入阴影队列，避免玩家背对建筑时阴影突然消失
+                        const bool wmoNearShadow =
+                            (glm::distance(inst.worldCenter, camPos) <= 85.0f + inst.worldRadius);
+                        if (!wmoNearShadow &&
+                            !camFrustum.IntersectsAABB(inst.worldBoundsMin, inst.worldBoundsMax)) {
                             continue;
                         }
                         if (inst.groupBounds.size() != model.groups.size()) continue;
