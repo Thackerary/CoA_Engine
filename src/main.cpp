@@ -277,7 +277,7 @@ layout(binding = 1) uniform sampler2D uTexLayer1;   // 地形 Layer 1
 layout(binding = 2) uniform sampler2D uTexLayer2;   // 地形 Layer 2
 layout(binding = 3) uniform sampler2D uTexLayer3;   // 地形 Layer 3
 layout(binding = 4) uniform sampler2D uTexAlphaMap; // 64x64 RGB Alpha 遮罩 (M2 模型绑定全黑纹理，alpha=0)
-layout(binding = 5) uniform sampler2DShadow uShadowMap; // 太阳方向 2048x2048 实时阴影贴图 (硬件比较 + 双线性)
+layout(binding = 5) uniform sampler2DShadow uShadowMap; // 太阳方向 3072x3072 实时阴影贴图 (硬件比较 + 双线性)
 
 layout(location = 0) uniform int  uAlphaCutout;   // 0 = Opaque, 1 = Cutout, 2 = Blend, 3 = UV Scroll
 layout(location = 1) uniform int  uMaterialFlags; // bit 0 = TwoSided, bit 1 = Unlit
@@ -327,12 +327,14 @@ float CalcShadow(vec3 worldPos, float ndotl) {
     float vis = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            vis += texture(uShadowMap, vec3(uv + vec2(dx, dy) / 2048.0, curD - bias));
+            vis += texture(uShadowMap, vec3(uv + vec2(dx, dy) / 3072.0, curD - bias));
         }
     }
     vis /= 9.0;
 
-    float fade = 1.0 - smoothstep(34.0, 41.0, length(worldPos.xy - uCameraPos.xy));
+    // 35~50 码淡出：阴影盒半径 80 码，因此 50~80 码是 30 码宽的零透明度缓冲带，
+    // 新进入阴影盒的大树/建筑影子总能在缓冲带内从 0% 平滑渐显，杜绝边界处突然蹦出
+    float fade = 1.0 - smoothstep(35.0, 50.0, length(worldPos.xy - uCameraPos.xy));
     return mix(1.0, vis, fade * 0.75);
 }
 
@@ -767,11 +769,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
         GLuint skyVao      = 0;
         glCreateVertexArrays(1, &skyVao);
 
-        // ---- 太阳方向 2048x2048 实时阴影贴图 (仅深度) ----
+        // ---- 太阳方向 3072x3072 实时阴影贴图 (仅深度) ----
         GLuint shadowTex = 0;
         GLuint shadowFbo = 0;
         glCreateTextures(GL_TEXTURE_2D, 1, &shadowTex);
-        glTextureStorage2D(shadowTex, 1, GL_DEPTH_COMPONENT24, 2048, 2048);
+        glTextureStorage2D(shadowTex, 1, GL_DEPTH_COMPONENT24, 3072, 3072);
         glTextureParameteri(shadowTex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTextureParameteri(shadowTex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
@@ -1234,13 +1236,15 @@ int main(int /*argc*/, char* /*argv*/[]) {
             // 方向 K：太阳方向阴影正交投影
             // 先在光空间内对锚点做纹素级吸附（消除相机移动时的阴影抖动），
             // 再把正交中心固定在吸附后的锚点、眼睛沿光轴后退 180 码，
-            // 使 near/far 稳定覆盖 ±45 码半径内的所有投射物，避免深度越界导致整片阴影丢失
+            // 使 near/far 稳定覆盖 ±80 码半径内的所有投射物，避免深度越界导致整片阴影丢失。
+            // 半径 80 码 + 3072 分辨率：与 45 码 + 1728 纹素密度完全一致 (2*80/3072 = 2*45/1728)，
+            // 在满足 R_caster(80) >= R_fade_end(50) + L_shadow(30) 的同时不降低精度
             {
                 glm::vec3 sunDir = glm::normalize(glm::vec3(
                     lightState.sunDir.x, lightState.sunDir.y, std::max(lightState.sunDir.z, 0.28f)));
 
-                const float kShadowRad = 45.0f;
-                const float texelSize  = (kShadowRad * 2.0f) / 2048.0f;
+                const float kShadowRad = 80.0f;
+                const float texelSize  = (kShadowRad * 2.0f) / 3072.0f;
 
                 const glm::vec3 anchor   = walkMode ? playerPos : camPos;
                 const glm::mat4 lightRot = glm::lookAt(sunDir, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
@@ -1252,7 +1256,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 const glm::mat4 lightView =
                     glm::lookAt(snappedAnchor + sunDir * 180.0f, snappedAnchor, glm::vec3(0.0f, 0.0f, 1.0f));
                 const glm::mat4 lightProj =
-                    glm::orthoRH_ZO(-kShadowRad, kShadowRad, -kShadowRad, kShadowRad, 10.0f, 360.0f);
+                    glm::orthoRH_ZO(-kShadowRad, kShadowRad, -kShadowRad, kShadowRad, 10.0f, 420.0f);
                 uboData.lightViewProj = lightProj * lightView;
             }
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
@@ -1324,18 +1328,27 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 const auto& model = *bucket.model;
                 uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
                 uint32_t visibleCount  = 0;
-                float    minDistSq     = 1e30f; // 该桶可见实例到相机的最近距离平方
+                float    minDistSq     = 1e30f; // 该桶可见实例到相机的最近中心距离平方
+                float    minEdgeDist   = 1e30f; // 该桶可见实例到相机的最近表面距离 (已扣除包围球半径)
 
+                // 表面距离判定 + 保留镜头背后的近处大树：
+                // 80 码阴影盒内、半径 >= 1.2 码的投射物即使完全位于视锥外也参与阴影，
+                // 避免玩家转身或前进时背后/身侧的树影突兀消失
                 for (const auto* instPtr : bucket.instances) {
                     const auto& inst = *instPtr;
-                    if (!IsInstanceVisible(camFrustum, camPos, inst.worldBoundsMin, inst.worldBoundsMax,
-                                           inst.worldCenter, inst.worldRadius)) {
+                    const float centerDist = glm::distance(inst.worldCenter, camPos);
+                    const float edgeDist   = std::max(0.0f, centerDist - inst.worldRadius);
+                    const bool  inView     = IsInstanceVisible(camFrustum, camPos,
+                                                               inst.worldBoundsMin, inst.worldBoundsMax,
+                                                               inst.worldCenter, inst.worldRadius);
+                    const bool  inShadow   = (inst.worldRadius >= 1.2f && edgeDist <= 80.0f);
+                    if (!inView && !inShadow) {
                         continue;
                     }
                     visibleMatrices.push_back(inst.model);
                     ++visibleCount;
-                    const glm::vec3 d = inst.worldCenter - camPos;
-                    minDistSq = std::min(minDistSq, glm::dot(d, d));
+                    minDistSq   = std::min(minDistSq, centerDist * centerDist);
+                    minEdgeDist = std::min(minEdgeDist, edgeDist);
                 }
                 if (visibleCount == 0) continue;
                 visibleM2Instances += static_cast<int>(visibleCount);
@@ -1537,8 +1550,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.batchColor    = batchColor;
                     cmd.texAlphaMap   = blackAlphaTex.Handle();
                     renderQueue.push_back(cmd);
-                    // 阴影投射：仅阴影半径 (48 码) 内的近处实例，且仅不透明/Cutout 通道
-                    if (pass <= 3 && minDistSq <= 48.0f * 48.0f) {
+                    // 阴影投射：表面距离 (已扣除包围球半径) 落入 80 码阴影盒、且仅不透明/Cutout 通道
+                    if (pass <= 3 && minEdgeDist <= 80.0f) {
                         shadowQueue.push_back(cmd);
                     }
                 }
@@ -1638,7 +1651,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         // 近距建筑即使完全位于镜头背后（视锥外）也放行，交由 3.2 的距离判断
                         // 决定是否进入阴影队列，避免玩家背对建筑时阴影突然消失
                         const bool wmoNearShadow =
-                            (glm::distance(inst.worldCenter, camPos) <= 85.0f + inst.worldRadius);
+                            (glm::distance(inst.worldCenter, camPos) <= 90.0f + inst.worldRadius);
                         if (!wmoNearShadow &&
                             !camFrustum.IntersectsAABB(inst.worldBoundsMin, inst.worldBoundsMax)) {
                             continue;
@@ -1654,7 +1667,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
                             const bool  inView       = camFrustum.IntersectsAABB(gc.worldBoundsMin, gc.worldBoundsMax);
                             const float grpDist      = glm::distance(gc.worldCenter, camPos);
-                            const bool  inShadowRange = (grpDist <= 75.0f + gc.worldRadius);
+                            const bool  inShadowRange = (grpDist <= 85.0f + gc.worldRadius);
                             if (!inView && !inShadowRange) continue;
 
                             auto ensureBaseInstance = [&]() -> uint32_t {
@@ -1754,7 +1767,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             // ---- 方向 K：太阳方向阴影贴图 Pass (仅 Pass 2/3，先构建深度再恢复反向 Z 主渲染) ----
             glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
-            glViewport(0, 0, 2048, 2048);
+            glViewport(0, 0, 3072, 3072);
             glDepthFunc(GL_LESS);
             glClearDepth(1.0);
             glClear(GL_DEPTH_BUFFER_BIT);
