@@ -348,4 +348,60 @@ inline void SubmitDrawCommands(std::vector<DrawCommand>& cmds) {
     glDisable(GL_BLEND);
 }
 
+// ==================== 5. 阴影贴图专用绘制提交 (仅深度 Pass 2/3) ====================
+inline void SubmitShadowCommands(const std::vector<DrawCommand>& cmds, GLuint shadowProg) {
+    glUseProgram(shadowProg);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_CULL_FACE);
+
+    // 斜率深度偏移：抑制斜射光照下的阴影痤疮
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.5f, 3.0f);
+
+    GLuint lastVao = 0, lastVbo = 0, lastIbo = 0, lastTex0 = 0;
+
+    for (const auto& c : cmds) {
+        const uint8_t pass = static_cast<uint8_t>(c.sortKey >> 60);
+        // 仅渲染不透明与 Alpha Cutout，跳过水体与半透明特效
+        if (pass != 2 && pass != 3) continue;
+
+        glUniform1i(0, (pass == 3) ? 1 : 0);               // 树叶 Alpha Cutout
+        glUniform1i(2, static_cast<int>(c.boneBaseIndex)); // 骨骼动画阴影
+
+        if (c.vao != lastVao) {
+            glBindVertexArray(c.vao);
+            lastVao = c.vao;
+            lastVbo = 0;
+            lastIbo = 0;
+        }
+        if (c.vbo != lastVbo) {
+            glVertexArrayVertexBuffer(c.vao, 0, c.vbo, 0, c.stride);
+            lastVbo = c.vbo;
+        }
+        if (c.ibo != lastIbo) {
+            glVertexArrayElementBuffer(c.vao, c.ibo);
+            lastIbo = c.ibo;
+        }
+        if (pass == 3 && c.texAlbedo != lastTex0) {
+            glBindTextureUnit(0, c.texAlbedo);
+            lastTex0 = c.texAlbedo;
+        }
+
+        const void* indexOffsetPtr =
+            reinterpret_cast<const void*>(static_cast<uintptr_t>(c.firstIndex) * sizeof(uint16_t));
+        glDrawElementsInstancedBaseVertexBaseInstance(
+            GL_TRIANGLES,
+            static_cast<GLsizei>(c.indexCount),
+            GL_UNSIGNED_SHORT,
+            indexOffsetPtr,
+            static_cast<GLsizei>(c.instanceCount),
+            c.baseVertex,
+            c.baseInstance
+        );
+    }
+
+    glDisable(GL_POLYGON_OFFSET_FILL);
+}
+
 } // namespace coa::rhi

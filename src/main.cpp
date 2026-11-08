@@ -48,6 +48,7 @@ struct alignas(16) FrameUniforms {
     glm::vec4 skyHorizon;         // rgb = 地平线色
     glm::vec4 waterShallow;       // rgb = 动态浅水色
     glm::vec4 waterDeep;          // rgb = 动态深水色
+    glm::mat4 lightViewProj;      // 太阳方向阴影正交光视图投影矩阵
 };
 
 // 单个公告板粒子的 GPU 实例数据 (48 字节，std430 紧凑排布，对应 kParticleVertShader)
@@ -155,6 +156,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSkyHorizon;
     vec4 uWaterShallow;
     vec4 uWaterDeep;
+    mat4 uLightViewProj;
 };
 
 out vec4 FragColor;
@@ -223,6 +225,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSkyHorizon;
     vec4 uWaterShallow;
     vec4 uWaterDeep;
+    mat4 uLightViewProj;
 };
 
 layout(std430, binding = 0) readonly buffer InstanceBuffer {
@@ -274,6 +277,7 @@ layout(binding = 1) uniform sampler2D uTexLayer1;   // 地形 Layer 1
 layout(binding = 2) uniform sampler2D uTexLayer2;   // 地形 Layer 2
 layout(binding = 3) uniform sampler2D uTexLayer3;   // 地形 Layer 3
 layout(binding = 4) uniform sampler2D uTexAlphaMap; // 64x64 RGB Alpha 遮罩 (M2 模型绑定全黑纹理，alpha=0)
+layout(binding = 5) uniform sampler2D uShadowMap;   // 太阳方向 2048x2048 实时阴影贴图
 
 layout(location = 0) uniform int  uAlphaCutout;   // 0 = Opaque, 1 = Cutout, 2 = Blend, 3 = UV Scroll
 layout(location = 1) uniform int  uMaterialFlags; // bit 0 = TwoSided, bit 1 = Unlit
@@ -295,6 +299,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSkyHorizon;
     vec4 uWaterShallow;
     vec4 uWaterDeep;
+    mat4 uLightViewProj;
 };
 
 out vec4 FragColor;
@@ -306,6 +311,28 @@ vec3 HeightBlend(vec3 baseCol, vec3 overCol, float alpha) {
     float hOver = GetLuma(overCol);
     float w = clamp((alpha * 1.4 - 0.2) + (hOver - hBase) * 0.35, 0.0, 1.0);
     return mix(baseCol, overCol, smoothstep(0.0, 1.0, w));
+}
+
+// 3x3 PCF 软阴影：光空间 2048x2048 深度比对 + 越界坐标安全回退
+float CalcShadow(vec3 worldPos, float ndotl) {
+    vec4 lc    = uLightViewProj * vec4(worldPos, 1.0);
+    vec2 uv    = lc.xy * 0.5 + 0.5;
+    float curD = lc.z;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || curD <= 0.0 || curD >= 1.0) {
+        return 1.0;
+    }
+
+    float bias  = max(0.0025 * (1.0 - ndotl), 0.0006);
+    float shade = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float sampleD = texture(uShadowMap, uv + vec2(dx, dy) / 2048.0).r;
+            shade += (curD - bias > sampleD) ? 1.0 : 0.0;
+        }
+    }
+    float vis  = 1.0 - shade / 9.0;
+    float fade = 1.0 - smoothstep(80.0, 92.0, length(worldPos.xy - uCameraPos.xy));
+    return mix(1.0, vis, fade * 0.78);
 }
 
 void main() {
@@ -355,8 +382,11 @@ void main() {
         vec3 groundAmbient = uAmbientGround.rgb;
         vec3 ambient = mix(groundAmbient, skyAmbient, N.z * 0.5 + 0.5);
 
+        float shadowFactor = CalcShadow(vWorldPos, ndotl);
+
         vec3 sunColor = uSunColor.rgb * uSunDirAndIntensity.w;
-        litColor = (texColor.rgb * uBatchColor.rgb) * (ambient + sunColor * halfLambert) + sunColor * spec;
+        litColor = (texColor.rgb * uBatchColor.rgb) * (ambient + sunColor * halfLambert * shadowFactor)
+                 + sunColor * spec * shadowFactor;
     }
 
     float dist = length(vWorldPos - uCameraPos.xyz);
@@ -391,6 +421,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSkyHorizon;
     vec4 uWaterShallow;
     vec4 uWaterDeep;
+    mat4 uLightViewProj;
 };
 
 layout(std430, binding = 0) readonly buffer InstanceBuffer {
@@ -434,6 +465,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSkyHorizon;
     vec4 uWaterShallow;
     vec4 uWaterDeep;
+    mat4 uLightViewProj;
 };
 
 out vec4 FragColor;
@@ -528,6 +560,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSkyHorizon;
     vec4 uWaterShallow;
     vec4 uWaterDeep;
+    mat4 uLightViewProj;
 };
 
 out vec2 vUV;
@@ -588,6 +621,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uSkyHorizon;
     vec4 uWaterShallow;
     vec4 uWaterDeep;
+    mat4 uLightViewProj;
 };
 
 out vec4 FragColor;
@@ -611,6 +645,82 @@ void main() {
     vec3 litRgb = (uAdditive != 0) ? (c.rgb * fogFactor)
                                    : mix(uFogColorAndParams.rgb, c.rgb, fogFactor);
     FragColor = vec4(litRgb, c.a);
+}
+)GLSL";
+
+// 阴影深度顶点着色器：复用世界顶点布局 + 骨骼蒙皮 + 硬件实例化，仅输出光空间深度
+constexpr std::string_view kShadowVertShader = R"GLSL(
+#version 460 core
+layout(location = 0) in vec3  aPos;
+layout(location = 1) in vec3  aNormal;
+layout(location = 2) in vec2  aUV;
+layout(location = 3) in vec4  aBoneWeights;
+layout(location = 4) in uvec4 aBoneIndices;
+
+layout(location = 2) uniform int uBoneBaseIndex;
+
+layout(std140, binding = 0) uniform FrameBlock {
+    mat4 uView;
+    mat4 uProj;
+    mat4 uViewProj;
+    vec4 uCameraPos;
+    vec4 uSunDirAndIntensity;
+    vec4 uSunColor;
+    vec4 uAmbientSky;
+    vec4 uAmbientGround;
+    vec4 uFogColorAndParams;
+    vec4 uSkyTopAndDensity;
+    vec4 uSkyMid;
+    vec4 uSkyBand1;
+    vec4 uSkyHorizon;
+    vec4 uWaterShallow;
+    vec4 uWaterDeep;
+    mat4 uLightViewProj;
+};
+
+layout(std430, binding = 0) readonly buffer InstanceBuffer {
+    mat4 uInstanceMatrices[];
+};
+
+layout(std430, binding = 1) readonly buffer BoneBuffer {
+    mat4 uBoneMatrices[];
+};
+
+out vec2 vUV;
+
+void main() {
+    vec3 localPos = aPos;
+
+    if (uBoneBaseIndex > 0) {
+        float wSum = aBoneWeights.x + aBoneWeights.y + aBoneWeights.z + aBoneWeights.w;
+        if (wSum > 0.001) {
+            mat4 skinMat = (aBoneWeights.x * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.x)]
+                          + aBoneWeights.y * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.y)]
+                          + aBoneWeights.z * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.z)]
+                          + aBoneWeights.w * uBoneMatrices[uBoneBaseIndex + int(aBoneIndices.w)]) / wSum;
+            localPos = (skinMat * vec4(aPos, 1.0)).xyz;
+        }
+    }
+
+    mat4 modelMat = uInstanceMatrices[gl_BaseInstance + gl_InstanceID];
+    vec4 worldPos = modelMat * vec4(localPos, 1.0);
+    gl_Position   = uLightViewProj * worldPos;
+    vUV           = aUV;
+}
+)GLSL";
+
+// 阴影深度片段着色器：树叶 Alpha Cutout 镂空阴影，无颜色输出
+constexpr std::string_view kShadowFragShader = R"GLSL(
+#version 460 core
+in vec2 vUV;
+
+layout(binding = 0) uniform sampler2D uTexAlbedo;
+layout(location = 0) uniform int uAlphaCutout;
+
+void main() {
+    if (uAlphaCutout == 1 && texture(uTexAlbedo, vUV).a < 0.5) {
+        discard;
+    }
 }
 )GLSL";
 
@@ -650,10 +760,28 @@ int main(int /*argc*/, char* /*argv*/[]) {
         coa::rhi::GlShaderProgram waterShader(kWaterVertShader, kWaterFragShader);
         coa::rhi::GlShaderProgram skyShader(kSkyVertShader, kSkyFragShader);
         coa::rhi::GlShaderProgram particleShader(kParticleVertShader, kParticleFragShader);
+        coa::rhi::GlShaderProgram shadowShader(kShadowVertShader, kShadowFragShader);
         GLuint sharedM2Vao = coa::assets::GpuM2Model::CreateSharedVAO();
         GLuint terrainVao  = coa::assets::GpuAdtTile::CreateTerrainVAO();
         GLuint skyVao      = 0;
         glCreateVertexArrays(1, &skyVao);
+
+        // ---- 太阳方向 2048x2048 实时阴影贴图 (仅深度) ----
+        GLuint shadowTex = 0;
+        GLuint shadowFbo = 0;
+        glCreateTextures(GL_TEXTURE_2D, 1, &shadowTex);
+        glTextureStorage2D(shadowTex, 1, GL_DEPTH_COMPONENT24, 2048, 2048);
+        glTextureParameteri(shadowTex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTextureParameteri(shadowTex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+        glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        const float shadowBorder[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        glTextureParameterfv(shadowTex, GL_TEXTURE_BORDER_COLOR, shadowBorder);
+
+        glCreateFramebuffers(1, &shadowFbo);
+        glNamedFramebufferTexture(shadowFbo, GL_DEPTH_ATTACHMENT, shadowTex, 0);
+        glNamedFramebufferDrawBuffer(shadowFbo, GL_NONE);
+        glNamedFramebufferReadBuffer(shadowFbo, GL_NONE);
 
         // 每帧动态上传可见实例矩阵的 SSBO (binding = 0) 与 M2 骨骼蒙皮矩阵的 SSBO (binding = 1)
         coa::rhi::GlBuffer instanceSsbo(sizeof(glm::mat4), nullptr, GL_DYNAMIC_STORAGE_BIT);
@@ -1096,6 +1224,16 @@ int main(int /*argc*/, char* /*argv*/[]) {
             uboData.skyHorizon         = glm::vec4(lightState.skyHorizon, 1.0f);
             uboData.waterShallow       = glm::vec4(lightState.riverShallow, 1.0f);
             uboData.waterDeep          = glm::vec4(lightState.riverDeep, 1.0f);
+
+            // 方向 K：太阳方向阴影正交投影 (中心跟随角色/相机，半宽 95 码，Z 轴使用 [near..far] 前端投影)
+            {
+                glm::vec3 sunDir = glm::normalize(glm::vec3(
+                    lightState.sunDir.x, lightState.sunDir.y, std::max(lightState.sunDir.z, 0.28f)));
+                glm::vec3 center = glm::floor((walkMode ? playerPos : camPos) * 0.5f) * 2.0f;
+                uboData.lightViewProj =
+                    glm::orthoRH_ZO(-95.0f, 95.0f, -95.0f, 95.0f, 10.0f, 380.0f) *
+                    glm::lookAt(center + sunDir * 180.0f, center, glm::vec3(0.0f, 0.0f, 1.0f));
+            }
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
 
             glClearColor(lightState.skyHorizon.r, lightState.skyHorizon.g, lightState.skyHorizon.b, 1.0f);
@@ -1553,6 +1691,19 @@ int main(int /*argc*/, char* /*argv*/[]) {
             }
             boneSsbo.UpdateSubData(0, neededBoneBytes, visibleBoneMatrices.data());
 
+            // ---- 方向 K：太阳方向阴影贴图 Pass (仅 Pass 2/3，先构建深度再恢复反向 Z 主渲染) ----
+            glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
+            glViewport(0, 0, 2048, 2048);
+            glDepthFunc(GL_LESS);
+            glClearDepth(1.0);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            coa::rhi::SubmitShadowCommands(renderQueue, shadowShader.Handle());
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, winW, winH);
+            glDepthFunc(GL_GEQUAL);
+            glClearDepth(0.0);
+            glBindTextureUnit(5, shadowTex);
+
             // 每 0.25 秒更新一次窗口标题，观察视锥裁剪统计
             titleTimer += dt;
             if (titleTimer >= 0.25f) {
@@ -1624,6 +1775,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
         glDeleteVertexArrays(1, &terrainVao);
         glDeleteVertexArrays(1, &sharedM2Vao);
         glDeleteVertexArrays(1, &skyVao);
+        glDeleteFramebuffers(1, &shadowFbo);
+        glDeleteTextures(1, &shadowTex);
     }
 
     SDL_GL_DestroyContext(glCtx);
