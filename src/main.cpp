@@ -984,7 +984,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 // 2. 主线程分步 GPU 上传：每帧最多消耗 2ms，避免贴图解码 / 建缓冲造成掉帧
                 if (pendingAdtCpu.has_value()) {
                     if (coa::assets::AdtLoader::StepFinalizeAdtGpu(
-                            *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 2'000'000ULL)) {
+                            *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 1'200'000ULL)) {
                         adtTiles.push_back(std::move(pendingAdtCpu->tile));
                         pendingAdtCpu.reset();
                         loadingTx = loadingTy = -1;
@@ -1160,6 +1160,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 const auto& model = *bucket.model;
                 uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
                 uint32_t visibleCount  = 0;
+                float    minDistSq     = 1e30f; // 该桶可见实例到相机的最近距离平方
 
                 for (const auto* instPtr : bucket.instances) {
                     const auto& inst = *instPtr;
@@ -1169,12 +1170,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
                     visibleMatrices.push_back(inst.model);
                     ++visibleCount;
+                    const glm::vec3 d = inst.worldCenter - camPos;
+                    minDistSq = std::min(minDistSq, glm::dot(d, d));
                 }
                 if (visibleCount == 0) continue;
                 visibleM2Instances += static_cast<int>(visibleCount);
 
                 // ---- 粒子发射器：为每个可见实例生成确定性公告板粒子 (屋顶炊烟 / 火把火苗) ----
-                if (!model.particleEmitters.empty()) {
+                if (!model.particleEmitters.empty() && minDistSq <= 220.0f * 220.0f) {
                     auto hash01 = [](uint32_t n) {
                         n ^= n >> 16; n *= 2246822519u;
                         n ^= n >> 13; n *= 3266489917u;
@@ -1306,9 +1309,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
                 }
 
-                // 全场景同一种 M2 模型每帧仅评估 1 次骨骼矩阵栈
+                // 全场景同一种 M2 模型每帧仅评估 1 次骨骼矩阵栈 (远处实例无需骨骼姿态)
                 uint32_t boneBaseIndex = 0;
-                if (model.hasAnimatedBones) {
+                if (model.hasAnimatedBones && minDistSq <= 180.0f * 180.0f) {
                     boneBaseIndex = model.EvaluateBones(animTimeSec, visibleBoneMatrices);
                 }
 

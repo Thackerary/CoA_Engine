@@ -497,6 +497,7 @@ public:
 
             c.stage  = 1;
             c.cursor = 0;
+            return false; // Stage 0 已用掉本帧预算，贴图上传留到下一帧
         }
 
         // ---- Stage 1: 分批解码 MCNK 地面贴图与 64x64 Alpha 遮罩 ----
@@ -527,7 +528,7 @@ public:
                 std::vector<uint8_t>().swap(ca.rgba);
 
                 ++c.cursor;
-                if ((c.cursor % 16u) == 0u && (SDL_GetTicksNS() - t0) >= budgetNs) return false;
+                if ((c.cursor % 4u) == 0u && (SDL_GetTicksNS() - t0) >= budgetNs) return false;
             }
             c.stage  = 2;
             c.cursor = 0;
@@ -628,7 +629,7 @@ public:
                 }
 
                 ++c.cursor;
-                if ((c.cursor % 2u) == 0u && (SDL_GetTicksNS() - t0) >= budgetNs) return false;
+                if ((SDL_GetTicksNS() - t0) >= budgetNs) return false;
             }
 
             c.tile.tileX = c.tileX;
@@ -696,16 +697,25 @@ public:
 
         // 2. WMO 建筑地板射线检测：世界竖直向下射线变换到子房间局部空间做 Möller–Trumbore
         const glm::vec3 worldRayOrigin(worldX, worldY, currentFootZ + 1.8f);
+        const glm::vec3 worldRayBottom(worldX, worldY, currentFootZ - 30.0f);
+        std::unordered_set<uint32_t> testedWmoIds; // 跨界 WMO 同一 uniqueId 仅检测一次
         for (const auto& tile : tiles) {
             for (const auto& wmoBatch : tile.wmoBatches) {
                 if (!wmoBatch.model) continue;
                 for (const auto& inst : wmoBatch.instances) {
                     if (worldX < inst.worldBoundsMin.x || worldX > inst.worldBoundsMax.x) continue;
                     if (worldY < inst.worldBoundsMin.y || worldY > inst.worldBoundsMax.y) continue;
+                    if (inst.uniqueId != 0 && !testedWmoIds.insert(inst.uniqueId).second) continue;
                     if (inst.groupBounds.size() != wmoBatch.model->groups.size()) continue;
 
                     const glm::vec3 localOrigin = glm::vec3(inst.invModel * glm::vec4(worldRayOrigin, 1.0f));
                     const glm::vec3 localDir    = glm::vec3(inst.invModel * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));
+
+                    // 竖直射线有效高度区间 [foot-30, foot+1.8] 变换到局部空间，用于三角形级快速剔除
+                    const glm::vec3 localTop = glm::vec3(inst.invModel * glm::vec4(worldRayOrigin, 1.0f));
+                    const glm::vec3 localBot = glm::vec3(inst.invModel * glm::vec4(worldRayBottom, 1.0f));
+                    const glm::vec3 rayMin = glm::min(localTop, localBot) - glm::vec3(0.05f);
+                    const glm::vec3 rayMax = glm::max(localTop, localBot) + glm::vec3(0.05f);
 
                     for (size_t g = 0; g < wmoBatch.model->groups.size(); ++g) {
                         const auto& gc = inst.groupBounds[g];
@@ -726,6 +736,11 @@ public:
                             const glm::vec3& v0 = grp.cpuPositions[i0];
                             const glm::vec3& v1 = grp.cpuPositions[i1];
                             const glm::vec3& v2 = grp.cpuPositions[i2];
+
+                            // 三角形局部 AABB 快速剔除：绝大多数三角形不在射线包围盒内
+                            if (std::max({v0.x, v1.x, v2.x}) < rayMin.x || std::min({v0.x, v1.x, v2.x}) > rayMax.x ||
+                                std::max({v0.y, v1.y, v2.y}) < rayMin.y || std::min({v0.y, v1.y, v2.y}) > rayMax.y ||
+                                std::max({v0.z, v1.z, v2.z}) < rayMin.z || std::min({v0.z, v1.z, v2.z}) > rayMax.z) continue;
 
                             const glm::vec3 e1   = v1 - v0;
                             const glm::vec3 e2   = v2 - v0;
@@ -759,6 +774,7 @@ public:
         }
 
         // 3. M2 装饰物碰撞网格射线检测：渡口木板 / 桥梁 / 巨石 (依赖 MD20 boundingVertices/Triangles)
+        std::unordered_set<uint32_t> testedM2Ids; // 跨界 M2 同一 uniqueId 仅检测一次
         for (const auto& tile : tiles) {
             for (const auto& doodadBatch : tile.doodadBatches) {
                 if (!doodadBatch.model) continue;
@@ -768,9 +784,16 @@ public:
                 for (const auto& inst : doodadBatch.instances) {
                     if (worldX < inst.worldBoundsMin.x || worldX > inst.worldBoundsMax.x) continue;
                     if (worldY < inst.worldBoundsMin.y || worldY > inst.worldBoundsMax.y) continue;
+                    if (inst.uniqueId != 0 && !testedM2Ids.insert(inst.uniqueId).second) continue;
 
                     const glm::vec3 localOrigin = glm::vec3(inst.invModel * glm::vec4(worldRayOrigin, 1.0f));
                     const glm::vec3 localDir    = glm::vec3(inst.invModel * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));
+
+                    // 竖直射线有效高度区间 [foot-30, foot+1.8] 变换到局部空间，用于三角形级快速剔除
+                    const glm::vec3 localTop = glm::vec3(inst.invModel * glm::vec4(worldRayOrigin, 1.0f));
+                    const glm::vec3 localBot = glm::vec3(inst.invModel * glm::vec4(worldRayBottom, 1.0f));
+                    const glm::vec3 rayMin = glm::min(localTop, localBot) - glm::vec3(0.05f);
+                    const glm::vec3 rayMax = glm::max(localTop, localBot) + glm::vec3(0.05f);
 
                     for (size_t i = 0; i + 2 < mdl.collisionIndices.size(); i += 3) {
                         const uint16_t i0 = mdl.collisionIndices[i + 0];
@@ -783,6 +806,11 @@ public:
                         const glm::vec3& v0 = mdl.collisionVerts[i0];
                         const glm::vec3& v1 = mdl.collisionVerts[i1];
                         const glm::vec3& v2 = mdl.collisionVerts[i2];
+
+                        // 三角形局部 AABB 快速剔除：绝大多数三角形不在射线包围盒内
+                        if (std::max({v0.x, v1.x, v2.x}) < rayMin.x || std::min({v0.x, v1.x, v2.x}) > rayMax.x ||
+                            std::max({v0.y, v1.y, v2.y}) < rayMin.y || std::min({v0.y, v1.y, v2.y}) > rayMax.y ||
+                            std::max({v0.z, v1.z, v2.z}) < rayMin.z || std::min({v0.z, v1.z, v2.z}) > rayMax.z) continue;
 
                         const glm::vec3 e1   = v1 - v0;
                         const glm::vec3 e2   = v2 - v0;
@@ -862,6 +890,11 @@ public:
                     const glm::vec3 localOrigin = glm::vec3(invModel * glm::vec4(worldOrigin, 1.0f));
                     const glm::vec3 localDir    = glm::vec3(invModel * glm::vec4(worldDir, 0.0f));
 
+                    // 水平射线段在局部空间的 AABB，用于三角形级快速剔除
+                    const glm::vec3 localEnd = localOrigin + localDir * maxDist;
+                    const glm::vec3 rayMin   = glm::min(localOrigin, localEnd) - glm::vec3(0.05f);
+                    const glm::vec3 rayMax   = glm::max(localOrigin, localEnd) + glm::vec3(0.05f);
+
                     for (size_t i = 0; i + 2 < indices.size(); i += 3) {
                         const uint16_t i0 = indices[i + 0];
                         const uint16_t i1 = indices[i + 1];
@@ -871,6 +904,10 @@ public:
                         const glm::vec3& v0 = verts[i0];
                         const glm::vec3& v1 = verts[i1];
                         const glm::vec3& v2 = verts[i2];
+
+                        if (std::max({v0.x, v1.x, v2.x}) < rayMin.x || std::min({v0.x, v1.x, v2.x}) > rayMax.x ||
+                            std::max({v0.y, v1.y, v2.y}) < rayMin.y || std::min({v0.y, v1.y, v2.y}) > rayMax.y ||
+                            std::max({v0.z, v1.z, v2.z}) < rayMin.z || std::min({v0.z, v1.z, v2.z}) > rayMax.z) continue;
 
                         const glm::vec3 e1   = v1 - v0;
                         const glm::vec3 e2   = v2 - v0;
@@ -915,11 +952,13 @@ public:
             };
 
             // 1. WMO 建筑：整栋包围盒 + 逐子房间包围盒快速筛除
+            std::unordered_set<uint32_t> testedWmoIds;
             for (const auto& tile : tiles) {
                 for (const auto& wmoBatch : tile.wmoBatches) {
                     if (!wmoBatch.model) continue;
                     for (const auto& inst : wmoBatch.instances) {
                         if (!boxNear(inst.worldBoundsMin, inst.worldBoundsMax)) continue;
+                        if (inst.uniqueId != 0 && !testedWmoIds.insert(inst.uniqueId).second) continue;
                         const bool hasGroups =
                             (inst.groupBounds.size() == wmoBatch.model->groups.size());
                         for (size_t g = 0; g < wmoBatch.model->groups.size(); ++g) {
@@ -935,11 +974,13 @@ public:
             }
 
             // 2. M2 装饰物：仅测试带碰撞网格的模型 (木板 / 桥梁 / 巨石)
+            std::unordered_set<uint32_t> testedM2Ids;
             for (const auto& tile : tiles) {
                 for (const auto& batch : tile.doodadBatches) {
                     if (!batch.model || batch.model->collisionIndices.empty()) continue;
                     for (const auto& inst : batch.instances) {
                         if (!boxNear(inst.worldBoundsMin, inst.worldBoundsMax)) continue;
+                        if (inst.uniqueId != 0 && !testedM2Ids.insert(inst.uniqueId).second) continue;
                         testMesh(inst.model, inst.invModel,
                                  batch.model->collisionVerts, batch.model->collisionIndices);
                     }
