@@ -11,6 +11,8 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <SDL3/SDL.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include "../rhi/rhi_gl.hpp"
@@ -226,6 +228,43 @@ struct GpuAdtTile {
 
 class AdtLoader {
 public:
+    // ==================== 异步流式加载：后台 CPU 解包产物 ====================
+    struct CpuAdtData {
+        struct ChunkAlphaCpu {
+            int32_t texIds[4]{ -1, -1, -1, -1 }; // 对应 MTEX 字符串表下标，-1 = 无贴图
+            bool    hasAlpha = false;
+            std::vector<uint8_t> rgba;           // 64x64x4 RGBA8 遮罩数据 (仅在 hasAlpha 时有效)
+        };
+        struct DoodadPlacement {
+            glm::mat4 mat{ 1.0f };
+            glm::mat4 invMat{ 1.0f };
+            uint32_t  uniqueId = 0;
+        };
+        struct WmoPlacement {
+            glm::mat4 mat{ 1.0f };
+            glm::mat4 invMat{ 1.0f };
+            uint16_t  doodadSet = 0;
+            uint32_t  uniqueId  = 0;
+        };
+
+        int tileX = -1;
+        int tileY = -1;
+        GpuAdtTile tile;
+        std::vector<TerrainVertex> allVerts;
+        std::vector<TerrainVertex> liquidVerts;
+        std::vector<uint16_t>      allIndices;
+        std::vector<uint16_t>      liquidIndices;
+        std::vector<std::string>   mtexPaths;
+        std::vector<ChunkAlphaCpu> chunkAlphas;
+
+        std::unordered_map<std::string, std::vector<DoodadPlacement>>     doodadGroups;
+        std::vector<std::pair<std::string, std::vector<WmoPlacement>>>    wmoList;
+        std::vector<std::pair<std::string, std::vector<DoodadPlacement>>> m2List;
+
+        int    stage  = 0;
+        size_t cursor = 0;
+    };
+
     static constexpr float kMapHalfSize = 32.0f * (1600.0f / 3.0f); // 17066.66656 码
     static constexpr float kChunkSize   = (1600.0f / 3.0f) / 16.0f; // 33.333333 码
     static constexpr float kUnitSize    = kChunkSize / 8.0f;        // 4.1666665 码
@@ -275,18 +314,28 @@ public:
         outRadius = glm::length(worldExtents);
     }
 
-    [[nodiscard]] static std::optional<GpuAdtTile> LoadAdt(
+    // ==================== 后台线程：纯 CPU ADT 解包 (线程安全) ====================
+    // 【严格约束】本函数运行在 std::async 工作线程中，绝不调用任何 OpenGL / AssetManager 接口
+    [[nodiscard]] static std::optional<CpuAdtData> ParseAdtCpu(
         std::string_view adtVirtualPath,
         const vfs::VirtualFileSystem& vfs,
-        AssetManager& assets,
-        GLuint fallbackWhiteTex,
-        std::unordered_set<uint32_t>& seenUniqueIds)
+        int tx = -1, int ty = -1)
     {
         auto fileOpt = vfs.ReadFile(adtVirtualPath);
         if (!fileOpt || fileOpt->size() < 64) return std::nullopt;
         std::span<const uint8_t> bytes(*fileOpt);
 
-        std::vector<std::string> mtexPaths;
+        CpuAdtData cpu;
+        cpu.tileX = tx;
+        cpu.tileY = ty;
+
+        // 局部引用别名：解析阶段直接写入 CpuAdtData 字段，避免重复拷贝大块几何数据
+        GpuAdtTile&                 tile      = cpu.tile;
+        std::vector<TerrainVertex>& allVerts  = cpu.allVerts;
+        std::vector<uint16_t>&      allIndices = cpu.allIndices;
+        std::vector<std::string>&   mtexPaths = cpu.mtexPaths;
+        allVerts.reserve(256 * 145);
+
         std::span<const char>    mmdxBlob;
         std::span<const uint32_t> mmidOffsets;
         std::span<const MddfEntry> mddfEntries;
@@ -294,15 +343,12 @@ public:
         std::span<const uint32_t>  mwidOffsets;
         std::span<const ModfEntry> modfEntries;
         std::span<const uint8_t>   mh2oChunkData;
-        std::vector<TerrainVertex> allVerts;
-        allVerts.reserve(256 * 145);
 
-        std::vector<uint16_t> allIndices;
         // 预先在 allIndices[0..767] 生成一份标准无洞口 MCNK 的 768 个索引，供所有普通地形块复用！
         BuildChunkIndices(0, allIndices);
 
-        GpuAdtTile tile;
         tile.chunks.reserve(256);
+        cpu.chunkAlphas.reserve(256);
 		tile.alphaTextures.reserve(256);
 
         // 1. 扫描 ADT 顶层 IFF Chunks
@@ -340,34 +386,25 @@ public:
             } else if (magic == FourCC("MCNK") && size >= sizeof(McnkHeader)) {
                 // 解析单个 MCNK 地形块 (包含 8 字节头在内的起始位置为 cursor)
                 auto mcnkFullSpan = bytes.subspan(cursor, size + 8);
-                ParseMcnkChunk(mcnkFullSpan, mtexPaths, assets, fallbackWhiteTex, allVerts, allIndices, tile);
+                ParseMcnkChunk(mcnkFullSpan, allVerts, allIndices, tile, cpu.chunkAlphas);
             }
 
             cursor = dataStart + size;
         }
 
         if (tile.chunks.empty()) return std::nullopt;
+        if (cpu.chunkAlphas.size() != tile.chunks.size()) return std::nullopt;
 
         // 1.5 解析 MH2O 水体层 (必须放在全部 MCNK 顶点写入 allVerts 之后)
         if (!mh2oChunkData.empty()) {
-            ParseMh2oChunk(mh2oChunkData, allVerts, tile);
+            ParseMh2oChunk(mh2oChunkData, allVerts, tile, cpu.liquidVerts, cpu.liquidIndices);
         }
-
-        // 2. 上传地形合并 VBO 与 IBO
-        tile.terrainVbo = rhi::GlBuffer(allVerts.size() * sizeof(TerrainVertex), allVerts.data(), 0);
-        tile.terrainIbo = rhi::GlBuffer(allIndices.size() * sizeof(uint16_t), allIndices.data(), 0);
 
         // 将初始相机设在整块 ADT 正中央的 MCNK (第 128 块) 上方 25 码处
         const auto& midVert = allVerts[(tile.chunks.size() / 2) * 145];
         tile.suggestedCamPos = midVert.pos + glm::vec3(0.0f, 0.0f, 25.0f);
 
-        // 3. 按 M2 路径分组解析 MDDF 装饰物实例，合并为 Instanced Draw Batches
-        // 每个摆放同时携带 uniqueId，供实例化后保留归属信息
-        struct DoodadPlacement {
-            glm::mat4 mat{1.0f};
-            uint32_t  uniqueId = 0;
-        };
-        std::unordered_map<std::string, std::vector<DoodadPlacement>> doodadGroups;
+        // 3. 按 M2 路径分组解析 MDDF 装饰物实例 (仅记录变换，GPU 侧延后到主线程分步上传)
         for (const auto& entry : mddfEntries) {
             if (entry.mmidIndex >= mmidOffsets.size()) continue;
             uint32_t strOffset = mmidOffsets[entry.mmidIndex];
@@ -398,17 +435,13 @@ public:
             mat = glm::rotate(mat, glm::radians(entry.rot.z),          glm::vec3(1.0f, 0.0f, 0.0f));
             mat = glm::scale(mat, glm::vec3(scale));
 
-            doodadGroups[m2Path].push_back(DoodadPlacement{mat, entry.uniqueId});
+            cpu.doodadGroups[m2Path].push_back(
+                CpuAdtData::DoodadPlacement{mat, glm::inverse(mat), entry.uniqueId});
             tile.debugPlacements.push_back({m2Path, worldPos, scale, false});
         }
 
         // 4. 解析 MODF 大型建筑 (WMO) 并记录每个实例的变换矩阵、doodadSet 与唯一 ID
-        struct WmoPlacement {
-            glm::mat4 mat{1.0f};
-            uint16_t  doodadSet = 0;
-            uint32_t  uniqueId  = 0;
-        };
-        std::unordered_map<std::string, std::vector<WmoPlacement>> wmoGroups;
+        std::unordered_map<std::string, std::vector<CpuAdtData::WmoPlacement>> wmoGroups;
         for (const auto& entry : modfEntries) {
             if (entry.mwidIndex >= mwidOffsets.size()) continue;
             uint32_t strOffset = mwidOffsets[entry.mwidIndex];
@@ -423,94 +456,205 @@ public:
             mat = glm::rotate(mat, glm::radians(entry.rot.x),          glm::vec3(0.0f, 1.0f, 0.0f));
             mat = glm::rotate(mat, glm::radians(entry.rot.z),          glm::vec3(1.0f, 0.0f, 0.0f));
 
-            wmoGroups[wmoPath].push_back(WmoPlacement{mat, entry.doodadSet, entry.uniqueId});
+            wmoGroups[wmoPath].push_back(
+                CpuAdtData::WmoPlacement{mat, glm::inverse(mat), entry.doodadSet, entry.uniqueId});
             tile.debugPlacements.push_back({wmoPath, worldPos, 1.0f, true});
         }
 
+        // 将按路径分组的 WMO 摆放转换为有序队列，供主线程分步加载
+        cpu.wmoList.reserve(wmoGroups.size());
         for (auto& [wmoPath, placements] : wmoGroups) {
-            auto wmoPtr = assets.GetOrLoadWmo(wmoPath, fallbackWhiteTex);
-            if (!wmoPtr) {
-                continue;
+            cpu.wmoList.emplace_back(wmoPath, std::move(placements));
+        }
+        return cpu;
+    }
+
+    // ==================== 主线程：分步 GPU 上传 ====================
+    // 每帧最多消耗 budgetNs 纳秒；返回 true 表示整块 ADT 已可提交渲染
+    static bool StepFinalizeAdtGpu(CpuAdtData& c, AssetManager& assets,
+                                   GLuint fallbackWhiteTex, uint64_t budgetNs)
+    {
+        const uint64_t t0 = SDL_GetTicksNS();
+
+        // ---- Stage 0: 一次性上传地形 / 水体合并缓冲，并释放 CPU 几何内存 ----
+        if (c.stage == 0) {
+            if (c.allVerts.empty() || c.allIndices.empty()) return false;
+
+            c.tile.terrainVbo = rhi::GlBuffer(c.allVerts.size() * sizeof(TerrainVertex), c.allVerts.data(), 0);
+            c.tile.terrainIbo = rhi::GlBuffer(c.allIndices.size() * sizeof(uint16_t), c.allIndices.data(), 0);
+
+            if (!c.liquidVerts.empty() && !c.liquidIndices.empty()) {
+                c.tile.liquidVbo = rhi::GlBuffer(c.liquidVerts.size() * sizeof(TerrainVertex),
+                                                 c.liquidVerts.data(), 0);
+                c.tile.liquidIbo = rhi::GlBuffer(c.liquidIndices.size() * sizeof(uint16_t),
+                                                 c.liquidIndices.data(), 0);
             }
 
-            GpuWmoBatch batch;
-            batch.model = std::move(wmoPtr);
-            batch.instances.reserve(placements.size());
+            std::vector<TerrainVertex>().swap(c.allVerts);
+            std::vector<uint16_t>().swap(c.allIndices);
+            std::vector<TerrainVertex>().swap(c.liquidVerts);
+            std::vector<uint16_t>().swap(c.liquidIndices);
 
-            // 每个建筑实例一次性预计算整栋 + 各子房间的世界空间 AABB
-            for (const auto& p : placements) {
-                WmoInstance inst{};
-                inst.model    = p.mat;
-                inst.invModel = glm::inverse(p.mat);
-                inst.uniqueId = p.uniqueId;
-                TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, p.mat,
-                                   inst.worldBoundsMin, inst.worldBoundsMax,
-                                   inst.worldCenter, inst.worldRadius);
+            c.stage  = 1;
+            c.cursor = 0;
+        }
 
-                inst.groupBounds.resize(batch.model->groups.size());
-                for (size_t g = 0; g < batch.model->groups.size(); ++g) {
-                    const auto& grp = batch.model->groups[g];
-                    TransformLocalAABB(grp.localBoundsMin, grp.localBoundsMax, p.mat,
-                                       inst.groupBounds[g].worldBoundsMin, inst.groupBounds[g].worldBoundsMax,
-                                       inst.groupBounds[g].worldCenter, inst.groupBounds[g].worldRadius);
-                }
-                batch.instances.push_back(std::move(inst));
-            }
+        // ---- Stage 1: 分批解码 MCNK 地面贴图与 64x64 Alpha 遮罩 ----
+        if (c.stage == 1) {
+            const size_t chunkCount = std::min(c.tile.chunks.size(), c.chunkAlphas.size());
+            while (c.cursor < chunkCount) {
+                const size_t i = c.cursor;
+                GpuMcnkChunk& ch = c.tile.chunks[i];
+                CpuAdtData::ChunkAlphaCpu& ca = c.chunkAlphas[i];
 
-            // 将 WMO 内部 MODD 家具按每个建筑实例激活的 doodadSet 展开，并入统一的 M2 实例化分组
-            auto appendDoodadSet = [&](uint16_t setIdx, const glm::mat4& wmoWorldMat) {
-                if (setIdx >= batch.model->doodadSets.size()) return;
-                const auto& ds = batch.model->doodadSets[setIdx];
-                size_t endIdx = std::min<size_t>(ds.startIndex + ds.count, batch.model->doodads.size());
-                for (size_t i = ds.startIndex; i < endIdx; ++i) {
-                    const auto& d = batch.model->doodads[i];
-                    if (!d.m2Path.empty()) {
-                        // WMO 内部 MODD 家具没有独立全局 ID，统一记为 0
-                        doodadGroups[d.m2Path].push_back(
-                            DoodadPlacement{ wmoWorldMat * d.localMatrix, 0u });
+                for (int l = 0; l < 4; ++l) {
+                    ch.layerTex[l] = fallbackWhiteTex;
+                    const int32_t id = ca.texIds[l];
+                    if (id >= 0 && static_cast<size_t>(id) < c.mtexPaths.size()) {
+                        const GLuint loaded = assets.GetOrLoadTexture(c.mtexPaths[static_cast<size_t>(id)], true);
+                        if (loaded != 0) ch.layerTex[l] = loaded;
                     }
                 }
-            };
-            for (const auto& p : placements) {
-                appendDoodadSet(0, p.mat); // Set 0 (DefaultGlobal) 始终激活
-                if (p.doodadSet != 0) appendDoodadSet(p.doodadSet, p.mat);
+
+                if (ca.hasAlpha && ca.rgba.size() >= 64u * 64u * 4u) {
+                    rhi::GlTexture2D alphaTex(64, 64, 1, rhi::PixelFormat::RGBA8, false);
+                    alphaTex.UploadUncompressedMip(0, 64, 64, ca.rgba);
+                    ch.alphaMapTex = alphaTex.Handle();
+                    c.tile.alphaTextures.push_back(std::move(alphaTex));
+                } else {
+                    ch.alphaMapTex = 0; // 单层地形无需遮罩，渲染期绑定全黑纹理
+                }
+                std::vector<uint8_t>().swap(ca.rgba);
+
+                ++c.cursor;
+                if ((c.cursor % 16u) == 0u && (SDL_GetTicksNS() - t0) >= budgetNs) return false;
             }
-
-            tile.wmoBatches.push_back(std::move(batch));
-        }
-        std::printf("[ADT Loader] Loaded %zu WMO building types\n", tile.wmoBatches.size());
-
-        // 5. 通过 AssetManager 全局缓存获取或加载 M2 模型，并逐实例预计算世界空间 AABB
-        for (auto& [m2Path, placements] : doodadGroups) {
-            auto modelPtr = assets.GetOrLoadM2(m2Path, fallbackWhiteTex);
-            if (!modelPtr) {
-                continue;
-            }
-
-            GpuDoodadBatch batch;
-            batch.model = std::move(modelPtr);
-            batch.instances.reserve(placements.size());
-
-            for (const auto& placement : placements) {
-                M2Instance inst{};
-                inst.model    = placement.mat;
-                inst.invModel = glm::inverse(placement.mat);
-                inst.uniqueId = placement.uniqueId;
-                TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, placement.mat,
-                                   inst.worldBoundsMin, inst.worldBoundsMax,
-                                   inst.worldCenter, inst.worldRadius);
-                batch.instances.push_back(std::move(inst));
-            }
-            tile.doodadBatches.push_back(std::move(batch));
+            c.stage  = 2;
+            c.cursor = 0;
         }
 
-        size_t totalM2Instances = 0;
-        for (const auto& b : tile.doodadBatches) totalM2Instances += b.instances.size();
+        // ---- Stage 2: 分批加载 WMO 建筑，并展开其 MODD 家具到 M2 待加载队列 ----
+        if (c.stage == 2) {
+            while (c.cursor < c.wmoList.size()) {
+                auto& item = c.wmoList[c.cursor];
+                auto& placements = item.second;
 
-        std::printf("[ADT Loader] Loaded %zu MCNK chunks, %zu tile M2 types (%zu instances) | Global VRAM Pool: %zu M2, %zu WMO\n",
-                    tile.chunks.size(), tile.doodadBatches.size(), totalM2Instances,
-                    assets.CachedM2Count(), assets.CachedWmoCount());
-        return tile;
+                auto wmoPtr = assets.GetOrLoadWmo(item.first, fallbackWhiteTex);
+                if (wmoPtr) {
+                    GpuWmoBatch batch;
+                    batch.model = std::move(wmoPtr);
+                    batch.instances.reserve(placements.size());
+
+                    // 每个建筑实例一次性预计算整栋 + 各子房间的世界空间 AABB
+                    for (const auto& p : placements) {
+                        WmoInstance inst{};
+                        inst.model    = p.mat;
+                        inst.invModel = p.invMat;
+                        inst.uniqueId = p.uniqueId;
+                        TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, p.mat,
+                                           inst.worldBoundsMin, inst.worldBoundsMax,
+                                           inst.worldCenter, inst.worldRadius);
+
+                        inst.groupBounds.resize(batch.model->groups.size());
+                        for (size_t g = 0; g < batch.model->groups.size(); ++g) {
+                            const auto& grp = batch.model->groups[g];
+                            TransformLocalAABB(grp.localBoundsMin, grp.localBoundsMax, p.mat,
+                                               inst.groupBounds[g].worldBoundsMin, inst.groupBounds[g].worldBoundsMax,
+                                               inst.groupBounds[g].worldCenter, inst.groupBounds[g].worldRadius);
+                        }
+                        batch.instances.push_back(std::move(inst));
+                    }
+
+                    // 将 WMO 内部 MODD 家具按激活的 doodadSet 展开，并入统一的 M2 待加载队列
+                    auto appendDoodadSet = [&](uint16_t setIdx, const glm::mat4& wmoWorldMat) {
+                        if (setIdx >= batch.model->doodadSets.size()) return;
+                        const auto& ds = batch.model->doodadSets[setIdx];
+                        size_t endIdx = std::min<size_t>(ds.startIndex + ds.count, batch.model->doodads.size());
+                        for (size_t i = ds.startIndex; i < endIdx; ++i) {
+                            const auto& d = batch.model->doodads[i];
+                            if (!d.m2Path.empty()) {
+                                const glm::mat4 world = wmoWorldMat * d.localMatrix;
+                                // WMO 内部 MODD 家具没有独立全局 ID，统一记为 0
+                                c.doodadGroups[d.m2Path].push_back(
+                                    CpuAdtData::DoodadPlacement{ world, glm::inverse(world), 0u });
+                            }
+                        }
+                    };
+                    for (const auto& p : placements) {
+                        appendDoodadSet(0, p.mat); // Set 0 (DefaultGlobal) 始终激活
+                        if (p.doodadSet != 0) appendDoodadSet(p.doodadSet, p.mat);
+                    }
+
+                    c.tile.wmoBatches.push_back(std::move(batch));
+                }
+
+                ++c.cursor;
+                if ((SDL_GetTicksNS() - t0) >= budgetNs) return false;
+            }
+
+            c.m2List.reserve(c.doodadGroups.size());
+            for (auto& kv : c.doodadGroups) {
+                c.m2List.emplace_back(kv.first, std::move(kv.second));
+            }
+            c.doodadGroups.clear();
+            std::printf("[ADT Loader] Finalized %zu WMO building types\n", c.tile.wmoBatches.size());
+
+            c.stage  = 3;
+            c.cursor = 0;
+        }
+
+        // ---- Stage 3: 分批加载 M2 装饰物，逐实例预计算世界空间 AABB ----
+        if (c.stage == 3) {
+            while (c.cursor < c.m2List.size()) {
+                auto& item = c.m2List[c.cursor];
+
+                auto modelPtr = assets.GetOrLoadM2(item.first, fallbackWhiteTex);
+                if (modelPtr) {
+                    GpuDoodadBatch batch;
+                    batch.model = std::move(modelPtr);
+                    batch.instances.reserve(item.second.size());
+
+                    for (const auto& placement : item.second) {
+                        M2Instance inst{};
+                        inst.model    = placement.mat;
+                        inst.invModel = placement.invMat;
+                        inst.uniqueId = placement.uniqueId;
+                        TransformLocalAABB(batch.model->localBoundsMin, batch.model->localBoundsMax, placement.mat,
+                                           inst.worldBoundsMin, inst.worldBoundsMax,
+                                           inst.worldCenter, inst.worldRadius);
+                        batch.instances.push_back(std::move(inst));
+                    }
+                    c.tile.doodadBatches.push_back(std::move(batch));
+                }
+
+                ++c.cursor;
+                if ((c.cursor % 2u) == 0u && (SDL_GetTicksNS() - t0) >= budgetNs) return false;
+            }
+
+            c.tile.tileX = c.tileX;
+            c.tile.tileY = c.tileY;
+            c.stage = 4;
+            std::printf("[ADT Loader] Finalized %zu MCNK chunks, %zu M2 types | Global VRAM Pool: %zu M2, %zu WMO\n",
+                        c.tile.chunks.size(), c.tile.doodadBatches.size(),
+                        assets.CachedM2Count(), assets.CachedWmoCount());
+            return true;
+        }
+
+        return true;
+    }
+
+    // 保留同步版本，供启动时的首块 ADT 一次性加载
+    [[nodiscard]] static std::optional<GpuAdtTile> LoadAdt(
+        std::string_view adtVirtualPath,
+        const vfs::VirtualFileSystem& vfs,
+        AssetManager& assets,
+        GLuint fallbackWhiteTex,
+        std::unordered_set<uint32_t>& /*seenUniqueIds*/)
+    {
+        auto cpu = ParseAdtCpu(adtVirtualPath, vfs);
+        if (!cpu) return std::nullopt;
+        while (!StepFinalizeAdtGpu(*cpu, assets, fallbackWhiteTex, UINT64_MAX)) {}
+        return std::move(cpu->tile);
     }
 
     // 方向 G：查询 (worldX, worldY) 处脚下最高可行走地面世界 Z
@@ -845,12 +989,11 @@ private:
     static void ParseMh2oChunk(
         std::span<const uint8_t> mh2oChunkData,
         const std::vector<TerrainVertex>& allVerts,
-        GpuAdtTile& tile)
+        GpuAdtTile& tile,
+        std::vector<TerrainVertex>& liquidVerts,
+        std::vector<uint16_t>& liquidIndices)
     {
         if (mh2oChunkData.size() < 256 * sizeof(Mh2oChunkHeader)) return;
-
-        std::vector<TerrainVertex> liquidVerts;
-        std::vector<uint16_t>      liquidIndices;
 
         const size_t chunkCount = std::min<size_t>(256, tile.chunks.size());
         for (size_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
@@ -970,10 +1113,7 @@ private:
 
         if (liquidVerts.empty() || liquidIndices.empty()) return;
 
-        tile.liquidVbo = rhi::GlBuffer(liquidVerts.size() * sizeof(TerrainVertex), liquidVerts.data(), 0);
-        tile.liquidIbo = rhi::GlBuffer(liquidIndices.size() * sizeof(uint16_t), liquidIndices.data(), 0);
-
-        std::printf("[ADT Loader] Loaded %zu MH2O liquid chunks\n", tile.liquidChunks.size());
+        std::printf("[ADT Loader] Parsed %zu MH2O liquid chunks (CPU)\n", tile.liquidChunks.size());
     }
 
     static void ParseNullTerminatedStrings(std::span<const uint8_t> blob, std::vector<std::string>& outList) {
@@ -990,12 +1130,10 @@ private:
 
     static void ParseMcnkChunk(
         std::span<const uint8_t> mcnkFullSpan,
-        const std::vector<std::string>& mtexPaths,
-        AssetManager& assets,
-        GLuint fallbackWhiteTex,
         std::vector<TerrainVertex>& allVerts,
         std::vector<uint16_t>& allIndices,
-        GpuAdtTile& tile)
+        GpuAdtTile& tile,
+        std::vector<CpuAdtData::ChunkAlphaCpu>& chunkAlphas)
     {
         McnkHeader hdr{};
         std::memcpy(&hdr, mcnkFullSpan.data() + 8, sizeof(McnkHeader));
@@ -1065,7 +1203,9 @@ private:
         gpuChunk.aabbMin = vMin;
         gpuChunk.aabbMax = vMax;
 
-        for (int i = 0; i < 4; ++i) gpuChunk.layerTex[i] = fallbackWhiteTex;
+        // CPU 阶段仅记录 MTEX 下标；贴图对象创建延后到主线程分步上传
+        CpuAdtData::ChunkAlphaCpu chunkAlpha{};
+        for (int i = 0; i < 4; ++i) gpuChunk.layerTex[i] = 0;
 
         uint32_t layerCount = std::min<uint32_t>(hdr.nLayers, 4u);
         MclyEntry layers[4]{};
@@ -1074,15 +1214,13 @@ private:
         {
             std::memcpy(layers, mcnkFullSpan.data() + hdr.ofsLayer + 8, layerCount * sizeof(MclyEntry));
             for (uint32_t i = 0; i < layerCount; ++i) {
-                if (layers[i].textureId < mtexPaths.size()) {
-                    GLuint loaded = assets.GetOrLoadTexture(mtexPaths[layers[i].textureId], true);
-                    if (loaded != 0) gpuChunk.layerTex[i] = loaded;
-                }
+                chunkAlpha.texIds[i] = static_cast<int32_t>(layers[i].textureId);
             }
         }
 
-        // 若层数 > 1，解码 MCAL 生成 64x64 RGBA8 遮罩纹理 (repeatWrap = false 即 GL_CLAMP_TO_EDGE)
+        // 若层数 > 1，解码 MCAL 得到 64x64 RGBA8 遮罩数据 (贴图创建延后到主线程)
         std::vector<uint8_t> alphaRgba(64 * 64 * 4, 0);
+        bool decodedAlpha = false;
         if (layerCount > 1 && hdr.ofsAlpha > 0 && hdr.ofsAlpha + 8 < mcnkFullSpan.size()) {
             size_t maxMcal = mcnkFullSpan.size() - (hdr.ofsAlpha + 8);
             size_t mcalSize = (hdr.sizeAlpha >= 8) ? std::min<size_t>(hdr.sizeAlpha - 8, maxMcal) : maxMcal;
@@ -1097,14 +1235,16 @@ private:
                     }
                     size_t layerByteSize = (nextOfs > curOfs) ? (nextOfs - curOfs) : 0;
                     DecodeAlphaChannel(mcalSpan, hdr.flags, layers[i].flags, curOfs, layerByteSize, i - 1, alphaRgba);
+                    decodedAlpha = true;
                 }
             }
         }
 
-        rhi::GlTexture2D alphaTex(64, 64, 1, rhi::PixelFormat::RGBA8, false);
-        alphaTex.UploadUncompressedMip(0, 64, 64, alphaRgba);
-        gpuChunk.alphaMapTex = alphaTex.Handle();
-        tile.alphaTextures.push_back(std::move(alphaTex));
+        gpuChunk.alphaMapTex = 0;
+        if (decodedAlpha) {
+            chunkAlpha.hasAlpha = true;
+            chunkAlpha.rgba     = std::move(alphaRgba);
+        }
 
         // 【补回被误删的地形洞口索引与 push_back】
         uint16_t holeMask = static_cast<uint16_t>(hdr.holes & 0xFFFFu);
@@ -1117,6 +1257,7 @@ private:
             gpuChunk.indexCount = static_cast<uint32_t>(allIndices.size()) - gpuChunk.firstIndex;
         }
 
+        chunkAlphas.push_back(std::move(chunkAlpha));
         tile.chunks.push_back(gpuChunk);
     }
 

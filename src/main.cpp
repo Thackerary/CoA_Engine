@@ -8,6 +8,7 @@
 #include <array>
 #include <algorithm>
 #include <unordered_set>
+#include <future>
 #include "rhi/rhi_gl.hpp"
 #include "vfs/vfs.hpp"
 #include "assets/asset_manager.hpp"
@@ -687,6 +688,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::unordered_set<int> failedAdtKeys; // 键值 = (tileX << 8) | tileY，避免反复重试缺失文件
         float streamCooldown = 0.25f;          // 相邻两次流式加载之间的冷却时间，避免瞬移时卡顿
 
+        // 方向 I：后台线程纯 CPU 解包 + 主线程每帧 2ms 时间片分步上传 GPU
+        std::future<std::optional<coa::assets::AdtLoader::CpuAdtData>> asyncAdtFuture;
+        std::optional<coa::assets::AdtLoader::CpuAdtData>              pendingAdtCpu;
+        int loadingTx = -1;
+        int loadingTy = -1;
+
         // 跨 ADT 全局 M2 合批桶：按 uniqueId 去重后直接持有实例指针，避免跨界 ADT 重复绘制同一棵树
         struct GlobalM2Bucket {
             const coa::assets::GpuM2Model* model = nullptr;
@@ -974,8 +981,32 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
                 }
 
-                // 2. 按距离加载：仅在冷却结束时加载 380 码内距离最近的一块缺失 ADT
-                if (streamCooldown <= 0.0f) {
+                // 2. 主线程分步 GPU 上传：每帧最多消耗 2ms，避免贴图解码 / 建缓冲造成掉帧
+                if (pendingAdtCpu.has_value()) {
+                    if (coa::assets::AdtLoader::StepFinalizeAdtGpu(
+                            *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 2'000'000ULL)) {
+                        adtTiles.push_back(std::move(pendingAdtCpu->tile));
+                        pendingAdtCpu.reset();
+                        loadingTx = loadingTy = -1;
+                        bucketsDirty = true;
+                        std::printf("[ADT Streamer] Finalized azeroth_%d_%d.adt (Loaded: %zu)\n",
+                                    adtTiles.back().tileX, adtTiles.back().tileY, adtTiles.size());
+                    }
+                } else if (asyncAdtFuture.valid()) {
+                    // 2.1 非阻塞轮询后台 CPU 解包任务
+                    if (asyncAdtFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                        auto parsed = asyncAdtFuture.get();
+                        if (parsed) {
+                            pendingAdtCpu = std::move(*parsed);
+                        } else {
+                            if (loadingTx >= 0 && loadingTy >= 0) {
+                                failedAdtKeys.insert((loadingTx << 8) | loadingTy);
+                            }
+                            loadingTx = loadingTy = -1;
+                        }
+                    }
+                } else if (streamCooldown <= 0.0f) {
+                    // 3. 启动后台 CPU 解包：查找 380 码内距离最近、未加载且不在加载中的区块
                     int   bestTx = -1;
                     int   bestTy = -1;
                     float bestDist = 380.0f;
@@ -986,6 +1017,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                             const int ty = curTile.y + dy;
                             if (tx < 0 || tx > 63 || ty < 0 || ty > 63) continue;
                             if (failedAdtKeys.count((tx << 8) | ty) != 0) continue;
+                            if (tx == loadingTx && ty == loadingTy) continue;
 
                             bool alreadyLoaded = false;
                             for (const auto& t : adtTiles) {
@@ -1007,25 +1039,23 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
 
                     if (bestTx >= 0 && bestTy >= 0) {
+                        loadingTx      = bestTx;
+                        loadingTy      = bestTy;
+                        streamCooldown = 0.15f;
+
                         char adtPath[96];
                         std::snprintf(adtPath, sizeof(adtPath),
                                       "world/maps/azeroth/azeroth_%d_%d.adt", bestTx, bestTy);
 
-                        auto tile = coa::assets::AdtLoader::LoadAdt(
-                            adtPath, vfs, assets, whiteFallbackTex.Handle(), seenUniqueIds);
-                        if (tile) {
-                            tile->tileX = bestTx;
-                            tile->tileY = bestTy;
-                            adtTiles.push_back(std::move(*tile));
-                            bucketsDirty  = true;
-                            streamCooldown = 0.15f;
-                        } else {
-                            failedAdtKeys.insert((bestTx << 8) | bestTy);
-                        }
+                        // 后台线程仅做纯 CPU 解包，绝不触碰 OpenGL / AssetManager
+                        asyncAdtFuture = std::async(std::launch::async,
+                            [adtPathStr = std::string(adtPath), &vfs, bestTx, bestTy]() {
+                                return coa::assets::AdtLoader::ParseAdtCpu(adtPathStr, vfs, bestTx, bestTy);
+                            });
                     }
                 }
 
-                // 3. 本帧发生加载或卸载：重建 M2 合批桶
+                // 4. 本帧发生加载或卸载：重建 M2 合批桶
                 if (bucketsDirty) rebuildGlobalM2Buckets();
             }
 
@@ -1120,7 +1150,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.texLayers[0]  = chunk.layerTex[1];
                     cmd.texLayers[1]  = chunk.layerTex[2];
                     cmd.texLayers[2]  = chunk.layerTex[3];
-                    cmd.texAlphaMap   = chunk.alphaMapTex;
+                    cmd.texAlphaMap   = (chunk.alphaMapTex != 0) ? chunk.alphaMapTex : blackAlphaTex.Handle();
                     renderQueue.push_back(cmd);
                 }
             }
