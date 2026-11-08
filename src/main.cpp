@@ -277,7 +277,7 @@ layout(binding = 1) uniform sampler2D uTexLayer1;   // 地形 Layer 1
 layout(binding = 2) uniform sampler2D uTexLayer2;   // 地形 Layer 2
 layout(binding = 3) uniform sampler2D uTexLayer3;   // 地形 Layer 3
 layout(binding = 4) uniform sampler2D uTexAlphaMap; // 64x64 RGB Alpha 遮罩 (M2 模型绑定全黑纹理，alpha=0)
-layout(binding = 5) uniform sampler2D uShadowMap;   // 太阳方向 2048x2048 实时阴影贴图
+layout(binding = 5) uniform sampler2DShadow uShadowMap; // 太阳方向 2048x2048 实时阴影贴图 (硬件比较 + 双线性)
 
 layout(location = 0) uniform int  uAlphaCutout;   // 0 = Opaque, 1 = Cutout, 2 = Blend, 3 = UV Scroll
 layout(location = 1) uniform int  uMaterialFlags; // bit 0 = TwoSided, bit 1 = Unlit
@@ -322,17 +322,18 @@ float CalcShadow(vec3 worldPos, float ndotl) {
         return 1.0;
     }
 
-    float bias  = max(0.0025 * (1.0 - ndotl), 0.0006);
-    float shade = 0.0;
+    float bias = max(0.0015 * (1.0 - ndotl), 0.0004);
+
+    float vis = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            float sampleD = texture(uShadowMap, uv + vec2(dx, dy) / 2048.0).r;
-            shade += (curD - bias > sampleD) ? 1.0 : 0.0;
+            vis += texture(uShadowMap, vec3(uv + vec2(dx, dy) / 2048.0, curD - bias));
         }
     }
-    float vis  = 1.0 - shade / 9.0;
-    float fade = 1.0 - smoothstep(80.0, 92.0, length(worldPos.xy - uCameraPos.xy));
-    return mix(1.0, vis, fade * 0.78);
+    vis /= 9.0;
+
+    float fade = 1.0 - smoothstep(34.0, 41.0, length(worldPos.xy - uCameraPos.xy));
+    return mix(1.0, vis, fade * 0.75);
 }
 
 void main() {
@@ -775,6 +776,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
         glTextureParameteri(shadowTex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
         glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        // 硬件深度比较 + 双线性过滤：每次采样即 2x2 纹素软过渡，消除阴影边缘方块锯齿
+        glTextureParameteri(shadowTex, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+        glTextureParameteri(shadowTex, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
         const float shadowBorder[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         glTextureParameterfv(shadowTex, GL_TEXTURE_BORDER_COLOR, shadowBorder);
 
@@ -913,6 +917,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
         float titleTimer = 0.0f;
 
         std::vector<coa::rhi::DrawCommand> renderQueue;
+        // 独立轻量阴影队列：不含 MCNK 地形，仅收纳阴影半径内近处 M2/角色/WMO 批次
+        std::vector<coa::rhi::DrawCommand> shadowQueue;
         std::vector<glm::mat4> visibleMatrices;
         std::vector<glm::mat4> visibleBoneMatrices;
         std::vector<GpuParticleQuad>  visibleParticles;
@@ -1225,14 +1231,29 @@ int main(int /*argc*/, char* /*argv*/[]) {
             uboData.waterShallow       = glm::vec4(lightState.riverShallow, 1.0f);
             uboData.waterDeep          = glm::vec4(lightState.riverDeep, 1.0f);
 
-            // 方向 K：太阳方向阴影正交投影 (中心跟随角色/相机，半宽 95 码，Z 轴使用 [near..far] 前端投影)
+            // 方向 K：太阳方向阴影正交投影
+            // 光视图固定以世界原点为中心，仅在光空间内平移正交中心并按纹素对齐，
+            // 彻底消除相机移动/转向时阴影随位置变形与逐帧抖动，同时收紧到 42 码半径提升精度
             {
                 glm::vec3 sunDir = glm::normalize(glm::vec3(
                     lightState.sunDir.x, lightState.sunDir.y, std::max(lightState.sunDir.z, 0.28f)));
-                glm::vec3 center = glm::floor((walkMode ? playerPos : camPos) * 0.5f) * 2.0f;
-                uboData.lightViewProj =
-                    glm::orthoRH_ZO(-95.0f, 95.0f, -95.0f, 95.0f, 10.0f, 380.0f) *
-                    glm::lookAt(center + sunDir * 180.0f, center, glm::vec3(0.0f, 0.0f, 1.0f));
+
+                const float kShadowRad = 42.0f;
+                const float texelSize  = (kShadowRad * 2.0f) / 2048.0f;
+
+                const glm::vec3 anchor = walkMode ? playerPos : camPos;
+                const glm::mat4 lightView =
+                    glm::lookAt(sunDir * 160.0f, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+
+                glm::vec4 lvCenter = lightView * glm::vec4(anchor, 1.0f);
+                lvCenter.x = std::floor(lvCenter.x / texelSize) * texelSize;
+                lvCenter.y = std::floor(lvCenter.y / texelSize) * texelSize;
+
+                const glm::mat4 lightProj = glm::orthoRH_ZO(
+                    lvCenter.x - kShadowRad, lvCenter.x + kShadowRad,
+                    lvCenter.y - kShadowRad, lvCenter.y + kShadowRad,
+                    -150.0f, 320.0f);
+                uboData.lightViewProj = lightProj * lightView;
             }
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
 
@@ -1251,6 +1272,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
             glEnable(GL_DEPTH_TEST);
 
             renderQueue.clear();
+            shadowQueue.clear();
             visibleParticles.clear();
             particleBatches.clear();
             visibleMatrices.clear();
@@ -1515,6 +1537,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.batchColor    = batchColor;
                     cmd.texAlphaMap   = blackAlphaTex.Handle();
                     renderQueue.push_back(cmd);
+                    // 阴影投射：仅阴影半径 (48 码) 内的近处实例，且仅不透明/Cutout 通道
+                    if (pass <= 3 && minDistSq <= 48.0f * 48.0f) {
+                        shadowQueue.push_back(cmd);
+                    }
                 }
             }
 
@@ -1587,6 +1613,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.batchColor    = batchColor;
                     cmd.texAlphaMap   = blackAlphaTex.Handle();
                     renderQueue.push_back(cmd);
+                    if (pass <= 3) {
+                        shadowQueue.push_back(cmd);
+                    }
                 }
             }
 
@@ -1612,23 +1641,50 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         if (inst.groupBounds.size() != model.groups.size()) continue;
 
                         uint32_t wmoBaseInstance = UINT32_MAX;
-                        // 3.2 逐个子房间仅做视锥测试，不再叠加距离剔除
+                        // 3.2 逐个子房间：视锥测试决定是否进入主渲染队列；
+                        //     距离测试 (包含镜头背后、视锥外的房间) 决定是否进入阴影队列，避免背后建筑漏光
                         for (size_t g = 0; g < model.groups.size(); ++g) {
                             const auto& grp = model.groups[g];
                             const auto& gc  = inst.groupBounds[g];
-                            if (!camFrustum.IntersectsAABB(gc.worldBoundsMin, gc.worldBoundsMax)) {
-                                continue;
-                            }
-                            ++visibleWmoGroups;
 
-                            if (wmoBaseInstance == UINT32_MAX) {
-                                wmoBaseInstance = static_cast<uint32_t>(visibleMatrices.size());
-                                visibleMatrices.push_back(inst.model);
-                            }
+                            const bool  inView       = camFrustum.IntersectsAABB(gc.worldBoundsMin, gc.worldBoundsMax);
+                            const float grpDist      = glm::distance(gc.worldCenter, camPos);
+                            const bool  inShadowRange = (grpDist <= 75.0f + gc.worldRadius);
+                            if (!inView && !inShadowRange) continue;
+
+                            auto ensureBaseInstance = [&]() -> uint32_t {
+                                if (wmoBaseInstance == UINT32_MAX) {
+                                    wmoBaseInstance = static_cast<uint32_t>(visibleMatrices.size());
+                                    visibleMatrices.push_back(inst.model);
+                                }
+                                return wmoBaseInstance;
+                            };
+
+                            if (inView) ++visibleWmoGroups;
 
                             for (const auto& sb : grp.batches) {
+                                const uint8_t pass = (sb.blendMode == 1) ? 3 : 2;
+
+                                if (inShadowRange && pass <= 3) {
+                                    coa::rhi::DrawCommand sCmd{};
+                                    sCmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sb.textureId), 0);
+                                    sCmd.program       = worldShader.Handle();
+                                    sCmd.vao           = terrainVao;
+                                    sCmd.vbo           = grp.vbo.Handle();
+                                    sCmd.ibo           = grp.ibo.Handle();
+                                    sCmd.stride        = sizeof(coa::assets::WmoVertex);
+                                    sCmd.texAlbedo     = sb.textureId;
+                                    sCmd.texAlphaMap   = blackAlphaTex.Handle();
+                                    sCmd.firstIndex    = sb.firstIndex;
+                                    sCmd.indexCount    = sb.indexCount;
+                                    sCmd.baseVertex    = 0;
+                                    sCmd.instanceCount = 1;
+                                    sCmd.baseInstance  = ensureBaseInstance();
+                                    shadowQueue.push_back(sCmd);
+                                }
+                                if (!inView) continue;
+
                                 coa::rhi::DrawCommand cmd{};
-                                uint8_t pass      = (sb.blendMode == 1) ? 3 : 2;
                                 cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sb.textureId), 0);
                                 cmd.program       = worldShader.Handle();
                                 cmd.vao           = terrainVao;
@@ -1641,7 +1697,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                                 cmd.indexCount    = sb.indexCount;
                                 cmd.baseVertex    = 0;
                                 cmd.instanceCount = 1;
-                                cmd.baseInstance  = wmoBaseInstance;
+                                cmd.baseInstance  = ensureBaseInstance();
                                 renderQueue.push_back(cmd);
                             }
                         }
@@ -1697,7 +1753,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
             glDepthFunc(GL_LESS);
             glClearDepth(1.0);
             glClear(GL_DEPTH_BUFFER_BIT);
-            coa::rhi::SubmitShadowCommands(renderQueue, shadowShader.Handle());
+            coa::rhi::SubmitShadowCommands(shadowQueue, shadowShader.Handle());
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glViewport(0, 0, winW, winH);
             glDepthFunc(GL_GEQUAL);
