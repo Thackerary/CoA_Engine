@@ -952,6 +952,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
         bool  walkMode    = false;
         float verticalVel = 0.0f;
         bool  isGrounded  = false;
+        bool  isSwimming  = false; // 方向 L：游泳 / 潜泳状态
         constexpr float kEyeHeight = 1.85f;
         // 方向 J：第三人称角色状态 (playerPos.z 直接代表脚底高度)
         glm::vec3 playerPos = camPos - glm::vec3(0.0f, 0.0f, kEyeHeight);
@@ -1014,6 +1015,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     walkMode    = !walkMode;
                     verticalVel = 0.0f;
                     isGrounded  = false;
+                    isSwimming  = false;
                     if (walkMode) {
                         // 进入第三人称模式：角色出生在相机下方地面，朝向沿用当前水平视角
                         playerPos = camPos - glm::vec3(0.0f, 0.0f, kEyeHeight);
@@ -1034,6 +1036,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     camPos      = kLandmarks[idx];
                     verticalVel = 0.0f;
                     isGrounded  = false;
+                    isSwimming  = false;
                     playerPos   = camPos - glm::vec3(0.0f, 0.0f, kEyeHeight);
                     std::printf("[Teleport] Landmark F%d -> (%.1f, %.1f, %.1f)\n",
                                 idx + 1, camPos.x, camPos.y, camPos.z);
@@ -1062,19 +1065,49 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             const bool* keys = SDL_GetKeyboardState(nullptr);
             if (walkMode) {
-                // ---- 第三人称角色移动：水平碰撞 + 跳跃 + 重力 + 地面吸附 (playerPos.z 即脚底高度) ----
+                // ---- 第三人称角色移动：水平碰撞 + 跳跃 / 游泳 + 重力 + 地面吸附 (playerPos.z 即脚底高度) ----
                 glm::vec3 fwdFlat(forward.x, forward.y, 0.0f);
                 if (glm::length(fwdFlat) > 1e-4f) fwdFlat = glm::normalize(fwdFlat);
                 glm::vec3 flatRight = glm::normalize(glm::cross(fwdFlat, worldUp));
 
+                // 方向 L：采样脚下地面高度与水面高度，判定游泳 / 潜泳状态
+                constexpr float kSubmergeOffset = 1.15f; // 吃水线：脚底低于水面该距离即视为游泳
+                float groundZ = playerPos.z;
+                const bool hasGround = coa::assets::AdtLoader::SampleGroundHeight(
+                    adtTiles, playerPos.x, playerPos.y, playerPos.z, groundZ);
+
+                float waterZ = -1e30f;
+                const bool hasWater = coa::assets::AdtLoader::SampleWaterHeight(
+                    adtTiles, playerPos.x, playerPos.y, waterZ);
+
+                // 深水且脚底已沉入吃水线以下 -> 进入游泳；浅水 / 离水 -> 立刻退出
+                if (hasWater && (waterZ - groundZ) > 1.30f &&
+                    playerPos.z <= waterZ - kSubmergeOffset + 0.15f) {
+                    isSwimming = true;
+                }
+                if (!hasWater || (waterZ - groundZ) <= 1.25f) {
+                    isSwimming = false;
+                }
+
                 const float walkSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 14.0f : 7.0f) * dt;
+                const float swimSpeed = (keys[SDL_SCANCODE_LSHIFT] ? 11.0f : 6.0f) * dt;
+                const float moveSpeed = isSwimming ? swimSpeed : walkSpeed;
 
                 // 方向 H：先累积期望水平位移，再交给 Collide-and-Slide 解析
                 glm::vec2 moveDelta(0.0f);
-                if (keys[SDL_SCANCODE_W]) moveDelta += glm::vec2(fwdFlat.x, fwdFlat.y) * walkSpeed;
-                if (keys[SDL_SCANCODE_S]) moveDelta -= glm::vec2(fwdFlat.x, fwdFlat.y) * walkSpeed;
-                if (keys[SDL_SCANCODE_D]) moveDelta += glm::vec2(flatRight.x, flatRight.y) * walkSpeed;
-                if (keys[SDL_SCANCODE_A]) moveDelta -= glm::vec2(flatRight.x, flatRight.y) * walkSpeed;
+                if (keys[SDL_SCANCODE_W]) moveDelta += glm::vec2(fwdFlat.x, fwdFlat.y) * moveSpeed;
+                if (keys[SDL_SCANCODE_S]) moveDelta -= glm::vec2(fwdFlat.x, fwdFlat.y) * moveSpeed;
+                if (keys[SDL_SCANCODE_D]) moveDelta += glm::vec2(flatRight.x, flatRight.y) * moveSpeed;
+                if (keys[SDL_SCANCODE_A]) moveDelta -= glm::vec2(flatRight.x, flatRight.y) * moveSpeed;
+
+                // 方向 L：游泳时 W/S 沿视线俯仰分量潜泳 / 上浮，SPACE 上浮，LCTRL 下潜
+                float swimVertical = 0.0f;
+                if (isSwimming) {
+                    if (keys[SDL_SCANCODE_W])     swimVertical += forward.z * swimSpeed;
+                    if (keys[SDL_SCANCODE_S])     swimVertical -= forward.z * swimSpeed;
+                    if (keys[SDL_SCANCODE_SPACE]) swimVertical += 5.5f * dt;
+                    if (keys[SDL_SCANCODE_LCTRL]) swimVertical -= 5.5f * dt;
+                }
 
                 const float curFootZ = playerPos.z;
                 const glm::vec2 resolvedXY = coa::assets::AdtLoader::ResolveHorizontalCollision(
@@ -1092,35 +1125,53 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     playerPos.y = resolvedXY.y;
                 }
 
-                if (keys[SDL_SCANCODE_SPACE] && isGrounded) {
-                    verticalVel = 8.2f;
+                if (isSwimming) {
+                    // 游泳 / 潜泳：水面吃水线吸附 + 湖底限制，垂直速度归零避免与重力叠加冲突
+                    float newZ = playerPos.z + swimVertical;
+                    if (swimVertical >= 0.0f && playerPos.z >= waterZ - kSubmergeOffset - 0.1f) {
+                        newZ = waterZ - kSubmergeOffset; // 水面附近且未下潜 -> 稳定吸附在吃水线
+                    }
+                    newZ = std::min(newZ, waterZ - kSubmergeOffset); // 不允许浮出水面之上
+                    if (hasGround) newZ = std::max(newZ, groundZ);   // 不允许穿透湖底
+                    playerPos.z = newZ;
+                    verticalVel = 0.0f;
                     isGrounded  = false;
-                }
+                } else {
+                    if (keys[SDL_SCANCODE_SPACE] && isGrounded) {
+                        verticalVel = 8.2f;
+                        isGrounded  = false;
+                    }
 
-                verticalVel -= 22.0f * dt;
-                float footZ   = playerPos.z + verticalVel * dt;
-                float groundZ = playerPos.z;
+                    verticalVel -= 22.0f * dt;
+                    float footZ = playerPos.z + verticalVel * dt;
+                    groundZ = playerPos.z; // 水平位移后重新采样落脚点地面高度
 
-                if (coa::assets::AdtLoader::SampleGroundHeight(adtTiles, playerPos.x, playerPos.y,
-                                                              playerPos.z, groundZ)) {
-                    if (footZ <= groundZ + 0.08f && verticalVel <= 0.0f) {
-                        footZ       = groundZ;
-                        verticalVel = 0.0f;
-                        isGrounded  = true;
+                    if (coa::assets::AdtLoader::SampleGroundHeight(adtTiles, playerPos.x, playerPos.y,
+                                                                  playerPos.z, groundZ)) {
+                        if (footZ <= groundZ + 0.08f && verticalVel <= 0.0f) {
+                            footZ       = groundZ;
+                            verticalVel = 0.0f;
+                            isGrounded  = true;
+                        } else {
+                            isGrounded = false;
+                        }
                     } else {
                         isGrounded = false;
                     }
-                } else {
-                    isGrounded = false;
+
+                    playerPos.z = footZ;
                 }
 
-                playerPos.z = footZ;
-
-                // 角色朝向与骨骼动作状态机：Stand(0) / Walk(1) / Run(2) / Jump(3)
+                // 角色朝向与骨骼动作状态机：Stand(0) / Walk(1) / Run(2) / Jump(3) / SwimIdle(4) / Swim(5)
                 if (glm::length(moveDelta) > 1e-4f) {
                     playerYaw = std::atan2(moveDelta.y, moveDelta.x);
                 }
-                if (!isGrounded) {
+                if (isSwimming) {
+                    // 划水 (5) 与踩水待机 (4)：只要有水平/垂直推进输入即视为划水
+                    playerAnimAction = (glm::length(moveDelta) > 1e-4f ||
+                                        keys[SDL_SCANCODE_SPACE] ||
+                                        keys[SDL_SCANCODE_LCTRL]) ? 5 : 4;
+                } else if (!isGrounded) {
                     playerAnimAction = 3;
                 } else if (glm::length(moveDelta) > 1e-4f) {
                     playerAnimAction = keys[SDL_SCANCODE_LSHIFT] ? 2 : 1;
@@ -1929,7 +1980,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 std::snprintf(titleBuf, sizeof(titleBuf),
                               "CoA Engine | Time: %02d:%02d | %s | [Mode: %s] | Tile:(%d,%d) [%zu ADTs] | Visible MCNK: %d/%d | Visible WMO Groups: %d | Visible M2 Instances: %d | Water: %d | Batched DrawCalls: %zu",
                               hh, mm, underwater ? "UNDERWATER" : "Surface",
-                              walkMode ? "WALK" : "FLY",
+                              walkMode ? (isSwimming ? "SWIM" : "WALK") : "FLY",
                               curTileTitle.x, curTileTitle.y, adtTiles.size(),
                               visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances,
                               visibleWaterChunks, renderQueue.size());

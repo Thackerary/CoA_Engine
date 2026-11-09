@@ -242,7 +242,7 @@ struct M2AnimTrack {
         std::vector<uint32_t> times;
         std::vector<T>        values;
     };
-    std::array<ActionSeq, 4> actionSeqs;
+    std::array<ActionSeq, 6> actionSeqs;
 
     [[nodiscard]] bool HasAnimation() const noexcept {
         if (values.size() > 1 && times.size() >= values.size()) return true;
@@ -310,7 +310,7 @@ struct M2AnimTrack {
     [[nodiscard]] T SampleLinearAction(float timeSec, int actionIdx,
                                        const std::vector<uint32_t>& globalSeqs,
                                        const T& defVal) const noexcept {
-        if (globalSeq < 0 && actionIdx >= 0 && actionIdx < 4) {
+        if (globalSeq < 0 && actionIdx >= 0 && actionIdx < 6) {
             const auto& seq = actionSeqs[actionIdx];
             const size_t n = std::min(seq.times.size(), seq.values.size());
             if (n > 0) {
@@ -342,7 +342,7 @@ struct M2AnimTrack {
         requires std::is_same_v<U, glm::quat>
     [[nodiscard]] glm::quat SampleQuatAction(float timeSec, int actionIdx,
                                              const std::vector<uint32_t>& globalSeqs) const noexcept {
-        if (globalSeq < 0 && actionIdx >= 0 && actionIdx < 4) {
+        if (globalSeq < 0 && actionIdx >= 0 && actionIdx < 6) {
             const auto& seq = actionSeqs[actionIdx];
             const size_t n = std::min(seq.times.size(), seq.values.size());
             if (n > 0) {
@@ -436,7 +436,7 @@ struct GpuM2Model {
     std::vector<RuntimeM2ParticleEmitter> particleEmitters;
 
     // 评估当前时刻整棵骨骼树的枢轴空间蒙皮矩阵，追加到 visibleBoneMatrices 并返回起始下标
-    // actionIdx: 0=Stand, 1=Walk, 2=Run, 3=Jump
+    // actionIdx: 0=Stand, 1=Walk, 2=Run, 3=Jump, 4=SwimIdle, 5=Swim
     uint32_t EvaluateBones(float timeSec, std::vector<glm::mat4>& outBoneBuffer, int actionIdx = 0) const {
         if (!hasAnimatedBones || bones.empty()) return 0;
         const uint32_t baseIdx = static_cast<uint32_t>(outBoneBuffer.size());
@@ -999,9 +999,10 @@ private:
         }
 
         // 额外抽取多动作骨骼序列：Stand(animId 0) / Walk(4) / Run(5) / Jump(38 或 37)
+        // 以及 SwimIdle(41) / Swim(42)
         if (raw.globalSequence < 0 && !sequences.empty()) {
             auto fillAction = [&](size_t seqIdx, int actionSlot) {
-                if (actionSlot < 0 || actionSlot >= 4 || seqIdx >= outerCount) return;
+                if (actionSlot < 0 || actionSlot >= 6 || seqIdx >= outerCount) return;
 
                 const M2Array tsArrA  = tsOuter[seqIdx];
                 const M2Array valArrA = valOuter[seqIdx];
@@ -1023,17 +1024,23 @@ private:
 
             const size_t seqLimit = std::min(outerCount, sequences.size());
             size_t standSeq = seqLimit, walkSeq = seqLimit, runSeq = seqLimit, jumpSeq = seqLimit;
+            size_t swimIdleSeq = seqLimit, swimSeq = seqLimit;
             for (size_t s = 0; s < seqLimit; ++s) {
                 const uint16_t aid = sequences[s].animId;
                 if (aid == 0 && standSeq == seqLimit)                       standSeq = s;
                 else if (aid == 4 && walkSeq == seqLimit)                   walkSeq  = s;
                 else if (aid == 5 && runSeq == seqLimit)                    runSeq   = s;
                 else if ((aid == 38 || aid == 37) && jumpSeq == seqLimit)   jumpSeq  = s;
+                else if (aid == 41 && swimIdleSeq == seqLimit)              swimIdleSeq = s;
+                else if (aid == 42 && swimSeq == seqLimit)                  swimSeq  = s;
             }
             if (standSeq != seqLimit) fillAction(standSeq, 0);
             if (walkSeq  != seqLimit) fillAction(walkSeq,  1);
             if (runSeq   != seqLimit) fillAction(runSeq,   2);
             if (jumpSeq  != seqLimit) fillAction(jumpSeq,  3);
+            if (swimIdleSeq != seqLimit)   fillAction(swimIdleSeq, 4);
+            else if (standSeq != seqLimit) fillAction(standSeq,    4); // 无 SwimIdle (41) 时回退 Stand 踩水
+            if (swimSeq  != seqLimit)      fillAction(swimSeq,     5);
         }
 
         return out;

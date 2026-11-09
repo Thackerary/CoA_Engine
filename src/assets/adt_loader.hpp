@@ -949,6 +949,28 @@ public:
         return true;
     }
 
+    // 方向 L：查询 (worldX, worldY) 处水面表面世界 Z (取该点覆盖范围内最高水面)
+    [[nodiscard]] static bool SampleWaterHeight(const std::vector<GpuAdtTile>& tiles,
+                                                float worldX, float worldY, float& outWaterZ) noexcept
+    {
+        float bestWaterZ = -1e30f;
+        for (const auto& tile : tiles) {
+            // 快速剪枝：跳过远离查询点的 7 块 ADT，仅检测脚下附近的水体
+            if (tile.tileX >= 0 &&
+                DistanceToAdtTile(glm::vec3(worldX, worldY, 0.0f), tile.tileX, tile.tileY) > 25.0f) continue;
+            for (const auto& lc : tile.liquidChunks) {
+                if (worldX >= lc.aabbMin.x && worldX <= lc.aabbMax.x &&
+                    worldY >= lc.aabbMin.y && worldY <= lc.aabbMax.y) {
+                    const float surfaceZ = std::max(lc.aabbMin.z, lc.aabbMax.z - 0.45f);
+                    bestWaterZ = std::max(bestWaterZ, surfaceZ);
+                }
+            }
+        }
+        if (bestWaterZ <= -1e29f) return false;
+        outWaterZ = bestWaterZ;
+        return true;
+    }
+
     // 方向 H：行走模式水平防穿墙检测与贴墙滑动 (Collide-and-Slide)
     // 返回解析后的水平位置；moveDelta 为本帧期望的水平位移增量
     [[nodiscard]] static glm::vec2 ResolveHorizontalCollision(
