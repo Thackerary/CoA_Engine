@@ -313,7 +313,7 @@ vec3 HeightBlend(vec3 baseCol, vec3 overCol, float alpha) {
     return mix(baseCol, overCol, smoothstep(0.0, 1.0, w));
 }
 
-// 3x3 PCF 软阴影：光空间 2048x2048 深度比对 + 越界坐标安全回退
+// 3x3 PCF 软阴影：光空间 4096x4096 深度比对 + 越界坐标安全回退
 float CalcShadow(vec3 worldPos, float ndotl) {
     vec4 lc    = uLightViewProj * vec4(worldPos, 1.0);
     vec2 uv    = lc.xy * 0.5 + 0.5;
@@ -322,19 +322,19 @@ float CalcShadow(vec3 worldPos, float ndotl) {
         return 1.0;
     }
 
-    float bias = max(0.0015 * (1.0 - ndotl), 0.0004);
+    float bias = max(0.0012 * (1.0 - ndotl), 0.00035);
 
     float vis = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            vis += texture(uShadowMap, vec3(uv + vec2(dx, dy) / 3072.0, curD - bias));
+            vis += texture(uShadowMap, vec3(uv + vec2(dx, dy) / 4096.0, curD - bias));
         }
     }
     vis /= 9.0;
 
-    // 35~50 码淡出：阴影盒半径 80 码，因此 50~80 码是 30 码宽的零透明度缓冲带，
-    // 新进入阴影盒的大树/建筑影子总能在缓冲带内从 0% 平滑渐显，杜绝边界处突然蹦出
-    float fade = 1.0 - smoothstep(35.0, 50.0, length(worldPos.xy - uCameraPos.xy));
+    // 115~150 码淡出：阴影盒半径 165 码，因此 150~165 码是 15 码宽的零透明度缓冲带，
+    // 新进入阴影盒的远景树木/建筑影子总能在缓冲带内从 0% 平滑渐显，并与 120 码远景雾衔接
+    float fade = 1.0 - smoothstep(115.0, 150.0, length(worldPos.xy - uCameraPos.xy));
     return mix(1.0, vis, fade * 0.75);
 }
 
@@ -773,7 +773,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
         GLuint shadowTex = 0;
         GLuint shadowFbo = 0;
         glCreateTextures(GL_TEXTURE_2D, 1, &shadowTex);
-        glTextureStorage2D(shadowTex, 1, GL_DEPTH_COMPONENT24, 3072, 3072);
+        glTextureStorage2D(shadowTex, 1, GL_DEPTH_COMPONENT24, 4096, 4096);
         glTextureParameteri(shadowTex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTextureParameteri(shadowTex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
@@ -1235,16 +1235,16 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             // 方向 K：太阳方向阴影正交投影
             // 先在光空间内对锚点做纹素级吸附（消除相机移动时的阴影抖动），
-            // 再把正交中心固定在吸附后的锚点、眼睛沿光轴后退 180 码，
-            // 使 near/far 稳定覆盖 ±80 码半径内的所有投射物，避免深度越界导致整片阴影丢失。
-            // 半径 80 码 + 3072 分辨率：与 45 码 + 1728 纹素密度完全一致 (2*80/3072 = 2*45/1728)，
-            // 在满足 R_caster(80) >= R_fade_end(50) + L_shadow(30) 的同时不降低精度
+            // 再把正交中心固定在吸附后的锚点、眼睛沿光轴后退 300 码，
+            // 使 near/far 稳定覆盖 ±165 码半径内的所有投射物，避免深度越界导致整片阴影丢失。
+            // 半径 165 码 + 4096 分辨率：2*165/4096 ≈ 0.0806 码/纹素，仍优于旧的 2*80/3072 ≈ 0.052，
+            // 在满足 R_caster(165) >= R_fade_end(150) + L_shadow(15) 的同时把阴影覆盖延伸至远景
             {
                 glm::vec3 sunDir = glm::normalize(glm::vec3(
                     lightState.sunDir.x, lightState.sunDir.y, std::max(lightState.sunDir.z, 0.28f)));
 
-                const float kShadowRad = 80.0f;
-                const float texelSize  = (kShadowRad * 2.0f) / 3072.0f;
+                const float kShadowRad = 165.0f;
+                const float texelSize  = (kShadowRad * 2.0f) / 4096.0f;
 
                 const glm::vec3 anchor   = walkMode ? playerPos : camPos;
                 const glm::mat4 lightRot = glm::lookAt(sunDir, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
@@ -1254,9 +1254,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 const glm::vec3 snappedAnchor = glm::vec3(glm::transpose(glm::mat3(lightRot)) * lv);
 
                 const glm::mat4 lightView =
-                    glm::lookAt(snappedAnchor + sunDir * 180.0f, snappedAnchor, glm::vec3(0.0f, 0.0f, 1.0f));
+                    glm::lookAt(snappedAnchor + sunDir * 300.0f, snappedAnchor, glm::vec3(0.0f, 0.0f, 1.0f));
                 const glm::mat4 lightProj =
-                    glm::orthoRH_ZO(-kShadowRad, kShadowRad, -kShadowRad, kShadowRad, 10.0f, 420.0f);
+                    glm::orthoRH_ZO(-kShadowRad, kShadowRad, -kShadowRad, kShadowRad, 10.0f, 650.0f);
                 uboData.lightViewProj = lightProj * lightView;
             }
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
@@ -1341,7 +1341,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     const bool  inView     = IsInstanceVisible(camFrustum, camPos,
                                                                inst.worldBoundsMin, inst.worldBoundsMax,
                                                                inst.worldCenter, inst.worldRadius);
-                    const bool  inShadow   = (inst.worldRadius >= 1.2f && edgeDist <= 80.0f);
+                    const bool  inShadow   = (inst.worldRadius >= 1.2f && edgeDist <= 165.0f);
                     if (!inView && !inShadow) {
                         continue;
                     }
@@ -1550,8 +1550,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.batchColor    = batchColor;
                     cmd.texAlphaMap   = blackAlphaTex.Handle();
                     renderQueue.push_back(cmd);
-                    // 阴影投射：表面距离 (已扣除包围球半径) 落入 80 码阴影盒、且仅不透明/Cutout 通道
-                    if (pass <= 3 && minEdgeDist <= 80.0f) {
+                    // 阴影投射：按模型尺度分级，大物件 (建筑/大树) 投入 165 码远景阴影，
+                    // 小杂物 (草/花/碎石) 仅用 35 码近距阴影，兼顾远景覆盖与高帧率
+                    const float modelSpan       = glm::length(model.localBoundsMax - model.localBoundsMin);
+                    const float maxShadowDist   = (modelSpan >= 2.5f) ? 165.0f : 35.0f;
+                    if (pass <= 3 && minEdgeDist <= maxShadowDist) {
                         shadowQueue.push_back(cmd);
                     }
                 }
@@ -1651,7 +1654,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         // 近距建筑即使完全位于镜头背后（视锥外）也放行，交由 3.2 的距离判断
                         // 决定是否进入阴影队列，避免玩家背对建筑时阴影突然消失
                         const bool wmoNearShadow =
-                            (glm::distance(inst.worldCenter, camPos) <= 90.0f + inst.worldRadius);
+                            (glm::distance(inst.worldCenter, camPos) <= 175.0f + inst.worldRadius);
                         if (!wmoNearShadow &&
                             !camFrustum.IntersectsAABB(inst.worldBoundsMin, inst.worldBoundsMax)) {
                             continue;
@@ -1667,7 +1670,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
                             const bool  inView       = camFrustum.IntersectsAABB(gc.worldBoundsMin, gc.worldBoundsMax);
                             const float grpDist      = glm::distance(gc.worldCenter, camPos);
-                            const bool  inShadowRange = (grpDist <= 85.0f + gc.worldRadius);
+                            const bool  inShadowRange = (grpDist <= 170.0f + gc.worldRadius);
                             if (!inView && !inShadowRange) continue;
 
                             auto ensureBaseInstance = [&]() -> uint32_t {
@@ -1767,7 +1770,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             // ---- 方向 K：太阳方向阴影贴图 Pass (仅 Pass 2/3，先构建深度再恢复反向 Z 主渲染) ----
             glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
-            glViewport(0, 0, 3072, 3072);
+            glViewport(0, 0, 4096, 4096);
             glDepthFunc(GL_LESS);
             glClearDepth(1.0);
             glClear(GL_DEPTH_BUFFER_BIT);
