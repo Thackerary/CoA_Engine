@@ -773,9 +773,17 @@ public:
                 if ((SDL_GetTicksNS() - t0) >= budgetNs) return false;
             }
 
+            // 本帧仅做 Stage 4 收尾：下一帧进入 Stage 5 立即返回 true，
+            // 使主线程能在同一帧内完成 adtTiles.push_back 与 rebuildGlobalM2Buckets，
+            // 彻底消除 globalM2Buckets 中实例指针跨帧悬空的窗口
             c.tile.tileX = c.tileX;
             c.tile.tileY = c.tileY;
             c.stage = 5;
+            return false;
+        }
+
+        // ---- Stage 5: 整块 ADT 已就绪，主线程据此并入 adtTiles 并立即重建合批桶 ----
+        if (c.stage == 5) {
             return true;
         }
 

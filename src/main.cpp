@@ -898,10 +898,10 @@ int main(int /*argc*/, char* /*argv*/[]) {
         // 32_48 保持首位，使初始出生点仍位于北郡
         // 方向 I：基于相机坐标的 3x3 动态 ADT 流式加载与卸载
         std::vector<coa::assets::GpuAdtTile> adtTiles;
+        adtTiles.reserve(32);                  // 预留容量：降低 vector 扩容使实例指针失效的频率
         std::unordered_set<uint32_t> seenUniqueIds;
         std::unordered_set<int> failedAdtKeys; // 键值 = (tileX << 8) | tileY，避免反复重试缺失文件
         float streamCooldown = 0.25f;          // 相邻两次流式加载之间的冷却时间，避免瞬移时卡顿
-        bool  pendingBucketsRebuild = false;   // 合批桶重建推迟到独占帧执行，避免与 GPU 上传叠加
 
         // 方向 I：后台线程纯 CPU 解包 + 主线程每帧 2ms 时间片分步上传 GPU
         std::future<std::optional<coa::assets::AdtLoader::CpuAdtData>> asyncAdtFuture;
@@ -1071,7 +1071,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     // 方向 M：ESC 取消当前选中目标并移除脚下光环
                     currentPick = {};
                 } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT) {
-                    // 方向 M：鼠标左键发射世界空间射线，精确拾取 M2 / WMO 实例
+                    // 方向 M：鼠标左键发射世界空间射线，仅精确拾取场景 NPC 实体
+                    // (背景树木 / 建筑不参与拾取，避免选中光环错位到树冠或整栋建筑)
                     const float mx = ev.button.x;
                     const float my = ev.button.y;
                     const float ndcX = (2.0f * mx) / static_cast<float>(std::max(1, winW)) - 1.0f;
@@ -1094,9 +1095,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         + pickRight * (ndcX * tanHalfFov * pickAspect)
                         + pickUp * (ndcY * tanHalfFov));
 
-                    currentPick = coa::assets::AdtLoader::PickObjectByRay(adtTiles, camPos, rayDir, 250.0f);
+                    currentPick = {};
 
-                    // 地标 NPC 拾取：局部盒 [-0.8,-0.8,0] ~ [0.8,0.8,2.1]，命中且更近时优先选中
+                    // 地标 NPC 拾取：局部盒 [-0.8,-0.8,0] ~ [0.8,0.8,2.1]，取沿射线最近的命中
                     for (const auto& npc : landmarkNpcs) {
                         if (!npc.visible) continue;
                         const glm::vec3 bmin = npc.worldPos + glm::vec3(-0.8f, -0.8f, 0.0f);
@@ -1131,12 +1132,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
 
                     if (currentPick.hit) {
-                        std::printf("[Picker] Selected %s (ID:%u, dist:%.1f, radius:%.1f): %s\n",
-                                    currentPick.isWmo ? "WMO" : "M2", currentPick.uniqueId,
+                        std::printf("[Picker] Selected NPC (dist:%.1f, radius:%.1f): %s\n",
                                     currentPick.distance, currentPick.radius,
                                     currentPick.modelPath.c_str());
                     } else {
-                        std::printf("[Picker] No object hit (max 250 yards).\n");
+                        std::printf("[Picker] No NPC hit (max 250 yards).\n");
                     }
                 } else if (ev.type == SDL_EVENT_KEY_DOWN &&
                            ev.key.scancode >= SDL_SCANCODE_F1 &&
@@ -1322,49 +1322,49 @@ int main(int /*argc*/, char* /*argv*/[]) {
             {
                 const glm::ivec2 curTile = coa::assets::AdtLoader::WorldToAdtIndex(camPos);
 
-                // 合批桶重建独占整帧：本帧优先重建，且不再叠加执行 ADT 分步 GPU 上传
-                const bool rebuildingBuckets = pendingBucketsRebuild;
-                if (rebuildingBuckets) {
-                    rebuildGlobalM2Buckets();
-                    pendingBucketsRebuild = false;
-                }
-
                 // 冷却计时：相邻两次流式加载之间至少间隔一段时间，避免瞬移时集中解码造成卡顿
                 streamCooldown -= dt;
                 if (streamCooldown < 0.0f) streamCooldown = 0.0f;
 
+                // 本帧是否已执行过"卸载 / 并入"操作：两者互斥，避免单帧叠加过多工作
+                bool didUnloadOrMerge = false;
+
                 // 1. 渐进式卸载超出 580 码的区块：每帧最多释放 32 张遮罩纹理，或彻底卸载 1 个区块，
                 //    避免单帧析构大量 GL 纹理与合批桶重建叠加造成明显卡顿
-                if (!rebuildingBuckets) {
-                    for (auto it = adtTiles.begin(); it != adtTiles.end();) {
-                        const bool valid = (it->tileX >= 0 && it->tileY >= 0);
-                        const float dist = valid
-                            ? coa::assets::AdtLoader::DistanceToAdtTile(camPos, it->tileX, it->tileY)
-                            : 0.0f;
-                        if (valid && dist > 580.0f) {
-                            if (it->alphaTextures.size() > 32) {
-                                // 仅弹出末尾 32 张遮罩纹理，纹理析构开销摊薄到多帧
-                                it->alphaTextures.resize(it->alphaTextures.size() - 32);
-                                break;
-                            }
-                            for (uint32_t uid : it->ownedUniqueIds) seenUniqueIds.erase(uid);
-                            adtTiles.erase(it);
-                            pendingBucketsRebuild = true; // 推迟到下一帧独占重建合批桶
-                            break;                        // 每帧最多彻底卸载 1 个区块
+                for (auto it = adtTiles.begin(); it != adtTiles.end();) {
+                    const bool valid = (it->tileX >= 0 && it->tileY >= 0);
+                    const float dist = valid
+                        ? coa::assets::AdtLoader::DistanceToAdtTile(camPos, it->tileX, it->tileY)
+                        : 0.0f;
+                    if (valid && dist > 580.0f) {
+                        if (it->alphaTextures.size() > 32) {
+                            // 仅弹出末尾 32 张遮罩纹理，纹理析构开销摊薄到多帧
+                            it->alphaTextures.resize(it->alphaTextures.size() - 32);
+                            break;
                         }
-                        ++it;
+                        for (uint32_t uid : it->ownedUniqueIds) seenUniqueIds.erase(uid);
+                        adtTiles.erase(it);
+                        // 立即在当前帧重建合批桶：erase 会使其后所有 GpuAdtTile 前移，
+                        // globalM2Buckets 中的实例指针必须马上刷新，绝不跨帧悬空
+                        rebuildGlobalM2Buckets();
+                        didUnloadOrMerge = true;
+                        break; // 每帧最多彻底卸载 1 个区块
                     }
+                    ++it;
                 }
 
                 // 2. 主线程分步 GPU 上传：每帧最多消耗 0.45ms，避免贴图解码 / 建缓冲造成掉帧
-                if (pendingAdtCpu.has_value()) {
-                    if (!rebuildingBuckets &&
-                        coa::assets::AdtLoader::StepFinalizeAdtGpu(
+                if (didUnloadOrMerge) {
+                    // 本帧已执行卸载 / 并入：跳过后续 GPU 上传与后台轮询，避免单帧叠加过多工作
+                } else if (pendingAdtCpu.has_value()) {
+                    if (coa::assets::AdtLoader::StepFinalizeAdtGpu(
                             *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 450'000ULL)) {
                         adtTiles.push_back(std::move(pendingAdtCpu->tile));
                         pendingAdtCpu.reset();
                         loadingTx = loadingTy = -1;
-                        pendingBucketsRebuild = true; // 推迟到下一帧独占重建合批桶
+                        // 立即在当前帧重建合批桶：push_back 可能触发 vector 扩容，
+                        // 旧实例指针必须马上刷新，否则渲染阶段会解引用悬空地址闪退
+                        rebuildGlobalM2Buckets();
                     }
                 } else if (asyncAdtFuture.valid()) {
                     // 2.1 非阻塞轮询后台 CPU 解包任务
