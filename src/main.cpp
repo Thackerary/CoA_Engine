@@ -872,6 +872,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::unordered_set<uint32_t> seenUniqueIds;
         std::unordered_set<int> failedAdtKeys; // 键值 = (tileX << 8) | tileY，避免反复重试缺失文件
         float streamCooldown = 0.25f;          // 相邻两次流式加载之间的冷却时间，避免瞬移时卡顿
+        bool  pendingBucketsRebuild = false;   // 合批桶重建推迟到独占帧执行，避免与 GPU 上传叠加
 
         // 方向 I：后台线程纯 CPU 解包 + 主线程每帧 2ms 时间片分步上传 GPU
         std::future<std::optional<coa::assets::AdtLoader::CpuAdtData>> asyncAdtFuture;
@@ -913,9 +914,6 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
                 }
             }
-            std::printf("[Global Batcher] Merged M2 across %zu ADTs into %zu unique buckets (VRAM Cache: %zu M2, %zu WMO, %zu BLP)\n",
-                        adtTiles.size(), globalM2Buckets.size(),
-                        assets.CachedM2Count(), assets.CachedWmoCount(), assets.CachedTextureCount());
         };
 
         // 初始仅加载出生点所在的北郡 (32, 48)，其余区块由主循环按 3x3 视野动态流式加载
@@ -1155,41 +1153,50 @@ int main(int /*argc*/, char* /*argv*/[]) {
             // ---- 方向 I：基于真实距离的 ADT 流式加载与卸载 ----
             {
                 const glm::ivec2 curTile = coa::assets::AdtLoader::WorldToAdtIndex(camPos);
-                bool bucketsDirty = false;
+
+                // 合批桶重建独占整帧：本帧优先重建，且不再叠加执行 ADT 分步 GPU 上传
+                const bool rebuildingBuckets = pendingBucketsRebuild;
+                if (rebuildingBuckets) {
+                    rebuildGlobalM2Buckets();
+                    pendingBucketsRebuild = false;
+                }
 
                 // 冷却计时：相邻两次流式加载之间至少间隔一段时间，避免瞬移时集中解码造成卡顿
                 streamCooldown -= dt;
                 if (streamCooldown < 0.0f) streamCooldown = 0.0f;
 
-                // 1. 卸载超出 580 码的区块，并归还其占用的全局唯一 ID
-                for (auto it = adtTiles.begin(); it != adtTiles.end();) {
-                    const bool valid = (it->tileX >= 0 && it->tileY >= 0);
-                    const float dist = valid
-                        ? coa::assets::AdtLoader::DistanceToAdtTile(camPos, it->tileX, it->tileY)
-                        : 0.0f;
-                    if (valid && dist > 580.0f) {
-                        const int unloadX = it->tileX;
-                        const int unloadY = it->tileY;
-                        for (uint32_t uid : it->ownedUniqueIds) seenUniqueIds.erase(uid);
-                        it = adtTiles.erase(it);
-                        bucketsDirty = true;
-                        std::printf("[ADT Streamer] Unloaded azeroth_%d_%d.adt (Remaining: %zu)\n",
-                                    unloadX, unloadY, adtTiles.size());
-                    } else {
+                // 1. 渐进式卸载超出 580 码的区块：每帧最多释放 32 张遮罩纹理，或彻底卸载 1 个区块，
+                //    避免单帧析构大量 GL 纹理与合批桶重建叠加造成明显卡顿
+                if (!rebuildingBuckets) {
+                    for (auto it = adtTiles.begin(); it != adtTiles.end();) {
+                        const bool valid = (it->tileX >= 0 && it->tileY >= 0);
+                        const float dist = valid
+                            ? coa::assets::AdtLoader::DistanceToAdtTile(camPos, it->tileX, it->tileY)
+                            : 0.0f;
+                        if (valid && dist > 580.0f) {
+                            if (it->alphaTextures.size() > 32) {
+                                // 仅弹出末尾 32 张遮罩纹理，纹理析构开销摊薄到多帧
+                                it->alphaTextures.resize(it->alphaTextures.size() - 32);
+                                break;
+                            }
+                            for (uint32_t uid : it->ownedUniqueIds) seenUniqueIds.erase(uid);
+                            adtTiles.erase(it);
+                            pendingBucketsRebuild = true; // 推迟到下一帧独占重建合批桶
+                            break;                        // 每帧最多彻底卸载 1 个区块
+                        }
                         ++it;
                     }
                 }
 
-                // 2. 主线程分步 GPU 上传：每帧最多消耗 2ms，避免贴图解码 / 建缓冲造成掉帧
+                // 2. 主线程分步 GPU 上传：每帧最多消耗 0.45ms，避免贴图解码 / 建缓冲造成掉帧
                 if (pendingAdtCpu.has_value()) {
-                    if (coa::assets::AdtLoader::StepFinalizeAdtGpu(
-                            *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 600'000ULL)) {
+                    if (!rebuildingBuckets &&
+                        coa::assets::AdtLoader::StepFinalizeAdtGpu(
+                            *pendingAdtCpu, assets, whiteFallbackTex.Handle(), 450'000ULL)) {
                         adtTiles.push_back(std::move(pendingAdtCpu->tile));
                         pendingAdtCpu.reset();
                         loadingTx = loadingTy = -1;
-                        bucketsDirty = true;
-                        std::printf("[ADT Streamer] Finalized azeroth_%d_%d.adt (Loaded: %zu)\n",
-                                    adtTiles.back().tileX, adtTiles.back().tileY, adtTiles.size());
+                        pendingBucketsRebuild = true; // 推迟到下一帧独占重建合批桶
                     }
                 } else if (asyncAdtFuture.valid()) {
                     // 2.1 非阻塞轮询后台 CPU 解包任务
@@ -1254,8 +1261,6 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
                 }
 
-                // 4. 本帧发生加载或卸载：重建 M2 合批桶
-                if (bucketsDirty) rebuildGlobalM2Buckets();
             }
 
             if (keys[SDL_SCANCODE_LEFTBRACKET])  gameTimeHalfMin -= 360.0f * dt;

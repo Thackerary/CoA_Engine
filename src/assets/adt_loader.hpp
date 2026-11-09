@@ -255,6 +255,7 @@ public:
         std::vector<uint16_t>      liquidIndices;
         std::vector<std::string>   mtexPaths;
         std::vector<ChunkAlphaCpu> chunkAlphas;
+        std::vector<std::string>   preloadTexPaths; // 去重后的 MTEX / MOTX / M2 贴图清单，供主线程逐张预上传
 
         std::unordered_map<std::string, std::vector<DoodadPlacement>>     doodadGroups;
         std::vector<std::pair<std::string, std::vector<WmoPlacement>>>    wmoList;
@@ -465,6 +466,89 @@ public:
         for (auto& [wmoPath, placements] : wmoGroups) {
             cpu.wmoList.emplace_back(wmoPath, std::move(placements));
         }
+
+        // 5. 后台预读磁盘并提取全部贴图清单 (纯 CPU，绝不触碰 OpenGL / AssetManager)。
+        //    主线程随后逐张预上传，使 WMO / M2 加载阶段不再触发突发贴图解码，杜绝跨越地点时的卡顿。
+        {
+            std::unordered_set<std::string> uniqueTex;
+            uniqueTex.reserve(mtexPaths.size() + 128);
+
+            // 5.1 地表 MTEX 贴图
+            for (const auto& rawPath : mtexPaths) {
+                std::string norm = vfs::VirtualFileSystem::NormalizeVirtualPath(rawPath);
+                if (!norm.empty()) uniqueTex.insert(std::move(norm));
+            }
+
+            // 5.2 WMO：预读 root 文件，扫描顶层 IFF 块取 MOTX 内全部贴图路径
+            for (const auto& wmoItem : cpu.wmoList) {
+                auto wmoBytes = vfs.ReadFile(wmoItem.first);
+                if (!wmoBytes || wmoBytes->size() < 8) continue;
+                std::span<const uint8_t> wb(*wmoBytes);
+
+                size_t wmoCursor = 0;
+                while (wmoCursor + 8 <= wb.size()) {
+                    uint32_t magic = 0, size = 0;
+                    std::memcpy(&magic, wb.data() + wmoCursor, 4);
+                    std::memcpy(&size,  wb.data() + wmoCursor + 4, 4);
+                    const size_t dataStart = wmoCursor + 8;
+                    if (dataStart + size > wb.size()) break;
+
+                    if (magic == FourCC("MOTX")) {
+                        std::vector<std::string> wmoTexPaths;
+                        ParseNullTerminatedStrings(wb.subspan(dataStart, size), wmoTexPaths);
+                        for (auto& rawPath : wmoTexPaths) {
+                            std::string norm = vfs::VirtualFileSystem::NormalizeVirtualPath(rawPath);
+                            if (norm.empty()) continue;
+                            if (uniqueTex.insert(norm).second) {
+                                vfs.ReadFile(norm); // 预热 OS 磁盘缓存
+                            }
+                        }
+                    }
+                    wmoCursor = dataStart + size;
+                }
+            }
+
+            // 5.3 M2：预读模型与 00.skin，解析 MD20.textures 中的硬编码贴图 (type == 0)
+            for (const auto& m2Item : cpu.doodadGroups) {
+                const std::string& m2Path = m2Item.first;
+                auto m2Bytes = vfs.ReadFile(m2Path);
+                if (m2Path.size() >= 3) {
+                    vfs.ReadFile(m2Path.substr(0, m2Path.size() - 3) + "00.skin");
+                }
+                if (!m2Bytes || m2Bytes->size() < sizeof(M2HeaderV264)) continue;
+                std::span<const uint8_t> mb(*m2Bytes);
+
+                // 兼容可选的 MD21 外层包装：跳过 8 字节头后再匹配 MD20
+                size_t hdrOfs = 0;
+                if (mb.size() >= 12 && std::memcmp(mb.data(), "MD21", 4) == 0) hdrOfs = 8;
+                if (hdrOfs + sizeof(M2HeaderV264) > mb.size()) continue;
+                if (std::memcmp(mb.data() + hdrOfs, "MD20", 4) != 0) continue;
+
+                M2HeaderV264 hdr{};
+                std::memcpy(&hdr, mb.data() + hdrOfs, sizeof(M2HeaderV264));
+                if (hdr.textures.count == 0 || hdr.textures.count > 4096) continue;
+                const size_t texBytes = static_cast<size_t>(hdr.textures.count) * sizeof(M2TextureDef);
+                if (hdrOfs + hdr.textures.offset + texBytes > mb.size()) continue;
+
+                const auto* defs = reinterpret_cast<const M2TextureDef*>(mb.data() + hdrOfs + hdr.textures.offset);
+                for (uint32_t ti = 0; ti < hdr.textures.count; ++ti) {
+                    if (defs[ti].type != 0 || defs[ti].filename.count == 0) continue;
+                    const size_t strOfs = hdrOfs + defs[ti].filename.offset;
+                    if (strOfs >= mb.size()) continue;
+
+                    std::string norm = vfs::VirtualFileSystem::NormalizeVirtualPath(
+                        reinterpret_cast<const char*>(mb.data() + strOfs));
+                    if (norm.empty()) continue;
+                    if (uniqueTex.insert(norm).second) {
+                        vfs.ReadFile(norm); // 预热 OS 磁盘缓存
+                    }
+                }
+            }
+
+            cpu.preloadTexPaths.reserve(uniqueTex.size());
+            for (auto& tp : uniqueTex) cpu.preloadTexPaths.push_back(std::move(tp));
+        }
+
         return cpu;
     }
 
@@ -499,8 +583,20 @@ public:
             return false; // Stage 0 已用掉本帧预算，贴图上传留到下一帧
         }
 
-        // ---- Stage 1: 分批解码 MCNK 地面贴图与 64x64 Alpha 遮罩 ----
+        // ---- Stage 1: 逐张预上传 BLP 贴图 (预算精确到单张贴图，杜绝集中解码卡顿) ----
         if (c.stage == 1) {
+            while (c.cursor < c.preloadTexPaths.size()) {
+                assets.GetOrLoadTexture(c.preloadTexPaths[c.cursor++], true);
+                if ((SDL_GetTicksNS() - t0) >= budgetNs) return false;
+            }
+            std::vector<std::string>().swap(c.preloadTexPaths);
+            c.stage  = 2;
+            c.cursor = 0;
+            return false; // 贴图已全部进缓存，地形遮罩上传留到下一帧
+        }
+
+        // ---- Stage 2: 分批解码 MCNK 地面贴图与 64x64 Alpha 遮罩 ----
+        if (c.stage == 2) {
             const size_t chunkCount = std::min(c.tile.chunks.size(), c.chunkAlphas.size());
             while (c.cursor < chunkCount) {
                 const size_t i = c.cursor;
@@ -529,13 +625,13 @@ public:
                 ++c.cursor;
                 if ((SDL_GetTicksNS() - t0) >= budgetNs) return false;
             }
-            c.stage  = 2;
+            c.stage  = 3;
             c.cursor = 0;
-            return false; // Stage 1 已用掉本帧预算，WMO 加载留到下一帧
+            return false; // Stage 2 已用掉本帧预算，WMO 加载留到下一帧
         }
 
-        // ---- Stage 2: 分批加载 WMO 建筑，并展开其 MODD 家具到 M2 待加载队列 ----
-        if (c.stage == 2) {
+        // ---- Stage 3: 分批加载 WMO 建筑，并展开其 MODD 家具到 M2 待加载队列 ----
+        if (c.stage == 3) {
             while (c.cursor < c.wmoList.size()) {
                 auto& item = c.wmoList[c.cursor];
                 auto& placements = item.second;
@@ -599,13 +695,13 @@ public:
             }
             c.doodadGroups.clear();
 
-            c.stage  = 3;
+            c.stage  = 4;
             c.cursor = 0;
-            return false; // 绝不在同一帧穿透到 Stage 3
+            return false; // 绝不在同一帧穿透到 Stage 4
         }
 
-        // ---- Stage 3: 分批加载 M2 装饰物，逐实例预计算世界空间 AABB ----
-        if (c.stage == 3) {
+        // ---- Stage 4: 分批加载 M2 装饰物，逐实例预计算世界空间 AABB ----
+        if (c.stage == 4) {
             while (c.cursor < c.m2List.size()) {
                 auto& item = c.m2List[c.cursor];
 
@@ -637,10 +733,7 @@ public:
 
             c.tile.tileX = c.tileX;
             c.tile.tileY = c.tileY;
-            c.stage = 4;
-            std::printf("[ADT Loader] Finalized %zu MCNK chunks, %zu M2 types | Global VRAM Pool: %zu M2, %zu WMO\n",
-                        c.tile.chunks.size(), c.tile.doodadBatches.size(),
-                        assets.CachedM2Count(), assets.CachedWmoCount());
+            c.stage = 5;
             return true;
         }
 
