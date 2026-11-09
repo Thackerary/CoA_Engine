@@ -48,7 +48,8 @@ struct alignas(16) FrameUniforms {
     glm::vec4 skyHorizon;         // rgb = 地平线色
     glm::vec4 waterShallow;       // rgb = 动态浅水色
     glm::vec4 waterDeep;          // rgb = 动态深水色
-    glm::mat4 lightViewProj;      // 太阳方向阴影正交光视图投影矩阵
+    glm::mat4 lightViewProj;      // 近景级联阴影光视图投影矩阵 (58 码 / 2048)
+    glm::mat4 lightViewProjFar;   // 远景级联阴影光视图投影矩阵 (320 码 / 1024，每 6 帧缓存更新)
 };
 
 // 单个公告板粒子的 GPU 实例数据 (48 字节，std430 紧凑排布，对应 kParticleVertShader)
@@ -157,6 +158,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 out vec4 FragColor;
@@ -226,6 +228,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 layout(std430, binding = 0) readonly buffer InstanceBuffer {
@@ -277,7 +280,8 @@ layout(binding = 1) uniform sampler2D uTexLayer1;   // 地形 Layer 1
 layout(binding = 2) uniform sampler2D uTexLayer2;   // 地形 Layer 2
 layout(binding = 3) uniform sampler2D uTexLayer3;   // 地形 Layer 3
 layout(binding = 4) uniform sampler2D uTexAlphaMap; // 64x64 RGB Alpha 遮罩 (M2 模型绑定全黑纹理，alpha=0)
-layout(binding = 5) uniform sampler2DShadow uShadowMap; // 太阳方向 3072x3072 实时阴影贴图 (硬件比较 + 双线性)
+layout(binding = 5) uniform sampler2DShadow uShadowMap;    // 近景级联 2048x2048 实时阴影 (硬件比较 + 双线性)
+layout(binding = 6) uniform sampler2DShadow uShadowMapFar; // 远景级联 1024x1024 缓存阴影 (5 点十字采样)
 
 layout(location = 0) uniform int  uAlphaCutout;   // 0 = Opaque, 1 = Cutout, 2 = Blend, 3 = UV Scroll
 layout(location = 1) uniform int  uMaterialFlags; // bit 0 = TwoSided, bit 1 = Unlit
@@ -300,6 +304,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 out vec4 FragColor;
@@ -313,38 +318,67 @@ vec3 HeightBlend(vec3 baseCol, vec3 overCol, float alpha) {
     return mix(baseCol, overCol, smoothstep(0.0, 1.0, w));
 }
 
-// 3x3 PCF 软阴影：光空间 4096x4096 深度比对 + 越界坐标安全回退
+// 双级联软阴影：近景 2048 高清 3x3 PCF + 远景 1024 极速 5 点十字采样，44~56 码平滑混合
 float CalcShadow(vec3 worldPos, float ndotl) {
-    vec4 lc    = uLightViewProj * vec4(worldPos, 1.0);
-    vec2 uv    = lc.xy * 0.5 + 0.5;
-    float curD = lc.z;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || curD <= 0.0 || curD >= 1.0) {
-        return 1.0;
-    }
+    float dXY = length(worldPos.xy - uCameraPos.xy);
 
-    float bias = max(0.0012 * (1.0 - ndotl), 0.00035);
+    // 260~320 码淡出：远景阴影盒半径 320 码，末端留 60 码缓冲带与远景雾无缝衔接
+    float fade = 1.0 - smoothstep(260.0, 320.0, dXY);
+    if (fade <= 0.0) return 1.0;
 
-    float vis = 0.0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            vis += texture(uShadowMap, vec3(uv + vec2(dx, dy) / 4096.0, curD - bias));
+    // ---- 近景级联：58 码半径 / 2048 贴图，3x3 PCF ----
+    float visNear = 1.0;
+    if (dXY < 56.0) {
+        vec4  lc    = uLightViewProj * vec4(worldPos, 1.0);
+        vec2  uv    = lc.xy * 0.5 + 0.5;
+        float curD  = lc.z;
+        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 && curD > 0.0 && curD < 1.0) {
+            float bias = max(0.0015 * (1.0 - ndotl), 0.0004);
+            float vis = 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    vis += texture(uShadowMap, vec3(uv + vec2(dx, dy) / 2048.0, curD - bias));
+                }
+            }
+            visNear = vis / 9.0;
         }
     }
-    vis /= 9.0;
 
-    // 115~150 码淡出：阴影盒半径 165 码，因此 150~165 码是 15 码宽的零透明度缓冲带，
-    // 新进入阴影盒的远景树木/建筑影子总能在缓冲带内从 0% 平滑渐显，并与 120 码远景雾衔接
-    float fade = 1.0 - smoothstep(115.0, 150.0, length(worldPos.xy - uCameraPos.xy));
+    // ---- 远景级联：320 码半径 / 1024 贴图，仅中心 + 上下左右共 5 次硬件比较 ----
+    float visFar = 1.0;
+    if (dXY > 44.0) {
+        vec4  lc    = uLightViewProjFar * vec4(worldPos, 1.0);
+        vec2  uv    = lc.xy * 0.5 + 0.5;
+        float curD  = lc.z;
+        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 && curD > 0.0 && curD < 1.0) {
+            const float bias = 0.0025;
+            const vec2  off  = vec2(1.5 / 1024.0, 0.0);
+            float vis = texture(uShadowMapFar, vec3(uv, curD - bias));
+            vis += texture(uShadowMapFar, vec3(uv + off,  curD - bias));
+            vis += texture(uShadowMapFar, vec3(uv - off,  curD - bias));
+            vis += texture(uShadowMapFar, vec3(uv + off.yx, curD - bias));
+            vis += texture(uShadowMapFar, vec3(uv - off.yx, curD - bias));
+            visFar = vis / 5.0;
+        }
+    }
+
+    float cascadeBlend = smoothstep(44.0, 56.0, dXY);
+    float vis = (dXY <= 44.0) ? visNear : ((dXY >= 56.0) ? visFar : mix(visNear, visFar, cascadeBlend));
     return mix(1.0, vis, fade * 0.75);
 }
 
 void main() {
-    vec4 texColor = texture(uTexAlbedo, vUV);
+    // 远景景深 (DoF)：超过 55 码后逐级提升 Mip 采样偏置，模拟空气透视并抹掉远景高频闪烁
+    float dist    = length(vWorldPos - uCameraPos.xyz);
+    float dofBlur = smoothstep(55.0, 210.0, dist);
+    float lodBias = dofBlur * 2.6;
+
+    vec4 texColor = texture(uTexAlbedo, vUV, lodBias);
     vec3 alphaWeights = texture(uTexAlphaMap, clamp(vUV / 8.0, 0.0, 1.0)).rgb;
     if (dot(alphaWeights, vec3(1.0)) > 0.001) {
-        vec3 c1 = texture(uTexLayer1, vUV).rgb;
-        vec3 c2 = texture(uTexLayer2, vUV).rgb;
-        vec3 c3 = texture(uTexLayer3, vUV).rgb;
+        vec3 c1 = texture(uTexLayer1, vUV, lodBias).rgb;
+        vec3 c2 = texture(uTexLayer2, vUV, lodBias).rgb;
+        vec3 c3 = texture(uTexLayer3, vUV, lodBias).rgb;
         texColor.rgb = HeightBlend(texColor.rgb, c1, alphaWeights.r);
         texColor.rgb = HeightBlend(texColor.rgb, c2, alphaWeights.g);
         texColor.rgb = HeightBlend(texColor.rgb, c3, alphaWeights.b);
@@ -371,7 +405,8 @@ void main() {
         vec3 r2 = cross(N, dPdx);
         float det = dot(dPdx, r1);
         vec3 surfGrad = (abs(det) > 1e-8) ? ((r1 * dFdx(height) + r2 * dFdy(height)) / det) : vec3(0.0);
-        N = normalize(N - surfGrad * 0.04);
+        // 远景随景深淡出法线扰动，避免远处像素导数噪点在模糊后仍然闪烁
+        N = normalize(N - surfGrad * 0.04 * (1.0 - dofBlur));
 
         vec3 L = normalize(uSunDirAndIntensity.xyz);
         vec3 V = normalize(uCameraPos.xyz - vWorldPos);
@@ -379,7 +414,7 @@ void main() {
 
         float ndotl = max(dot(N, L), 0.0);
         float halfLambert = ndotl * 0.65 + 0.35;
-        float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.04 * ndotl;
+        float spec = pow(max(dot(N, H), 0.0), 24.0) * height * 0.04 * ndotl * (1.0 - dofBlur);
 
         vec3 skyAmbient    = uAmbientSky.rgb;
         vec3 groundAmbient = uAmbientGround.rgb;
@@ -392,7 +427,6 @@ void main() {
                  + sunColor * spec * shadowFactor;
     }
 
-    float dist = length(vWorldPos - uCameraPos.xyz);
     float fogFactor = clamp(exp(-max(dist - uFogColorAndParams.w, 0.0) * uSkyTopAndDensity.w), 0.0, 1.0);
     vec3 fogColor = uFogColorAndParams.rgb;
 
@@ -425,6 +459,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 layout(std430, binding = 0) readonly buffer InstanceBuffer {
@@ -469,6 +504,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 out vec4 FragColor;
@@ -564,6 +600,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 out vec2 vUV;
@@ -625,6 +662,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 out vec4 FragColor;
@@ -679,6 +717,7 @@ layout(std140, binding = 0) uniform FrameBlock {
     vec4 uWaterShallow;
     vec4 uWaterDeep;
     mat4 uLightViewProj;
+    mat4 uLightViewProjFar;
 };
 
 layout(std430, binding = 0) readonly buffer InstanceBuffer {
@@ -769,25 +808,37 @@ int main(int /*argc*/, char* /*argv*/[]) {
         GLuint skyVao      = 0;
         glCreateVertexArrays(1, &skyVao);
 
-        // ---- 太阳方向 3072x3072 实时阴影贴图 (仅深度) ----
-        GLuint shadowTex = 0;
-        GLuint shadowFbo = 0;
-        glCreateTextures(GL_TEXTURE_2D, 1, &shadowTex);
-        glTextureStorage2D(shadowTex, 1, GL_DEPTH_COMPONENT24, 4096, 4096);
-        glTextureParameteri(shadowTex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTextureParameteri(shadowTex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
-        glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-        // 硬件深度比较 + 双线性过滤：每次采样即 2x2 纹素软过渡，消除阴影边缘方块锯齿
-        glTextureParameteri(shadowTex, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
-        glTextureParameteri(shadowTex, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
-        const float shadowBorder[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-        glTextureParameterfv(shadowTex, GL_TEXTURE_BORDER_COLOR, shadowBorder);
+        // ---- 双级联实时阴影贴图 (仅深度)：近景 2048 写实 + 远景 1024 极低开销 ----
+        auto CreateShadowTexture = [](GLuint& tex, GLuint& fbo, GLsizei size) {
+            glCreateTextures(GL_TEXTURE_2D, 1, &tex);
+            glTextureStorage2D(tex, 1, GL_DEPTH_COMPONENT24, size, size);
+            glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+            glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+            // 硬件深度比较 + 双线性过滤：每次采样即 2x2 纹素软过渡，消除阴影边缘方块锯齿
+            glTextureParameteri(tex, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+            glTextureParameteri(tex, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+            const float border[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            glTextureParameterfv(tex, GL_TEXTURE_BORDER_COLOR, border);
 
-        glCreateFramebuffers(1, &shadowFbo);
-        glNamedFramebufferTexture(shadowFbo, GL_DEPTH_ATTACHMENT, shadowTex, 0);
-        glNamedFramebufferDrawBuffer(shadowFbo, GL_NONE);
-        glNamedFramebufferReadBuffer(shadowFbo, GL_NONE);
+            glCreateFramebuffers(1, &fbo);
+            glNamedFramebufferTexture(fbo, GL_DEPTH_ATTACHMENT, tex, 0);
+            glNamedFramebufferDrawBuffer(fbo, GL_NONE);
+            glNamedFramebufferReadBuffer(fbo, GL_NONE);
+        };
+
+        GLuint shadowTex    = 0, shadowTexFar = 0;
+        GLuint shadowFbo    = 0, shadowFboFar = 0;
+        CreateShadowTexture(shadowTex, shadowFbo, 2048);
+        CreateShadowTexture(shadowTexFar, shadowFboFar, 1024);
+
+        // 远景级联在首个可用刷新帧之前先清成「全亮」(深度 1.0)，避免采样到未定义深度而整屏变黑
+        glClearDepth(1.0);
+        glBindFramebuffer(GL_FRAMEBUFFER, shadowFboFar);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glClearDepth(0.0); // 恢复反向 Z 主渲染的默认清屏值
 
         // 每帧动态上传可见实例矩阵的 SSBO (binding = 0) 与 M2 骨骼蒙皮矩阵的 SSBO (binding = 1)
         coa::rhi::GlBuffer instanceSsbo(sizeof(glm::mat4), nullptr, GL_DYNAMIC_STORAGE_BIT);
@@ -921,6 +972,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::vector<coa::rhi::DrawCommand> renderQueue;
         // 独立轻量阴影队列：不含 MCNK 地形，仅收纳阴影半径内近处 M2/角色/WMO 批次
         std::vector<coa::rhi::DrawCommand> shadowQueue;
+        // 远景级联阴影队列：仅大尺寸投射物，且每 6 帧才真正渲染一次
+        std::vector<coa::rhi::DrawCommand> shadowFarQueue;
+        // M2 实例按阴影级联距离分片排列的复用缓冲，跨帧保留容量避免反复分配
+        std::vector<glm::mat4> nearMats;
+        std::vector<glm::mat4> farMats;
+        std::vector<glm::mat4> viewOnlyMats;
+        glm::mat4 lastLightViewProjFar(1.0f); // 远景级联矩阵缓存，非刷新帧直接沿用
+        uint32_t  frameCounter = 0;
         std::vector<glm::mat4> visibleMatrices;
         std::vector<glm::mat4> visibleBoneMatrices;
         std::vector<GpuParticleQuad>  visibleParticles;
@@ -1233,31 +1292,51 @@ int main(int /*argc*/, char* /*argv*/[]) {
             uboData.waterShallow       = glm::vec4(lightState.riverShallow, 1.0f);
             uboData.waterDeep          = glm::vec4(lightState.riverDeep, 1.0f);
 
-            // 方向 K：太阳方向阴影正交投影
-            // 先在光空间内对锚点做纹素级吸附（消除相机移动时的阴影抖动），
-            // 再把正交中心固定在吸附后的锚点、眼睛沿光轴后退 300 码，
-            // 使 near/far 稳定覆盖 ±165 码半径内的所有投射物，避免深度越界导致整片阴影丢失。
-            // 半径 165 码 + 4096 分辨率：2*165/4096 ≈ 0.0806 码/纹素，仍优于旧的 2*80/3072 ≈ 0.052，
-            // 在满足 R_caster(165) >= R_fade_end(150) + L_shadow(15) 的同时把阴影覆盖延伸至远景
+            // 方向 K：双级联太阳方向阴影正交投影
+            // 近景级联：58 码半径 + 2048 分辨率 (2*58/2048 ≈ 0.0566 码/纹素)，每帧刷新保证清晰度
+            // 远景级联：320 码半径 + 1024 分辨率，每 6 帧才重算矩阵并重绘一次，开销趋近于零
+            // 两级联均在光空间内对锚点做纹素级吸附，消除相机平移时的阴影蠕动
             {
                 glm::vec3 sunDir = glm::normalize(glm::vec3(
                     lightState.sunDir.x, lightState.sunDir.y, std::max(lightState.sunDir.z, 0.28f)));
 
-                const float kShadowRad = 165.0f;
-                const float texelSize  = (kShadowRad * 2.0f) / 4096.0f;
+                ++frameCounter;
+                // 远景级联刷新节奏：首两帧立即构建，其后每 6 帧一次；ADT 分步上传期间跳过以免抢帧
+                const bool updateFarShadow = ((frameCounter % 6 == 0) || (frameCounter <= 2)) &&
+                                             !pendingAdtCpu.has_value();
 
                 const glm::vec3 anchor   = walkMode ? playerPos : camPos;
                 const glm::mat4 lightRot = glm::lookAt(sunDir, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-                glm::vec3 lv = glm::vec3(lightRot * glm::vec4(anchor, 1.0f));
-                lv.x = std::floor(lv.x / texelSize) * texelSize;
-                lv.y = std::floor(lv.y / texelSize) * texelSize;
-                const glm::vec3 snappedAnchor = glm::vec3(glm::transpose(glm::mat3(lightRot)) * lv);
 
-                const glm::mat4 lightView =
-                    glm::lookAt(snappedAnchor + sunDir * 300.0f, snappedAnchor, glm::vec3(0.0f, 0.0f, 1.0f));
-                const glm::mat4 lightProj =
-                    glm::orthoRH_ZO(-kShadowRad, kShadowRad, -kShadowRad, kShadowRad, 10.0f, 650.0f);
-                uboData.lightViewProj = lightProj * lightView;
+                // 在光空间内把锚点吸附到纹素格点，避免移动时阴影边缘随纹素栅格抖动
+                auto snapAnchorToTexels = [&](float rad, float resolution) {
+                    const float texel = (rad * 2.0f) / resolution;
+                    glm::vec3 lv = glm::vec3(lightRot * glm::vec4(anchor, 1.0f));
+                    lv.x = std::floor(lv.x / texel) * texel;
+                    lv.y = std::floor(lv.y / texel) * texel;
+                    return glm::vec3(glm::transpose(glm::mat3(lightRot)) * lv);
+                };
+
+                // ---- 近景级联：每帧刷新 ----
+                const float     kShadowRad = 58.0f;
+                const glm::vec3 nearAnchor = snapAnchorToTexels(kShadowRad, 2048.0f);
+                const glm::mat4 nearView =
+                    glm::lookAt(nearAnchor + sunDir * 300.0f, nearAnchor, glm::vec3(0.0f, 0.0f, 1.0f));
+                const glm::mat4 nearProj =
+                    glm::orthoRH_ZO(-kShadowRad, kShadowRad, -kShadowRad, kShadowRad, 10.0f, 380.0f);
+                uboData.lightViewProj = nearProj * nearView;
+
+                // ---- 远景级联：仅刷新帧重算矩阵，其余帧沿用缓存 ----
+                if (updateFarShadow) {
+                    const float     kFarRad   = 320.0f;
+                    const glm::vec3 farAnchor = snapAnchorToTexels(kFarRad, 1024.0f);
+                    const glm::mat4 farView =
+                        glm::lookAt(farAnchor + sunDir * 400.0f, farAnchor, glm::vec3(0.0f, 0.0f, 1.0f));
+                    const glm::mat4 farProj =
+                        glm::orthoRH_ZO(-kFarRad, kFarRad, -kFarRad, kFarRad, 10.0f, 750.0f);
+                    lastLightViewProjFar = farProj * farView;
+                }
+                uboData.lightViewProjFar = lastLightViewProjFar;
             }
             frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
 
@@ -1277,6 +1356,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
             renderQueue.clear();
             shadowQueue.clear();
+            shadowFarQueue.clear();
             visibleParticles.clear();
             particleBatches.clear();
             visibleMatrices.clear();
@@ -1329,11 +1409,13 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 uint32_t firstInstance = static_cast<uint32_t>(visibleMatrices.size());
                 uint32_t visibleCount  = 0;
                 float    minDistSq     = 1e30f; // 该桶可见实例到相机的最近中心距离平方
-                float    minEdgeDist   = 1e30f; // 该桶可见实例到相机的最近表面距离 (已扣除包围球半径)
 
-                // 表面距离判定 + 保留镜头背后的近处大树：
-                // 80 码阴影盒内、半径 >= 1.2 码的投射物即使完全位于视锥外也参与阴影，
-                // 避免玩家转身或前进时背后/身侧的树影突兀消失
+                // 实例按阴影级联距离分片排列：近景 (<=58 码) -> 远景 (58~320 码) -> 仅渲染 (>320 码)。
+                // 这样阴影 Pass 只需绘制前 N 个实例，远处实例永远不会占用近景 2048 贴图的开销。
+                nearMats.clear();
+                farMats.clear();
+                viewOnlyMats.clear();
+
                 for (const auto* instPtr : bucket.instances) {
                     const auto& inst = *instPtr;
                     const float centerDist = glm::distance(inst.worldCenter, camPos);
@@ -1341,15 +1423,29 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     const bool  inView     = IsInstanceVisible(camFrustum, camPos,
                                                                inst.worldBoundsMin, inst.worldBoundsMax,
                                                                inst.worldCenter, inst.worldRadius);
-                    const bool  inShadow   = (inst.worldRadius >= 1.2f && edgeDist <= 165.0f);
-                    if (!inView && !inShadow) {
+                    // 镜头背后但足够近的大物件仍需投射阴影，避免玩家转身时树影突兀消失
+                    const bool isCaster = (inst.worldRadius >= 1.2f);
+                    if (!inView && !(isCaster && edgeDist <= 58.0f)) {
                         continue;
                     }
-                    visibleMatrices.push_back(inst.model);
-                    ++visibleCount;
-                    minDistSq   = std::min(minDistSq, centerDist * centerDist);
-                    minEdgeDist = std::min(minEdgeDist, edgeDist);
+                    if (isCaster && edgeDist <= 58.0f) {
+                        nearMats.push_back(inst.model);
+                    } else if (isCaster && edgeDist <= 320.0f) {
+                        farMats.push_back(inst.model);
+                    } else {
+                        viewOnlyMats.push_back(inst.model);
+                    }
+                    minDistSq = std::min(minDistSq, centerDist * centerDist);
                 }
+
+                const uint32_t nearCount = static_cast<uint32_t>(nearMats.size());
+                const uint32_t farCount  = static_cast<uint32_t>(farMats.size());
+                visibleCount = nearCount + farCount + static_cast<uint32_t>(viewOnlyMats.size());
+
+                visibleMatrices.insert(visibleMatrices.end(), nearMats.begin(), nearMats.end());
+                visibleMatrices.insert(visibleMatrices.end(), farMats.begin(), farMats.end());
+                visibleMatrices.insert(visibleMatrices.end(), viewOnlyMats.begin(), viewOnlyMats.end());
+
                 if (visibleCount == 0) continue;
                 visibleM2Instances += static_cast<int>(visibleCount);
 
@@ -1550,12 +1646,19 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     cmd.batchColor    = batchColor;
                     cmd.texAlphaMap   = blackAlphaTex.Handle();
                     renderQueue.push_back(cmd);
-                    // 阴影投射：按模型尺度分级，大物件 (建筑/大树) 投入 165 码远景阴影，
-                    // 小杂物 (草/花/碎石) 仅用 35 码近距阴影，兼顾远景覆盖与高帧率
-                    const float modelSpan       = glm::length(model.localBoundsMax - model.localBoundsMin);
-                    const float maxShadowDist   = (modelSpan >= 2.5f) ? 165.0f : 35.0f;
-                    if (pass <= 3 && minEdgeDist <= maxShadowDist) {
-                        shadowQueue.push_back(cmd);
+                    // 近景级联：只绘制离相机 58 码内的实例，2048 贴图的纹素精度全部留给近处
+                    if (pass <= 3 && nearCount > 0) {
+                        coa::rhi::DrawCommand sCmd = cmd;
+                        sCmd.instanceCount = nearCount;
+                        shadowQueue.push_back(sCmd);
+                    }
+                    // 远景级联：仅大尺寸模型 (树冠/建筑) 投入，并强制 pass = 2 跳过 alpha discard
+                    if (pass <= 3 && (nearCount + farCount) > 0 &&
+                        glm::length(model.localBoundsMax - model.localBoundsMin) >= 5.0f) {
+                        coa::rhi::DrawCommand fCmd = cmd;
+                        fCmd.instanceCount = nearCount + farCount;
+                        fCmd.sortKey       = coa::rhi::DrawCommand::MakeKey(2, 1, 0, 0);
+                        shadowFarQueue.push_back(fCmd);
                     }
                 }
             }
@@ -1668,9 +1771,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
                             const auto& grp = model.groups[g];
                             const auto& gc  = inst.groupBounds[g];
 
-                            const bool  inView       = camFrustum.IntersectsAABB(gc.worldBoundsMin, gc.worldBoundsMax);
-                            const float grpDist      = glm::distance(gc.worldCenter, camPos);
-                            const bool  inShadowRange = (grpDist <= 170.0f + gc.worldRadius);
+                            const bool  inView        = camFrustum.IntersectsAABB(gc.worldBoundsMin, gc.worldBoundsMax);
+                            const float grpDist       = glm::distance(gc.worldCenter, camPos);
+                            // 远景级联覆盖 320 码：房间即使完全在视锥外，只要在范围内仍参与阴影
+                            const bool  inShadowRange = (grpDist <= 320.0f + gc.worldRadius);
+                            // 近景级联只覆盖 65 码，保证 2048 贴图精度不被远处房间稀释
+                            const bool  inNearShadow  = (grpDist <= 65.0f + gc.worldRadius);
                             if (!inView && !inShadowRange) continue;
 
                             auto ensureBaseInstance = [&]() -> uint32_t {
@@ -1701,7 +1807,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
                                     sCmd.baseVertex    = 0;
                                     sCmd.instanceCount = 1;
                                     sCmd.baseInstance  = ensureBaseInstance();
-                                    shadowQueue.push_back(sCmd);
+                                    if (inNearShadow) {
+                                        shadowQueue.push_back(sCmd);
+                                    }
+                                    // 远景级联强制 pass = 2：跳过着色器 alpha discard，换取 6 帧一次的极低开销
+                                    sCmd.sortKey = coa::rhi::DrawCommand::MakeKey(2, 1, 0, 0);
+                                    shadowFarQueue.push_back(sCmd);
                                 }
                                 if (!inView) continue;
 
@@ -1768,18 +1879,38 @@ int main(int /*argc*/, char* /*argv*/[]) {
             }
             boneSsbo.UpdateSubData(0, neededBoneBytes, visibleBoneMatrices.data());
 
-            // ---- 方向 K：太阳方向阴影贴图 Pass (仅 Pass 2/3，先构建深度再恢复反向 Z 主渲染) ----
-            glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
-            glViewport(0, 0, 4096, 4096);
+            // ---- 方向 K：双级联阴影贴图 Pass (仅 Pass 2/3，先构建深度再恢复反向 Z 主渲染) ----
             glDepthFunc(GL_LESS);
             glClearDepth(1.0);
+
+            // 近景级联：2048x2048，每帧刷新，覆盖相机 58 码内的全部阴影
+            glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
+            glViewport(0, 0, 2048, 2048);
             glClear(GL_DEPTH_BUFFER_BIT);
             coa::rhi::SubmitShadowCommands(shadowQueue, shadowShader.Handle());
+
+            // 远景级联：1024x1024，每 6 帧刷新一次；非刷新帧直接复用上一次的深度内容
+            if (((frameCounter % 6 == 0) || (frameCounter <= 2)) && !pendingAdtCpu.has_value()) {
+                // 阴影顶点着色器统一读取 uLightViewProj，这里临时换成远景矩阵，画完立刻还原
+                const glm::mat4 savedLightViewProj = uboData.lightViewProj;
+                uboData.lightViewProj = uboData.lightViewProjFar;
+                frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
+
+                glBindFramebuffer(GL_FRAMEBUFFER, shadowFboFar);
+                glViewport(0, 0, 1024, 1024);
+                glClear(GL_DEPTH_BUFFER_BIT);
+                coa::rhi::SubmitShadowCommands(shadowFarQueue, shadowShader.Handle());
+
+                uboData.lightViewProj = savedLightViewProj;
+                frameUbo.UpdateSubData(0, sizeof(FrameUniforms), &uboData);
+            }
+
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glViewport(0, 0, winW, winH);
             glDepthFunc(GL_GEQUAL);
             glClearDepth(0.0);
             glBindTextureUnit(5, shadowTex);
+            glBindTextureUnit(6, shadowTexFar);
 
             // 每 0.25 秒更新一次窗口标题，观察视锥裁剪统计
             titleTimer += dt;
@@ -1853,7 +1984,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
         glDeleteVertexArrays(1, &sharedM2Vao);
         glDeleteVertexArrays(1, &skyVao);
         glDeleteFramebuffers(1, &shadowFbo);
+        glDeleteFramebuffers(1, &shadowFboFar);
         glDeleteTextures(1, &shadowTex);
+        glDeleteTextures(1, &shadowTexFar);
     }
 
     SDL_GL_DestroyContext(glCtx);
