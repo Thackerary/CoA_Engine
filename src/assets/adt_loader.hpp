@@ -476,14 +476,20 @@ public:
             // 5.1 地表 MTEX 贴图
             for (const auto& rawPath : mtexPaths) {
                 std::string norm = vfs::VirtualFileSystem::NormalizeVirtualPath(rawPath);
-                if (!norm.empty()) uniqueTex.insert(std::move(norm));
+                if (norm.empty()) continue;
+                vfs.PrefetchFile(norm); // 预取进 RAM 池，主线程命中即零磁盘 I/O
+                uniqueTex.insert(std::move(norm));
             }
 
-            // 5.2 WMO：预读 root 文件，扫描顶层 IFF 块取 MOTX 内全部贴图路径
+            // 5.2 WMO：预读 root 文件，扫描顶层 IFF 块取 MOTX 贴图 / MOHD 子房间 / MODN 室内家具
+            std::unordered_set<std::string> allM2Paths;
             for (const auto& wmoItem : cpu.wmoList) {
                 auto wmoBytes = vfs.ReadFile(wmoItem.first);
                 if (!wmoBytes || wmoBytes->size() < 8) continue;
                 std::span<const uint8_t> wb(*wmoBytes);
+
+                // 根文件本身也纳入 RAM 池：主线程 GetOrLoadWmo 时不再触发磁盘读取
+                vfs.PrefetchFile(wmoItem.first);
 
                 size_t wmoCursor = 0;
                 while (wmoCursor + 8 <= wb.size()) {
@@ -499,9 +505,36 @@ public:
                         for (auto& rawPath : wmoTexPaths) {
                             std::string norm = vfs::VirtualFileSystem::NormalizeVirtualPath(rawPath);
                             if (norm.empty()) continue;
-                            if (uniqueTex.insert(norm).second) {
-                                vfs.ReadFile(norm); // 预热 OS 磁盘缓存
+                            vfs.PrefetchFile(norm); // 后台预取进 RAM，主线程零磁盘 I/O
+                            uniqueTex.insert(std::move(norm));
+                        }
+                    } else if (magic == FourCC("MOHD") && size >= 8) {
+                        // MOHD: nMaterials(+0), nGroups(+4)。逐个预取 _NNN.wmo 子房间文件，
+                        // 避免主线程加载建筑时对每个房间文件发起同步磁盘读。
+                        uint32_t nGroups = 0;
+                        std::memcpy(&nGroups, wb.data() + dataStart + 4, sizeof(uint32_t));
+                        const uint32_t groupLimit = std::min<uint32_t>(nGroups, 512u);
+                        std::string rootPath = wmoItem.first;
+                        if (rootPath.size() >= 4 && rootPath.ends_with(".wmo")) {
+                            const std::string stem = rootPath.substr(0, rootPath.size() - 4);
+                            char groupPath[512];
+                            for (uint32_t gi = 0; gi < groupLimit; ++gi) {
+                                std::snprintf(groupPath, sizeof(groupPath), "%s_%03u.wmo", stem.c_str(), gi);
+                                vfs.PrefetchFile(groupPath);
                             }
+                        }
+                    } else if (magic == FourCC("MODN")) {
+                        // MODN：WMO 内部家具的 M2 文件名表，统一并入后续 M2 预取集合
+                        std::vector<std::string> modnNames;
+                        ParseNullTerminatedStrings(wb.subspan(dataStart, size), modnNames);
+                        for (auto& rawName : modnNames) {
+                            std::string norm = vfs::VirtualFileSystem::NormalizeVirtualPath(rawName);
+                            if (norm.empty()) continue;
+                            if (norm.size() >= 4 &&
+                                (norm.ends_with(".mdx") || norm.ends_with(".mdl"))) {
+                                norm.replace(norm.size() - 4, 4, ".m2");
+                            }
+                            allM2Paths.insert(std::move(norm));
                         }
                     }
                     wmoCursor = dataStart + size;
@@ -509,11 +542,17 @@ public:
             }
 
             // 5.3 M2：预读模型与 00.skin，解析 MD20.textures 中的硬编码贴图 (type == 0)
-            for (const auto& m2Item : cpu.doodadGroups) {
-                const std::string& m2Path = m2Item.first;
+            //     覆盖范围 = ADT 装饰物 (MDDF) + WMO 内部家具 (MODN)
+            std::vector<std::string> m2PreloadPaths;
+            m2PreloadPaths.reserve(cpu.doodadGroups.size() + allM2Paths.size());
+            for (const auto& kv : cpu.doodadGroups) m2PreloadPaths.push_back(kv.first);
+            for (const auto& p : allM2Paths)          m2PreloadPaths.push_back(p);
+
+            for (const auto& m2Path : m2PreloadPaths) {
                 auto m2Bytes = vfs.ReadFile(m2Path);
+                vfs.PrefetchFile(m2Path); // 模型本体进 RAM 池
                 if (m2Path.size() >= 3) {
-                    vfs.ReadFile(m2Path.substr(0, m2Path.size() - 3) + "00.skin");
+                    vfs.PrefetchFile(m2Path.substr(0, m2Path.size() - 3) + "00.skin"); // 皮肤文件进 RAM 池
                 }
                 if (!m2Bytes || m2Bytes->size() < sizeof(M2HeaderV264)) continue;
                 std::span<const uint8_t> mb(*m2Bytes);
@@ -539,9 +578,8 @@ public:
                     std::string norm = vfs::VirtualFileSystem::NormalizeVirtualPath(
                         reinterpret_cast<const char*>(mb.data() + strOfs));
                     if (norm.empty()) continue;
-                    if (uniqueTex.insert(norm).second) {
-                        vfs.ReadFile(norm); // 预热 OS 磁盘缓存
-                    }
+                    vfs.PrefetchFile(norm); // 预取进 RAM，主线程零磁盘 I/O
+                    uniqueTex.insert(std::move(norm));
                 }
             }
 
@@ -586,7 +624,7 @@ public:
         // ---- Stage 1: 逐张预上传 BLP 贴图 (预算精确到单张贴图，杜绝集中解码卡顿) ----
         if (c.stage == 1) {
             while (c.cursor < c.preloadTexPaths.size()) {
-                assets.GetOrLoadTexture(c.preloadTexPaths[c.cursor++], true);
+                (void)assets.GetOrLoadTexture(c.preloadTexPaths[c.cursor++], true);
                 if ((SDL_GetTicksNS() - t0) >= budgetNs) return false;
             }
             std::vector<std::string>().swap(c.preloadTexPaths);

@@ -427,6 +427,18 @@ void main() {
                  + sunColor * spec * shadowFactor;
     }
 
+    // 水下躯干遮挡与吃水线：低于水面 (uWaterShallow.w) 的像素混入水体色，交界处叠加白色泡沫带
+    float subDepth = uWaterShallow.w - vWorldPos.z;
+    if (subDepth > -0.04) {
+        float foam = smoothstep(0.04, 0.0, abs(subDepth));
+        if (subDepth > 0.0) {
+            float uwFade = exp(-subDepth * 1.45);
+            vec3 uwTint = mix(uWaterDeep.rgb * 0.42, uWaterShallow.rgb * 0.72, uwFade);
+            litColor = mix(uwTint, litColor * vec3(0.52, 0.75, 0.85), uwFade * 0.65);
+        }
+        litColor = mix(litColor, uWaterShallow.rgb + vec3(0.28), foam * 0.45);
+    }
+
     float fogFactor = clamp(exp(-max(dist - uFogColorAndParams.w, 0.0) * uSkyTopAndDensity.w), 0.0, 1.0);
     vec3 fogColor = uFogColorAndParams.rgb;
 
@@ -557,8 +569,8 @@ void main() {
     vec3 waterLitColor = mix(waterColor, skyReflect, fresnel * 0.65) + sunColor * spec;
 
     // 4. 岸边柔化与整体透明度
-    float shoreAlpha = smoothstep(0.0, 0.55, vWaterDepth);
-    float alpha = clamp(shoreAlpha * mix(0.45, 0.92,
+    float shoreAlpha = smoothstep(0.0, 0.16, vWaterDepth);
+    float alpha = clamp(shoreAlpha * mix(0.76, 0.95,
                     clamp(vWaterDepth * 0.25 + fresnel * 0.6, 0.0, 1.0)), 0.0, 0.95);
 
     // 5. 与 kWorldFragShader 完全一致的指数距离雾，使远处水面融入天际
@@ -1071,7 +1083,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 glm::vec3 flatRight = glm::normalize(glm::cross(fwdFlat, worldUp));
 
                 // 方向 L：采样脚下地面高度与水面高度，判定游泳 / 潜泳状态
-                constexpr float kSubmergeOffset = 1.15f; // 吃水线：脚底低于水面该距离即视为游泳
+                constexpr float kSubmergeOffset = 1.45f; // 吃水线：水面没过角色胸口至肩膀
                 float groundZ = playerPos.z;
                 const bool hasGround = coa::assets::AdtLoader::SampleGroundHeight(
                     adtTiles, playerPos.x, playerPos.y, playerPos.z, groundZ);
@@ -1081,7 +1093,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     adtTiles, playerPos.x, playerPos.y, waterZ);
 
                 // 深水且脚底已沉入吃水线以下 -> 进入游泳；浅水 / 离水 -> 立刻退出
-                if (hasWater && (waterZ - groundZ) > 1.30f &&
+                if (hasWater && (waterZ - groundZ) > 1.55f &&
                     playerPos.z <= waterZ - kSubmergeOffset + 0.15f) {
                     isSwimming = true;
                 }
@@ -1345,7 +1357,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
             uboData.skyMid             = glm::vec4(lightState.skyMiddle, 1.0f);
             uboData.skyBand1           = glm::vec4(lightState.skyBand1, 1.0f);
             uboData.skyHorizon         = glm::vec4(lightState.skyHorizon, 1.0f);
-            uboData.waterShallow       = glm::vec4(lightState.riverShallow, 1.0f);
+            // 把角色 / 相机所在位置的水面高度写入 uWaterShallow.w，供世界与水体着色器做吃水线遮挡
+            float curWaterZ = -1e30f;
+            (void)coa::assets::AdtLoader::SampleWaterHeight(
+                adtTiles,
+                walkMode ? playerPos.x : camPos.x,
+                walkMode ? playerPos.y : camPos.y,
+                curWaterZ);
+            uboData.waterShallow       = glm::vec4(lightState.riverShallow, curWaterZ);
             uboData.waterDeep          = glm::vec4(lightState.riverDeep, 1.0f);
 
             // 方向 K：双级联太阳方向阴影正交投影

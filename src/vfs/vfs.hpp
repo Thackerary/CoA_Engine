@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <optional>
 #include <cstdio>
+#include <mutex>
 
 #include <lz4.h>
 #include <zstd.h>
@@ -102,6 +103,17 @@ public:
         std::string normPath = NormalizeVirtualPath(virtualPath);
         if (normPath.empty()) return std::nullopt;
 
+        // 0. 优先命中后台预取的内存池：直接移出并擦除，完全不触发任何磁盘 I/O
+        {
+            std::lock_guard<std::mutex> lock(m_cacheMutex);
+            auto cacheIt = m_ramCache.find(normPath);
+            if (cacheIt != m_ramCache.end()) {
+                std::vector<uint8_t> cachedBytes = std::move(cacheIt->second);
+                m_ramCache.erase(cacheIt);
+                return cachedBytes;
+            }
+        }
+
         for (const auto& mp : m_mounts) {
             if (mp.type == MountType::LooseDirectory) {
                 std::filesystem::path fullPath = mp.rootPath / normPath;
@@ -180,6 +192,25 @@ public:
         return std::nullopt;
     }
 
+    // 4. 后台预取：把文件原始字节读入内存池，使主线程后续 ReadFile 零磁盘调用
+    void PrefetchFile(std::string_view virtualPath) const {
+        std::string normPath = NormalizeVirtualPath(virtualPath);
+        if (normPath.empty()) return;
+
+        {
+            std::lock_guard<std::mutex> lock(m_cacheMutex);
+            if (m_ramCache.size() >= 4096) return;
+            if (m_ramCache.find(normPath) != m_ramCache.end()) return;
+        }
+
+        auto bytes = ReadFile(normPath);
+        if (!bytes) return;
+
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        if (m_ramCache.size() >= 4096) return;
+        m_ramCache.try_emplace(std::move(normPath), std::move(*bytes));
+    }
+
     [[nodiscard]] static std::string NormalizeVirtualPath(std::string_view rawPath) {
         std::string s(rawPath);
         for (char& c : s) {
@@ -201,6 +232,10 @@ private:
     };
 
     std::vector<MountPoint> m_mounts;
+
+    // 后台预取池：ParseAdtCpu 工作线程写入，主线程 ReadFile 直接消费
+    mutable std::mutex m_cacheMutex;
+    mutable std::unordered_map<std::string, std::vector<uint8_t>> m_ramCache;
 
     void SortMountsByPriority() {
         std::stable_sort(m_mounts.begin(), m_mounts.end(), [](const MountPoint& a, const MountPoint& b) {
