@@ -177,10 +177,12 @@ struct WmoInstance {
 struct GpuDoodadBatch {
     std::shared_ptr<const GpuM2Model> model;
     std::vector<M2Instance>           instances;
+    std::string                       modelPath; // 虚拟路径，供鼠标拾取时定位模型来源
 };
 struct GpuWmoBatch {
     std::shared_ptr<const GpuWmoModel> model;
     std::vector<WmoInstance>           instances;
+    std::string                        modelPath; // 虚拟路径，供鼠标拾取时定位模型来源
 };
 struct GpuAdtTile {
     rhi::GlBuffer               terrainVbo;
@@ -677,7 +679,8 @@ public:
                 auto wmoPtr = assets.GetOrLoadWmo(item.first, fallbackWhiteTex);
                 if (wmoPtr) {
                     GpuWmoBatch batch;
-                    batch.model = std::move(wmoPtr);
+                    batch.model     = std::move(wmoPtr);
+                    batch.modelPath = item.first;
                     batch.instances.reserve(placements.size());
 
                     // 每个建筑实例一次性预计算整栋 + 各子房间的世界空间 AABB
@@ -746,7 +749,8 @@ public:
                 auto modelPtr = assets.GetOrLoadM2(item.first, fallbackWhiteTex);
                 if (modelPtr) {
                     GpuDoodadBatch batch;
-                    batch.model = std::move(modelPtr);
+                    batch.model     = std::move(modelPtr);
+                    batch.modelPath = item.first;
                     batch.instances.reserve(item.second.size());
 
                     for (const auto& placement : item.second) {
@@ -1191,6 +1195,119 @@ public:
         }
 
         return startXY + remDelta;
+    }
+
+    // ==================== 方向 M：鼠标左键 3D 射线拾取 ====================
+    struct PickResult {
+        bool        hit      = false;
+        bool        isWmo    = false;
+        float       distance = 1e30f;
+        uint32_t    uniqueId = 0;
+        glm::vec3   center{0.0f};
+        glm::vec3   groundPos{0.0f};
+        float       radius = 1.0f;
+        std::string modelPath;
+    };
+
+    // 世界空间射线 vs 全部 M2 / WMO 实例的世界 AABB，返回最近命中的实例信息
+    [[nodiscard]] static PickResult PickObjectByRay(const std::vector<GpuAdtTile>& tiles,
+                                                    const glm::vec3& rayOrigin,
+                                                    const glm::vec3& rayDir,
+                                                    float maxDist = 250.0f)
+    {
+        PickResult best{};
+        const float dirLen = glm::length(rayDir);
+        if (dirLen < 1e-6f) return best;
+        const glm::vec3 rayD = rayDir / dirLen;
+
+        // 标准三轴 Slab 算法：求射线与 AABB 的最近正交点
+        auto rayBoxIntersect = [&](const glm::vec3& bmin, const glm::vec3& bmax, float& outT) -> bool {
+            float tmin = 0.0f;
+            float tmax = 1e30f;
+            for (int i = 0; i < 3; ++i) {
+                if (std::fabs(rayD[i]) < 1e-8f) {
+                    // 射线在该轴平行于 Slab：原点必须落在 Slab 内
+                    if (rayOrigin[i] < bmin[i] || rayOrigin[i] > bmax[i]) return false;
+                } else {
+                    const float invD = 1.0f / rayD[i];
+                    float t1 = (bmin[i] - rayOrigin[i]) * invD;
+                    float t2 = (bmax[i] - rayOrigin[i]) * invD;
+                    if (t1 > t2) std::swap(t1, t2);
+                    tmin = std::max(tmin, t1);
+                    tmax = std::min(tmax, t2);
+                    if (tmin > tmax) return false;
+                }
+            }
+            outT = tmin;
+            return true;
+        };
+
+        // 包围球粗筛：射线到球心的垂直距离超过半径即可直接跳过
+        auto sphereReject = [&](const glm::vec3& center, float radius) {
+            const glm::vec3 toCenter = center - rayOrigin;
+            const float along = glm::dot(toCenter, rayD);
+            const glm::vec3 perp = toCenter - rayD * along;
+            return glm::dot(perp, perp) > radius * radius;
+        };
+
+        std::unordered_set<uint32_t> testedM2Ids;
+        std::unordered_set<uint32_t> testedWmoIds;
+
+        for (const auto& tile : tiles) {
+            // 1. M2 装饰物
+            for (const auto& doodadBatch : tile.doodadBatches) {
+                if (!doodadBatch.model) continue;
+                for (const auto& inst : doodadBatch.instances) {
+                    // 跨界 ADT 的同一 uniqueId 仅检测一次
+                    if (inst.uniqueId != 0 && !testedM2Ids.insert(inst.uniqueId).second) continue;
+                    if (sphereReject(inst.worldCenter, inst.worldRadius)) continue;
+
+                    float tHit = 0.0f;
+                    if (!rayBoxIntersect(inst.worldBoundsMin, inst.worldBoundsMax, tHit)) continue;
+                    if (tHit > maxDist || tHit >= best.distance) continue;
+
+                    best.hit       = true;
+                    best.isWmo     = false;
+                    best.distance  = tHit;
+                    best.uniqueId  = inst.uniqueId;
+                    best.center    = inst.worldCenter;
+                    best.radius    = inst.worldRadius;
+                    best.modelPath = doodadBatch.modelPath;
+                    best.groundPos = glm::vec3(inst.worldCenter.x, inst.worldCenter.y, inst.worldBoundsMin.z);
+                }
+            }
+
+            // 2. WMO 大型建筑
+            for (const auto& wmoBatch : tile.wmoBatches) {
+                if (!wmoBatch.model) continue;
+                for (const auto& inst : wmoBatch.instances) {
+                    if (inst.uniqueId != 0 && !testedWmoIds.insert(inst.uniqueId).second) continue;
+                    if (sphereReject(inst.worldCenter, inst.worldRadius)) continue;
+
+                    float tHit = 0.0f;
+                    if (!rayBoxIntersect(inst.worldBoundsMin, inst.worldBoundsMax, tHit)) continue;
+                    if (tHit > maxDist || tHit >= best.distance) continue;
+
+                    best.hit       = true;
+                    best.isWmo     = true;
+                    best.distance  = tHit;
+                    best.uniqueId  = inst.uniqueId;
+                    best.center    = inst.worldCenter;
+                    best.radius    = inst.worldRadius;
+                    best.modelPath = wmoBatch.modelPath;
+                    best.groundPos = glm::vec3(inst.worldCenter.x, inst.worldCenter.y, inst.worldBoundsMin.z);
+                }
+            }
+        }
+
+        // 命中后从包围盒中心向下采样真实地形高度，使选中光环贴合地面
+        if (best.hit) {
+            float groundZ = best.groundPos.z;
+            if (SampleGroundHeight(tiles, best.groundPos.x, best.groundPos.y, best.center.z, groundZ)) {
+                best.groundPos.z = groundZ;
+            }
+        }
+        return best;
     }
 
 private:

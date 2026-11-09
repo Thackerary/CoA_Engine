@@ -635,8 +635,16 @@ void main() {
     vec3 camRight = vec3(uView[0][0], uView[1][0], uView[2][0]);
     vec3 camUp    = vec3(uView[0][1], uView[1][1], uView[2][1]);
 
-    vec3 worldPos = p.worldPosAndSize.xyz
-                  + (camRight * corner.x + camUp * corner.y) * p.worldPosAndSize.w;
+    // w < 0 表示水平贴地光环：沿世界 X/Y 平面展开，半径取 |w|；否则为面片公告板
+    vec3 worldPos;
+    if (p.worldPosAndSize.w < 0.0) {
+        float ringRadius = -p.worldPosAndSize.w;
+        worldPos = p.worldPosAndSize.xyz
+                 + (vec3(1.0, 0.0, 0.0) * corner.x + vec3(0.0, 1.0, 0.0) * corner.y) * ringRadius;
+    } else {
+        worldPos = p.worldPosAndSize.xyz
+                 + (camRight * corner.x + camUp * corner.y) * p.worldPosAndSize.w;
+    }
 
     vUV       = p.uvRect.xy + uv * p.uvRect.zw;
     vCorner   = corner;
@@ -680,6 +688,15 @@ layout(std140, binding = 0) uniform FrameBlock {
 out vec4 FragColor;
 
 void main() {
+    // vUV.x < -0.5：程序化选中光环 (不采样贴图)，双层翠绿圆环 + 中心柔和填充
+    if (vUV.x < -0.5) {
+        float r    = length(vCorner) * 2.0;
+        float ring = smoothstep(0.72, 0.88, r) * (1.0 - smoothstep(0.88, 0.98, r))
+                   + (1.0 - r * r) * 0.22;
+        FragColor = vec4(vec3(0.2, 1.0, 0.45) * 1.4, ring * vColor.a);
+        return;
+    }
+
     // 粒子贴图普遍以 RGB 亮度携带形状、alpha 恒为 1：按亮度重建透明度以抠除黑底
     vec4  tex      = texture(uTexAlbedo, vUV);
     float luma     = max(tex.r, max(tex.g, tex.b));
@@ -995,6 +1012,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::vector<glm::mat4> visibleBoneMatrices;
         std::vector<GpuParticleQuad>  visibleParticles;
         std::vector<ParticleBatchCmd> particleBatches;
+        // 方向 M：鼠标左键射线拾取的当前选中目标 (ESC 清空)
+        coa::assets::AdtLoader::PickResult currentPick{};
         bool running = true;
 
         while (running) {
@@ -1032,6 +1051,42 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         // 进入第三人称模式：角色出生在相机下方地面，朝向沿用当前水平视角
                         playerPos = camPos - glm::vec3(0.0f, 0.0f, kEyeHeight);
                         playerYaw = camYaw;
+                    }
+                } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
+                    // 方向 M：ESC 取消当前选中目标并移除脚下光环
+                    currentPick = {};
+                } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT) {
+                    // 方向 M：鼠标左键发射世界空间射线，精确拾取 M2 / WMO 实例
+                    const float mx = ev.button.x;
+                    const float my = ev.button.y;
+                    const float ndcX = (2.0f * mx) / static_cast<float>(std::max(1, winW)) - 1.0f;
+                    const float ndcY = 1.0f - (2.0f * my) / static_cast<float>(std::max(1, winH));
+                    const float tanHalfFov = std::tan(glm::radians(60.0f) * 0.5f);
+                    const float pickAspect = (winH > 0)
+                        ? (static_cast<float>(winW) / static_cast<float>(winH)) : 1.777f;
+
+                    // 相机基向量 (与主循环 forward / right / up 完全一致)
+                    const glm::vec3 pickFwd(
+                        std::cos(camPitch) * std::cos(camYaw),
+                        std::cos(camPitch) * std::sin(camYaw),
+                        std::sin(camPitch));
+                    const glm::vec3 pickRight =
+                        glm::normalize(glm::cross(pickFwd, glm::vec3(0.0f, 0.0f, 1.0f)));
+                    const glm::vec3 pickUp = glm::normalize(glm::cross(pickRight, pickFwd));
+
+                    const glm::vec3 rayDir = glm::normalize(
+                        pickFwd
+                        + pickRight * (ndcX * tanHalfFov * pickAspect)
+                        + pickUp * (ndcY * tanHalfFov));
+
+                    currentPick = coa::assets::AdtLoader::PickObjectByRay(adtTiles, camPos, rayDir, 250.0f);
+                    if (currentPick.hit) {
+                        std::printf("[Picker] Selected %s (ID:%u, dist:%.1f, radius:%.1f): %s\n",
+                                    currentPick.isWmo ? "WMO" : "M2", currentPick.uniqueId,
+                                    currentPick.distance, currentPick.radius,
+                                    currentPick.modelPath.c_str());
+                    } else {
+                        std::printf("[Picker] No object hit (max 250 yards).\n");
                     }
                 } else if (ev.type == SDL_EVENT_KEY_DOWN &&
                            ev.key.scancode >= SDL_SCANCODE_F1 &&
@@ -1938,6 +1993,26 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 }
             }
 
+            // 方向 M：选中目标脚下翡翠绿光环 (负半径标识水平贴地展开，Additive 叠加)
+            if (currentPick.hit) {
+                const uint32_t ringFirst = static_cast<uint32_t>(visibleParticles.size());
+
+                GpuParticleQuad ringQuad{};
+                ringQuad.worldPosAndSize = glm::vec4(
+                    currentPick.groundPos + glm::vec3(0.0f, 0.0f, 0.15f),
+                    -glm::clamp(currentPick.radius * 1.2f, 1.8f, 18.0f));
+                ringQuad.color  = glm::vec4(0.2f, 1.0f, 0.45f, 0.85f);
+                ringQuad.uvRect = glm::vec4(-2.0f, -2.0f, 0.0f, 0.0f); // 负数 UV 起点标记程序化光环
+                visibleParticles.push_back(ringQuad);
+
+                particleBatches.push_back(ParticleBatchCmd{
+                    whiteFallbackTex.Handle(),
+                    3,        // Additive
+                    ringFirst,
+                    1u
+                });
+            }
+
             // 将本帧可见实例的模型矩阵上传至 SSBO (binding = 0)，必要时按需扩容重建
             size_t neededBytes = visibleMatrices.size() * sizeof(glm::mat4);
             if (neededBytes > instanceSsbo.Size()) {
@@ -2003,7 +2078,18 @@ int main(int /*argc*/, char* /*argv*/[]) {
                               curTileTitle.x, curTileTitle.y, adtTiles.size(),
                               visibleChunks, totalChunks, visibleWmoGroups, visibleM2Instances,
                               visibleWaterChunks, renderQueue.size());
-                SDL_SetWindowTitle(window, titleBuf);
+
+                std::string titleStr = titleBuf;
+                if (currentPick.hit) {
+                    std::string shortName = currentPick.modelPath;
+                    const size_t slashPos = shortName.find_last_of("/\\");
+                    if (slashPos != std::string::npos) shortName = shortName.substr(slashPos + 1);
+                    char pickBuf[160];
+                    std::snprintf(pickBuf, sizeof(pickBuf), " | Target: %s (%.1fm)",
+                                  shortName.c_str(), currentPick.distance);
+                    titleStr += pickBuf;
+                }
+                SDL_SetWindowTitle(window, titleStr.c_str());
                 titleTimer = 0.0f;
             }
 
