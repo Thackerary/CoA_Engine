@@ -1014,6 +1014,21 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::vector<ParticleBatchCmd> particleBatches;
         // 方向 M：鼠标左键射线拾取的当前选中目标 (ESC 清空)
         coa::assets::AdtLoader::PickResult currentPick{};
+
+        // 方向 M：各地标前放置可点击选中的 NPC 实体 (复用第三人称角色模型，Stand 待机姿态)
+        struct LandmarkNpc {
+            glm::vec3 spawn{0.0f};    // 地标 XY (Z 每帧按地形吸附)
+            glm::vec3 worldPos{0.0f}; // 每帧更新后的脚底世界坐标
+            bool      visible = false;
+        };
+        std::vector<LandmarkNpc> landmarkNpcs = {
+            { glm::vec3(-8918.0f, -142.0f, 0.0f), glm::vec3(0.0f), false }, // 北郡修道院前
+            { glm::vec3(-9464.0f,   48.0f, 0.0f), glm::vec3(0.0f), false }, // 闪金镇旅馆前
+            { glm::vec3(-9052.0f,  442.0f, 0.0f), glm::vec3(0.0f), false }, // 暴风城英雄谷桥头
+            { glm::vec3(-8532.0f,  838.0f, 0.0f), glm::vec3(0.0f), false }, // 大教堂广场
+            { glm::vec3(-9256.0f, -204.0f, 0.0f), glm::vec3(0.0f), false }, // 水晶湖渡口
+        };
+
         bool running = true;
 
         while (running) {
@@ -1080,6 +1095,41 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         + pickUp * (ndcY * tanHalfFov));
 
                     currentPick = coa::assets::AdtLoader::PickObjectByRay(adtTiles, camPos, rayDir, 250.0f);
+
+                    // 地标 NPC 拾取：局部盒 [-0.8,-0.8,0] ~ [0.8,0.8,2.1]，命中且更近时优先选中
+                    for (const auto& npc : landmarkNpcs) {
+                        if (!npc.visible) continue;
+                        const glm::vec3 bmin = npc.worldPos + glm::vec3(-0.8f, -0.8f, 0.0f);
+                        const glm::vec3 bmax = npc.worldPos + glm::vec3( 0.8f,  0.8f, 2.1f);
+                        float tNear = -1e30f;
+                        float tFar  =  1e30f;
+                        bool  hitBox = true;
+                        for (int i = 0; i < 3 && hitBox; ++i) {
+                            if (std::fabs(rayDir[i]) < 1e-8f) {
+                                if (camPos[i] < bmin[i] || camPos[i] > bmax[i]) hitBox = false;
+                            } else {
+                                const float invD = 1.0f / rayDir[i];
+                                float t1 = (bmin[i] - camPos[i]) * invD;
+                                float t2 = (bmax[i] - camPos[i]) * invD;
+                                if (t1 > t2) std::swap(t1, t2);
+                                tNear = std::max(tNear, t1);
+                                tFar  = std::min(tFar,  t2);
+                                if (tNear > tFar) hitBox = false;
+                            }
+                        }
+                        if (!hitBox || tNear <= 0.05f || tNear > 250.0f) continue;
+                        if (tNear >= currentPick.distance) continue;
+
+                        currentPick.hit       = true;
+                        currentPick.isWmo     = false;
+                        currentPick.distance  = tNear;
+                        currentPick.uniqueId  = 0;
+                        currentPick.center    = npc.worldPos + glm::vec3(0.0f, 0.0f, 1.05f);
+                        currentPick.groundPos = npc.worldPos;
+                        currentPick.radius    = 2.0f;
+                        currentPick.modelPath = "NPC: Stormwind Guard / Hero";
+                    }
+
                     if (currentPick.hit) {
                         std::printf("[Picker] Selected %s (ID:%u, dist:%.1f, radius:%.1f): %s\n",
                                     currentPick.isWmo ? "WMO" : "M2", currentPick.uniqueId,
@@ -1868,6 +1918,81 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 }
             }
 
+            // 2.6 方向 M：地标 NPC 实体 (复用第三人称角色模型，统一 Stand(0) 待机姿态)
+            if (playerModel && !playerModel->submeshes.empty()) {
+                bool needNpcBones = false;
+                for (auto& npc : landmarkNpcs) {
+                    npc.visible = false;
+                    if (glm::distance(npc.spawn, camPos) > 180.0f) continue;
+                    float groundZ = npc.worldPos.z;
+                    if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, npc.spawn.x, npc.spawn.y,
+                                                                 200.0f, groundZ)) {
+                        groundZ = 0.0f;
+                    }
+                    npc.worldPos = glm::vec3(npc.spawn.x, npc.spawn.y, groundZ);
+                    npc.visible  = true;
+                    needNpcBones = true;
+                }
+
+                const uint32_t npcBoneBase = needNpcBones
+                    ? playerModel->EvaluateBones(animTimeSec, visibleBoneMatrices, 0)
+                    : 0u;
+
+                for (const auto& npc : landmarkNpcs) {
+                    if (!npc.visible) continue;
+                    const uint32_t npcInstIdx = static_cast<uint32_t>(visibleMatrices.size());
+                    visibleMatrices.push_back(glm::translate(glm::mat4(1.0f), npc.worldPos));
+
+                    for (const auto& sub : playerModel->submeshes) {
+                        glm::vec4 batchColor(1.0f);
+                        if (sub.colorIndex >= 0 &&
+                            static_cast<size_t>(sub.colorIndex) < playerModel->colorTracks.size()) {
+                            const auto& ct = playerModel->colorTracks[sub.colorIndex];
+                            batchColor = glm::vec4(
+                                ct.color.SampleLinear(animTimeSec, playerModel->globalSequences,
+                                                      glm::vec3(1.0f)),
+                                ct.alpha.SampleLinear(animTimeSec, playerModel->globalSequences, 1.0f));
+                        }
+                        if (sub.transWeightIndex >= 0 &&
+                            static_cast<size_t>(sub.transWeightIndex) < playerModel->transWeightTracks.size()) {
+                            batchColor.a *= playerModel->transWeightTracks[sub.transWeightIndex]
+                                                .SampleLinear(animTimeSec, playerModel->globalSequences, 1.0f);
+                        }
+                        if (batchColor.a < 0.01f) continue;
+
+                        uint8_t pass = 2;
+                        if (sub.blendMode == 1)       pass = 3;
+                        else if (sub.blendMode == 2)  pass = 5;
+                        else if (sub.blendMode == 10) pass = 7;
+                        else if (sub.blendMode >= 3)  pass = 6;
+
+                        coa::rhi::DrawCommand cmd{};
+                        cmd.sortKey       = coa::rhi::DrawCommand::MakeKey(pass, 1, static_cast<uint16_t>(sub.textureId), 0);
+                        cmd.program       = worldShader.Handle();
+                        cmd.vao           = sharedM2Vao;
+                        cmd.vbo           = playerModel->vbo.Handle();
+                        cmd.ibo           = playerModel->ibo.Handle();
+                        cmd.stride        = sizeof(coa::assets::M2Vertex);
+                        cmd.texAlbedo     = sub.textureId;
+                        cmd.firstIndex    = sub.firstIndex;
+                        cmd.indexCount    = sub.indexCount;
+                        cmd.baseVertex    = 0;
+                        cmd.instanceCount = 1;
+                        cmd.baseInstance  = npcInstIdx;
+                        cmd.boneBaseIndex = npcBoneBase;
+                        cmd.isTwoSided    = ((sub.materialFlags & 0x04u) != 0) ? 1 : 0;
+                        cmd.isUnlit       = ((sub.materialFlags & 0x01u) != 0 || pass >= 6) ? 1 : 0;
+                        cmd.uvOffset      = glm::vec2(0.0f);
+                        cmd.batchColor    = batchColor;
+                        cmd.texAlphaMap   = blackAlphaTex.Handle();
+                        renderQueue.push_back(cmd);
+                        if (pass <= 3) {
+                            shadowQueue.push_back(cmd);
+                        }
+                    }
+                }
+            }
+
             // 3. WMO 两级层次化裁剪：先整栋建筑，再逐个子房间
             std::unordered_set<uint32_t> drawnWmoIds; // 跨界 WMO 的同一 uniqueId 每帧仅绘制一次
             for (const auto& tile : adtTiles) {
@@ -2000,7 +2125,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 GpuParticleQuad ringQuad{};
                 ringQuad.worldPosAndSize = glm::vec4(
                     currentPick.groundPos + glm::vec3(0.0f, 0.0f, 0.15f),
-                    -glm::clamp(currentPick.radius * 1.2f, 1.8f, 18.0f));
+                    -glm::clamp(currentPick.radius, 1.5f, 4.5f));
                 ringQuad.color  = glm::vec4(0.2f, 1.0f, 0.45f, 0.85f);
                 ringQuad.uvRect = glm::vec4(-2.0f, -2.0f, 0.0f, 0.0f); // 负数 UV 起点标记程序化光环
                 visibleParticles.push_back(ringQuad);

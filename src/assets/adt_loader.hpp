@@ -1209,7 +1209,7 @@ public:
         std::string modelPath;
     };
 
-    // 世界空间射线 vs 全部 M2 / WMO 实例的世界 AABB，返回最近命中的实例信息
+    // 世界空间射线 vs 全部 M2 / WMO 实例的紧凑局部 OBB，返回最近命中的实例信息
     [[nodiscard]] static PickResult PickObjectByRay(const std::vector<GpuAdtTile>& tiles,
                                                     const glm::vec3& rayOrigin,
                                                     const glm::vec3& rayDir,
@@ -1220,93 +1220,132 @@ public:
         if (dirLen < 1e-6f) return best;
         const glm::vec3 rayD = rayDir / dirLen;
 
-        // 标准三轴 Slab 算法：求射线与 AABB 的最近正交点
-        auto rayBoxIntersect = [&](const glm::vec3& bmin, const glm::vec3& bmax, float& outT) -> bool {
-            float tmin = 0.0f;
-            float tmax = 1e30f;
+        // 严格正交点 Slab 检测 (在模型局部空间执行)：
+        // tmin <= 0.05 说明相机已处于该包围盒内部、或盒整体位于相机背后，
+        // 必须直接丢弃；否则近平面上的巨型树冠 / 建筑盒会恒返回 tmin = 0，
+        // 把命中距离钉死在 0.0 并截胡视线正前方的真正目标。
+        auto rayLocalBoxIntersect = [](const glm::vec3& localOrig, const glm::vec3& localDir,
+                                       const glm::vec3& bmin, const glm::vec3& bmax,
+                                       float& outT) -> bool {
+            float tmin = -1e30f;
+            float tmax =  1e30f;
             for (int i = 0; i < 3; ++i) {
-                if (std::fabs(rayD[i]) < 1e-8f) {
+                const float d = localDir[i];
+                if (std::fabs(d) < 1e-8f) {
                     // 射线在该轴平行于 Slab：原点必须落在 Slab 内
-                    if (rayOrigin[i] < bmin[i] || rayOrigin[i] > bmax[i]) return false;
+                    if (localOrig[i] < bmin[i] || localOrig[i] > bmax[i]) return false;
                 } else {
-                    const float invD = 1.0f / rayD[i];
-                    float t1 = (bmin[i] - rayOrigin[i]) * invD;
-                    float t2 = (bmax[i] - rayOrigin[i]) * invD;
+                    const float invD = 1.0f / d;
+                    float t1 = (bmin[i] - localOrig[i]) * invD;
+                    float t2 = (bmax[i] - localOrig[i]) * invD;
                     if (t1 > t2) std::swap(t1, t2);
                     tmin = std::max(tmin, t1);
                     tmax = std::min(tmax, t2);
                     if (tmin > tmax) return false;
                 }
             }
+            if (tmin <= 0.05f) return false; // 相机位于盒内 / 盒在背后：丢弃伪命中
             outT = tmin;
             return true;
-        };
-
-        // 包围球粗筛：射线到球心的垂直距离超过半径即可直接跳过
-        auto sphereReject = [&](const glm::vec3& center, float radius) {
-            const glm::vec3 toCenter = center - rayOrigin;
-            const float along = glm::dot(toCenter, rayD);
-            const glm::vec3 perp = toCenter - rayD * along;
-            return glm::dot(perp, perp) > radius * radius;
         };
 
         std::unordered_set<uint32_t> testedM2Ids;
         std::unordered_set<uint32_t> testedWmoIds;
 
         for (const auto& tile : tiles) {
-            // 1. M2 装饰物
+            // 1. M2 装饰物：与模型紧凑局部盒求交，跳过纯特效 / 超大远景树冠遮罩
             for (const auto& doodadBatch : tile.doodadBatches) {
                 if (!doodadBatch.model) continue;
+                const auto& mdl = *doodadBatch.model;
                 for (const auto& inst : doodadBatch.instances) {
+                    // 播放器特效或巨型远景树冠的包围盒过于空旷，拾取无意义
+                    if (inst.worldRadius > 45.0f) continue;
                     // 跨界 ADT 的同一 uniqueId 仅检测一次
                     if (inst.uniqueId != 0 && !testedM2Ids.insert(inst.uniqueId).second) continue;
-                    if (sphereReject(inst.worldCenter, inst.worldRadius)) continue;
 
-                    float tHit = 0.0f;
-                    if (!rayBoxIntersect(inst.worldBoundsMin, inst.worldBoundsMax, tHit)) continue;
-                    if (tHit > maxDist || tHit >= best.distance) continue;
+                    const glm::mat4 invModel  = glm::inverse(inst.model);
+                    const glm::vec3 localOrig = glm::vec3(invModel * glm::vec4(rayOrigin, 1.0f));
+                    const glm::vec3 localDir  = glm::vec3(invModel * glm::vec4(rayD, 0.0f));
+
+                    float tLocal = 0.0f;
+                    if (!rayLocalBoxIntersect(localOrig, localDir,
+                                              mdl.localBoundsMin, mdl.localBoundsMax, tLocal)) {
+                        continue;
+                    }
+
+                    const glm::vec3 hitLocal = localOrig + localDir * tLocal;
+                    const glm::vec3 hitWorld = glm::vec3(inst.model * glm::vec4(hitLocal, 1.0f));
+                    const float worldDist = glm::length(hitWorld - rayOrigin);
+                    if (worldDist > maxDist || worldDist >= best.distance) continue;
+
+                    const glm::vec3 instPos   = glm::vec3(inst.model[3]);
+                    const float     instScale = glm::length(glm::vec3(inst.model[0]));
+
+                    // 光环落在模型底座：原点贴近底座时向下采样真实地面，避免室内一楼光环飞到二楼
+                    glm::vec3 groundPos(instPos.x, instPos.y, inst.worldBoundsMin.z);
+                    if ((instPos.z - inst.worldBoundsMin.z) < 2.0f) {
+                        float groundZ = instPos.z + 0.5f;
+                        if (SampleGroundHeight(tiles, groundPos.x, groundPos.y, instPos.z, groundZ)) {
+                            groundPos.z = groundZ;
+                        }
+                    }
+
+                    // 光环直径取底座较窄边，紧凑包裹树干 / 石柱根部
+                    const glm::vec2 xySpan =
+                        glm::vec2(mdl.localBoundsMax - mdl.localBoundsMin) * instScale;
 
                     best.hit       = true;
                     best.isWmo     = false;
-                    best.distance  = tHit;
+                    best.distance  = worldDist;
                     best.uniqueId  = inst.uniqueId;
                     best.center    = inst.worldCenter;
-                    best.radius    = inst.worldRadius;
+                    best.groundPos = groundPos;
+                    best.radius    = glm::clamp(std::min(xySpan.x, xySpan.y) * 0.65f, 1.4f, 4.2f);
                     best.modelPath = doodadBatch.modelPath;
-                    best.groundPos = glm::vec3(inst.worldCenter.x, inst.worldCenter.y, inst.worldBoundsMin.z);
                 }
             }
 
-            // 2. WMO 大型建筑
+            // 2. WMO 大型建筑：同样用局部紧凑盒，剔除包住相机的整栋巨型盒
             for (const auto& wmoBatch : tile.wmoBatches) {
                 if (!wmoBatch.model) continue;
+                const auto& mdl = *wmoBatch.model;
                 for (const auto& inst : wmoBatch.instances) {
                     if (inst.uniqueId != 0 && !testedWmoIds.insert(inst.uniqueId).second) continue;
-                    if (sphereReject(inst.worldCenter, inst.worldRadius)) continue;
 
-                    float tHit = 0.0f;
-                    if (!rayBoxIntersect(inst.worldBoundsMin, inst.worldBoundsMax, tHit)) continue;
-                    if (tHit > maxDist || tHit >= best.distance) continue;
+                    const glm::mat4 invModel  = glm::inverse(inst.model);
+                    const glm::vec3 localOrig = glm::vec3(invModel * glm::vec4(rayOrigin, 1.0f));
+                    const glm::vec3 localDir  = glm::vec3(invModel * glm::vec4(rayD, 0.0f));
+
+                    float tLocal = 0.0f;
+                    if (!rayLocalBoxIntersect(localOrig, localDir,
+                                              mdl.localBoundsMin, mdl.localBoundsMax, tLocal)) {
+                        continue;
+                    }
+
+                    const glm::vec3 hitLocal = localOrig + localDir * tLocal;
+                    const glm::vec3 hitWorld = glm::vec3(inst.model * glm::vec4(hitLocal, 1.0f));
+                    const float worldDist = glm::length(hitWorld - rayOrigin);
+                    if (worldDist > maxDist || worldDist >= best.distance) continue;
+
+                    const glm::vec3 instPos = glm::vec3(inst.model[3]);
+                    glm::vec3 groundPos(instPos.x, instPos.y, inst.worldBoundsMin.z);
+                    float groundZ = instPos.z + 0.5f;
+                    if (SampleGroundHeight(tiles, groundPos.x, groundPos.y, instPos.z, groundZ)) {
+                        groundPos.z = groundZ;
+                    }
 
                     best.hit       = true;
                     best.isWmo     = true;
-                    best.distance  = tHit;
+                    best.distance  = worldDist;
                     best.uniqueId  = inst.uniqueId;
                     best.center    = inst.worldCenter;
-                    best.radius    = inst.worldRadius;
+                    best.groundPos = groundPos;
+                    best.radius    = glm::clamp(inst.worldRadius * 0.35f, 1.6f, 4.5f);
                     best.modelPath = wmoBatch.modelPath;
-                    best.groundPos = glm::vec3(inst.worldCenter.x, inst.worldCenter.y, inst.worldBoundsMin.z);
                 }
             }
         }
 
-        // 命中后从包围盒中心向下采样真实地形高度，使选中光环贴合地面
-        if (best.hit) {
-            float groundZ = best.groundPos.z;
-            if (SampleGroundHeight(tiles, best.groundPos.x, best.groundPos.y, best.center.z, groundZ)) {
-                best.groundPos.z = groundZ;
-            }
-        }
         return best;
     }
 
