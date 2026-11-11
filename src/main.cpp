@@ -1021,11 +1021,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
             bool      visible = false;
         };
         std::vector<LandmarkNpc> landmarkNpcs = {
-            { glm::vec3(-8918.0f, -142.0f, 0.0f), glm::vec3(0.0f), false }, // 北郡修道院前
-            { glm::vec3(-9464.0f,   48.0f, 0.0f), glm::vec3(0.0f), false }, // 闪金镇旅馆前
-            { glm::vec3(-9052.0f,  442.0f, 0.0f), glm::vec3(0.0f), false }, // 暴风城英雄谷桥头
-            { glm::vec3(-8532.0f,  838.0f, 0.0f), glm::vec3(0.0f), false }, // 大教堂广场
-            { glm::vec3(-9256.0f, -204.0f, 0.0f), glm::vec3(0.0f), false }, // 水晶湖渡口
+            { glm::vec3(-8902.0f, -155.0f,  85.0f), glm::vec3(0.0f), false }, // F1 北郡修道院门前开阔广场
+            { glm::vec3(-9450.0f,   62.0f,  60.0f), glm::vec3(0.0f), false }, // F2 闪金镇旅馆门前大道
+            { glm::vec3(-9050.0f,  435.0f,  96.0f), glm::vec3(0.0f), false }, // F3 暴风城英雄谷大桥桥面正中央
+            { glm::vec3(-8528.0f,  845.0f, 110.0f), glm::vec3(0.0f), false }, // F4 暴风城大教堂广场中央
+            { glm::vec3(-9250.0f, -210.0f,  62.0f), glm::vec3(0.0f), false }, // F5 水晶湖渡口岸边
         };
 
         bool running = true;
@@ -1461,13 +1461,16 @@ int main(int /*argc*/, char* /*argv*/[]) {
             uboData.skyMid             = glm::vec4(lightState.skyMiddle, 1.0f);
             uboData.skyBand1           = glm::vec4(lightState.skyBand1, 1.0f);
             uboData.skyHorizon         = glm::vec4(lightState.skyHorizon, 1.0f);
-            // 把角色 / 相机所在位置的水面高度写入 uWaterShallow.w，供世界与水体着色器做吃水线遮挡
+            // 仅当角色处于行走/游泳模式且脚底真正没入水面超过 0.25 码时，才写入水面高度；
+            // 否则保持 -1e30，使世界着色器跳过水下遮挡，避免飞行 / 岸边站立被误染色
             float curWaterZ = -1e30f;
-            (void)coa::assets::AdtLoader::SampleWaterHeight(
-                adtTiles,
-                walkMode ? playerPos.x : camPos.x,
-                walkMode ? playerPos.y : camPos.y,
-                curWaterZ);
+            if (walkMode) {
+                float rawWaterZ = -1e30f;
+                if (coa::assets::AdtLoader::SampleWaterHeight(adtTiles, playerPos.x, playerPos.y, rawWaterZ) &&
+                    rawWaterZ > playerPos.z + 0.25f) {
+                    curWaterZ = rawWaterZ;
+                }
+            }
             uboData.waterShallow       = glm::vec4(lightState.riverShallow, curWaterZ);
             uboData.waterDeep          = glm::vec4(lightState.riverDeep, 1.0f);
 
@@ -1923,10 +1926,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 for (auto& npc : landmarkNpcs) {
                     npc.visible = false;
                     if (glm::distance(npc.spawn, camPos) > 180.0f) continue;
-                    float groundZ = npc.worldPos.z;
+                    // 以 NPC 出生海拔作为射线起点高度：使 WMO 桥面 (暴风城大桥约 95 码)
+                    // 能被射线命中，而不再穿透到桥下护城河地形
+                    float groundZ = npc.spawn.z;
                     if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, npc.spawn.x, npc.spawn.y,
-                                                                 200.0f, groundZ)) {
-                        groundZ = 0.0f;
+                                                                 npc.spawn.z, groundZ)) {
+                        groundZ = npc.spawn.z;
                     }
                     npc.worldPos = glm::vec3(npc.spawn.x, npc.spawn.y, groundZ);
                     npc.visible  = true;
