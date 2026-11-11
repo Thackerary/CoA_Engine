@@ -1080,23 +1080,25 @@ int main(int /*argc*/, char* /*argv*/[]) {
             glm::vec3 spawn{0.0f};       // 巡逻起点 (Z 每帧按地形吸附)
             glm::vec3 worldPos{0.0f};    // 每帧更新后的脚底世界坐标
             bool      visible  = false;
-            float     patrolPhase = 0.0f; // 0..1 巡逻进度 (10 秒一个完整往返)
+            bool      initialized   = false; // 是否已完成首次地面吸附初始化
+            bool      patrolForward = true;  // 当前巡逻方向：true = +X, false = -X
+            float     pauseTimer    = 0.0f;  // 折返后或起步时的原地停顿时长
             float     yaw      = 0.0f;
             int       animAction = 0;     // 0=Stand, 1=Walk
             float     hp       = 100.0f;
             float     maxHp    = 100.0f;
         };
         std::vector<LandmarkNpc> landmarkNpcs = {
-            { glm::vec3(-8902.0f, -155.0f,  85.0f), glm::vec3(0.0f), false }, // F1 北郡修道院门前开阔广场
+            { glm::vec3(-8942.0f, -165.0f,  83.0f), glm::vec3(0.0f), false }, // F1 北郡修道院南侧开阔大道
             { glm::vec3(-9450.0f,   62.0f,  60.0f), glm::vec3(0.0f), false }, // F2 闪金镇旅馆门前大道
             { glm::vec3(-9050.0f,  435.0f,  96.0f), glm::vec3(0.0f), false }, // F3 暴风城英雄谷大桥桥面正中央
             { glm::vec3(-8528.0f,  845.0f, 110.0f), glm::vec3(0.0f), false }, // F4 暴风城大教堂广场中央
             { glm::vec3(-9250.0f, -210.0f,  62.0f), glm::vec3(0.0f), false }, // F5 水晶湖渡口岸边
         };
 
-        // 各 NPC 巡逻相位错开，避免整排 NPC 同步齐步走
+        // 各 NPC 起步停顿错开，避免整排 NPC 同步齐步走
         for (size_t i = 0; i < landmarkNpcs.size(); ++i) {
-            landmarkNpcs[i].patrolPhase = static_cast<float>(i) * 0.17f;
+            landmarkNpcs[i].pauseTimer = static_cast<float>(i) * 0.35f;
         }
 
         // 方向 N：玩家攻击动作计时、施法读条计时与魔法飞弹状态
@@ -1247,7 +1249,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                            ev.key.scancode <= SDL_SCANCODE_F5) {
                     // F1~F5 地标瞬移热键
                     static const glm::vec3 kLandmarks[5] = {
-                        glm::vec3(-8915.0f, -155.0f,  85.0f), // F1 北郡修道院
+                        glm::vec3(-8952.0f, -165.0f,  83.0f), // F1 北郡修道院南侧开阔大道
                         glm::vec3(-9460.0f,   62.0f,  60.0f), // F2 闪金镇
                         glm::vec3(-9065.0f,  435.0f,  96.0f), // F3 暴风城英雄谷大门
                         glm::vec3(-8540.0f,  845.0f, 110.0f), // F4 暴风城大教堂广场
@@ -2045,55 +2047,69 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     npc.visible = false;
                     if (glm::distance(npc.spawn, camPos) > 180.0f) continue;
 
-                    // 以 NPC 出生海拔作为射线起点高度：使 WMO 桥面 (暴风城大桥约 95 码)
-                    // 能被射线命中，而不再穿透到桥下护城河地形
-                    float groundZ = npc.spawn.z;
-                    if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, npc.spawn.x, npc.spawn.y,
-                                                                 npc.spawn.z, groundZ)) {
-                        groundZ = npc.spawn.z;
+                    // 首次进入视距时初始化巡逻起点：以出生海拔作为射线起点，使 WMO 桥面
+                    // (暴风城大桥约 95 码) 能被射线命中，而不再穿透到桥下护城河地形
+                    if (!npc.initialized) {
+                        float initGroundZ = npc.spawn.z;
+                        if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, npc.spawn.x, npc.spawn.y,
+                                                                       npc.spawn.z, initGroundZ)) {
+                            initGroundZ = npc.spawn.z;
+                        }
+                        npc.worldPos    = glm::vec3(npc.spawn.x, npc.spawn.y, initGroundZ);
+                        npc.initialized = true;
                     }
-
-                    // 巡逻：0 -> +10 码 -> 0 的三角波，两端由 smoothstep 自然减速形成停顿
-                    npc.patrolPhase = std::fmod(npc.patrolPhase + dt / 10.0f, 1.0f);
-                    float tri = npc.patrolPhase * 2.0f;
-                    if (tri > 1.0f) tri = 2.0f - tri;
-                    const float patrolT   = glm::smoothstep(0.0f, 1.0f, tri);
-                    const float patrolOff = 10.0f * patrolT;
-                    const bool  walking   = (patrolT > 0.02f && patrolT < 0.98f);
-
-                    const glm::vec3 walkPos(npc.spawn.x + patrolOff, npc.spawn.y, groundZ);
-                    float footZ = groundZ;
-                    if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, walkPos.x, walkPos.y,
-                                                                   groundZ, footZ)) {
-                        footZ = groundZ;
-                    }
-                    const glm::vec3 npcPos(walkPos.x, walkPos.y, footZ);
 
                     const bool selected = currentPick.hit &&
                                           currentPick.uniqueId == static_cast<uint32_t>(i + 1000);
-                    if (selected && glm::distance(npcPos, viewerPos) < 12.0f) {
+                    if (selected && glm::distance(npc.worldPos, viewerPos) < 12.0f) {
                         // 被选中且玩家已靠近：原地驻足并转身面向玩家
                         npc.animAction = 0;
-                        npc.yaw = std::atan2(viewerPos.y - npcPos.y, viewerPos.x - npcPos.x);
-                    } else if (walking) {
-                        npc.animAction = 1; // Walk
-                        npc.yaw = (npc.patrolPhase < 0.5f) ? 0.0f : 3.14159265f;
+                        npc.yaw = std::atan2(viewerPos.y - npc.worldPos.y, viewerPos.x - npc.worldPos.x);
+                    } else if (npc.pauseTimer > 0.0f) {
+                        // 折返 / 起步停顿：原地站立，避免瞬间转向抖动
+                        npc.pauseTimer -= dt;
+                        npc.animAction = 0;
                     } else {
-                        npc.animAction = 0; // Stand
+                        // 物理巡逻步进：Collide-and-Slide 解析墙体与陡坡，受阻或越界即自动折返
+                        const glm::vec2 dir = npc.patrolForward ? glm::vec2(1.0f, 0.0f)
+                                                                : glm::vec2(-1.0f, 0.0f);
+                        const glm::vec2 step = dir * (2.6f * dt);
+                        const glm::vec2 curXY(npc.worldPos.x, npc.worldPos.y);
+                        const glm::vec2 resolvedXY = coa::assets::AdtLoader::ResolveHorizontalCollision(
+                            adtTiles, curXY, step, npc.worldPos.z);
+
+                        float nextZ = npc.worldPos.z;
+                        if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, resolvedXY.x, resolvedXY.y,
+                                                                       npc.worldPos.z, nextZ)) {
+                            nextZ = npc.worldPos.z;
+                        }
+
+                        const bool blocked = glm::length(resolvedXY - curXY) < glm::length(step) * 0.5f ||
+                                             std::fabs(nextZ - npc.worldPos.z) > 0.8f;
+                        const bool outOfRange =
+                            glm::distance(resolvedXY, glm::vec2(npc.spawn.x, npc.spawn.y)) >= 9.0f;
+                        if (blocked || outOfRange) {
+                            npc.patrolForward = !npc.patrolForward;
+                            npc.pauseTimer    = 2.5f;
+                            npc.animAction    = 0;
+                        } else {
+                            npc.worldPos   = glm::vec3(resolvedXY.x, resolvedXY.y, nextZ);
+                            npc.yaw        = std::atan2(dir.y, dir.x);
+                            npc.animAction = 1; // Walk
+                        }
                     }
 
-                    npc.worldPos = npcPos;
-                    npc.visible  = true;
+                    npc.visible = true;
 
                     // 每个 NPC 动作不同，必须独立评估一次骨骼栈，不能共用同一 baseIndex
                     npcBoneBases[i] = playerModel->EvaluateBones(animTimeSec, visibleBoneMatrices,
                                                                  npc.animAction);
-                    npcMats[i] = glm::translate(glm::mat4(1.0f), npcPos) *
+                    npcMats[i] = glm::translate(glm::mat4(1.0f), npc.worldPos) *
                                  glm::rotate(glm::mat4(1.0f), npc.yaw, glm::vec3(0.0f, 0.0f, 1.0f));
 
                     // 选中目标脚下的绿圈实时跟随移动中的 NPC
                     if (selected) {
-                        currentPick.groundPos = npcPos;
+                        currentPick.groundPos = npc.worldPos;
                     }
                 }
 
