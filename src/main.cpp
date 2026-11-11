@@ -1093,7 +1093,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
             { glm::vec3(-9450.0f,   62.0f,  60.0f), glm::vec3(0.0f), false }, // F2 闪金镇旅馆门前大道
             { glm::vec3(-9050.0f,  435.0f,  96.0f), glm::vec3(0.0f), false }, // F3 暴风城英雄谷大桥桥面正中央
             { glm::vec3(-8528.0f,  845.0f, 110.0f), glm::vec3(0.0f), false }, // F4 暴风城大教堂广场中央
-            { glm::vec3(-9250.0f, -210.0f,  62.0f), glm::vec3(0.0f), false }, // F5 水晶湖渡口岸边
+            { glm::vec3(-9258.0f, -185.0f,  64.0f), glm::vec3(0.0f), false }, // F5 水晶湖北岸开阔草地
         };
 
         // 各 NPC 起步停顿错开，避免整排 NPC 同步齐步走
@@ -1253,7 +1253,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         glm::vec3(-9460.0f,   62.0f,  60.0f), // F2 闪金镇
                         glm::vec3(-9065.0f,  435.0f,  96.0f), // F3 暴风城英雄谷大门
                         glm::vec3(-8540.0f,  845.0f, 110.0f), // F4 暴风城大教堂广场
-                        glm::vec3(-9260.0f, -210.0f,  62.0f), // F5 水晶湖渡口
+                        glm::vec3(-9268.0f, -185.0f,  64.0f), // F5 水晶湖北岸开阔草地
                     };
                     const int idx = static_cast<int>(ev.key.scancode) - static_cast<int>(SDL_SCANCODE_F1);
                     camPos      = kLandmarks[idx];
@@ -2048,12 +2048,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     if (glm::distance(npc.spawn, camPos) > 180.0f) continue;
 
                     // 首次进入视距时初始化巡逻起点：以出生海拔作为射线起点，使 WMO 桥面
-                    // (暴风城大桥约 95 码) 能被射线命中，而不再穿透到桥下护城河地形
+                    // (暴风城大桥约 95 码) 能被射线命中，而不再穿透到桥下护城河地形。
+                    // 关键修复：若该 NPC 所在 ADT 尚未流式加载完成，则本帧直接跳过，
+                    // 绝不回退为 0.0f 或提前标记 initialized，避免瞬移后 NPC 卡在地下。
                     if (!npc.initialized) {
                         float initGroundZ = npc.spawn.z;
                         if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, npc.spawn.x, npc.spawn.y,
                                                                        npc.spawn.z, initGroundZ)) {
-                            initGroundZ = npc.spawn.z;
+                            continue;
                         }
                         npc.worldPos    = glm::vec3(npc.spawn.x, npc.spawn.y, initGroundZ);
                         npc.initialized = true;
@@ -2078,14 +2080,28 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         const glm::vec2 resolvedXY = coa::assets::AdtLoader::ResolveHorizontalCollision(
                             adtTiles, curXY, step, npc.worldPos.z);
 
+                        // 从当前脚下上方 2 码向下探测：取到的是前方真正的地面而非脚下缓存高度
                         float nextZ = npc.worldPos.z;
-                        if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, resolvedXY.x, resolvedXY.y,
-                                                                       npc.worldPos.z, nextZ)) {
-                            nextZ = npc.worldPos.z;
+                        const bool hasNextGround = coa::assets::AdtLoader::SampleGroundHeight(
+                            adtTiles, resolvedXY.x, resolvedXY.y, npc.worldPos.z + 2.0f, nextZ);
+                        // 前方无地面 (已走出已加载地形边缘) 视为受阻
+                        if (!hasNextGround) {
+                            npc.patrolForward = !npc.patrolForward;
+                            npc.pauseTimer    = 2.5f;
+                            npc.animAction    = 0;
+                            npc.visible       = true;
+                            continue;
                         }
 
+                        // 前方入水检测：水面明显高于落脚地面时视为受阻，杜绝陆地 NPC 走进湖中
+                        float waterZ = -1e30f;
+                        const bool inWater = coa::assets::AdtLoader::SampleWaterHeight(
+                            adtTiles, resolvedXY.x, resolvedXY.y, waterZ) &&
+                            waterZ > nextZ + 0.35f;
+
                         const bool blocked = glm::length(resolvedXY - curXY) < glm::length(step) * 0.5f ||
-                                             std::fabs(nextZ - npc.worldPos.z) > 0.8f;
+                                             std::fabs(nextZ - npc.worldPos.z) > 0.8f ||
+                                             inWater;
                         const bool outOfRange =
                             glm::distance(resolvedXY, glm::vec2(npc.spawn.x, npc.spawn.y)) >= 9.0f;
                         if (blocked || outOfRange) {
