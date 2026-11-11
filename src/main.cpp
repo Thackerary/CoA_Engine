@@ -67,6 +67,13 @@ struct ParticleBatchCmd {
     uint32_t quadCount = 0;
 };
 
+// 单个 2D HUD 方框的 GPU 实例数据 (32 字节，std430 紧凑排布，对应 kUiVertShader)
+struct alignas(16) GpuUiQuad {
+    glm::vec4 rectPx; // xy = 屏幕左上角像素坐标, zw = 宽高像素
+    glm::vec4 color;  // rgba
+};
+static_assert(sizeof(GpuUiQuad) == 32, "GpuUiQuad must be 32 bytes");
+
 struct Frustum {
     glm::vec4 planes[6];
 
@@ -717,6 +724,55 @@ void main() {
 }
 )GLSL";
 
+// 2D HUD 顶点着色器：gl_VertexID 展开 6 顶点矩形，按左上角像素原点换算到 NDC
+constexpr std::string_view kUiVertShader = R"GLSL(
+#version 460 core
+struct GpuUiQuad {
+    vec4 rectPx; // xy = 屏幕左上角像素坐标, zw = 宽高
+    vec4 color;  // rgba
+};
+
+layout(std430, binding = 3) readonly buffer UiBuffer {
+    GpuUiQuad uQuads[];
+};
+
+layout(location = 0) uniform vec2 uScreenSize;
+
+out vec4 vColor;
+out vec2 vLocal;
+
+const vec2 kQuadCorners[6] = vec2[6](
+    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
+    vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0)
+);
+
+void main() {
+    GpuUiQuad q  = uQuads[gl_BaseInstance + gl_InstanceID];
+    vec2 corner  = kQuadCorners[gl_VertexID % 6];
+    vec2 px      = q.rectPx.xy + corner * q.rectPx.zw;
+    vec2 ndc     = vec2(px.x / max(uScreenSize.x, 1.0),
+                        1.0 - px.y / max(uScreenSize.y, 1.0)) * 2.0 - 1.0;
+    gl_Position  = vec4(ndc, 0.0, 1.0);
+    vColor       = q.color;
+    vLocal       = corner;
+}
+)GLSL";
+
+// 2D HUD 片段着色器：纯色填充 + 约 1 像素的暗边描边，让方框具备立体层次
+constexpr std::string_view kUiFragShader = R"GLSL(
+#version 460 core
+in vec4 vColor;
+in vec2 vLocal;
+
+out vec4 FragColor;
+
+void main() {
+    float edge   = min(min(vLocal.x, 1.0 - vLocal.x), min(vLocal.y, 1.0 - vLocal.y));
+    float border = smoothstep(0.0, 0.12, edge);
+    FragColor = vec4(vColor.rgb * mix(0.55, 1.0, border), vColor.a);
+}
+)GLSL";
+
 // 阴影深度顶点着色器：复用世界顶点布局 + 骨骼蒙皮 + 硬件实例化，仅输出光空间深度
 constexpr std::string_view kShadowVertShader = R"GLSL(
 #version 460 core
@@ -830,6 +886,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
         coa::rhi::GlShaderProgram waterShader(kWaterVertShader, kWaterFragShader);
         coa::rhi::GlShaderProgram skyShader(kSkyVertShader, kSkyFragShader);
         coa::rhi::GlShaderProgram particleShader(kParticleVertShader, kParticleFragShader);
+        coa::rhi::GlShaderProgram uiShader(kUiVertShader, kUiFragShader);
         coa::rhi::GlShaderProgram shadowShader(kShadowVertShader, kShadowFragShader);
         GLuint sharedM2Vao = coa::assets::GpuM2Model::CreateSharedVAO();
         GLuint terrainVao  = coa::assets::GpuAdtTile::CreateTerrainVAO();
@@ -876,6 +933,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
         // binding = 2: 本帧全部公告板粒子实例数据
         coa::rhi::GlBuffer particleSsbo(sizeof(GpuParticleQuad), nullptr, GL_DYNAMIC_STORAGE_BIT);
         particleSsbo.BindAsStorageBuffer(2);
+        // binding = 3: 本帧全部 2D HUD 方框实例数据
+        coa::rhi::GlBuffer uiSsbo(sizeof(GpuUiQuad), nullptr, GL_DYNAMIC_STORAGE_BIT);
+        uiSsbo.BindAsStorageBuffer(3);
 
         coa::rhi::GlTexture2D whiteFallbackTex(1, 1, 1, coa::rhi::PixelFormat::RGBA8, true);
         const uint8_t whitePixel[4] = {180, 210, 140, 255}; // 浅草绿兜底色
@@ -1011,14 +1071,20 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::vector<glm::mat4> visibleBoneMatrices;
         std::vector<GpuParticleQuad>  visibleParticles;
         std::vector<ParticleBatchCmd> particleBatches;
+        std::vector<GpuUiQuad>        uiQuads;
         // 方向 M：鼠标左键射线拾取的当前选中目标 (ESC 清空)
         coa::assets::AdtLoader::PickResult currentPick{};
 
-        // 方向 M：各地标前放置可点击选中的 NPC 实体 (复用第三人称角色模型，Stand 待机姿态)
+        // 方向 M/N：各地标前放置可点击选中、可自主巡逻并拥有生命值的 NPC 实体
         struct LandmarkNpc {
-            glm::vec3 spawn{0.0f};    // 地标 XY (Z 每帧按地形吸附)
-            glm::vec3 worldPos{0.0f}; // 每帧更新后的脚底世界坐标
-            bool      visible = false;
+            glm::vec3 spawn{0.0f};       // 巡逻起点 (Z 每帧按地形吸附)
+            glm::vec3 worldPos{0.0f};    // 每帧更新后的脚底世界坐标
+            bool      visible  = false;
+            float     patrolPhase = 0.0f; // 0..1 巡逻进度 (10 秒一个完整往返)
+            float     yaw      = 0.0f;
+            int       animAction = 0;     // 0=Stand, 1=Walk
+            float     hp       = 100.0f;
+            float     maxHp    = 100.0f;
         };
         std::vector<LandmarkNpc> landmarkNpcs = {
             { glm::vec3(-8902.0f, -155.0f,  85.0f), glm::vec3(0.0f), false }, // F1 北郡修道院门前开阔广场
@@ -1027,6 +1093,21 @@ int main(int /*argc*/, char* /*argv*/[]) {
             { glm::vec3(-8528.0f,  845.0f, 110.0f), glm::vec3(0.0f), false }, // F4 暴风城大教堂广场中央
             { glm::vec3(-9250.0f, -210.0f,  62.0f), glm::vec3(0.0f), false }, // F5 水晶湖渡口岸边
         };
+
+        // 各 NPC 巡逻相位错开，避免整排 NPC 同步齐步走
+        for (size_t i = 0; i < landmarkNpcs.size(); ++i) {
+            landmarkNpcs[i].patrolPhase = static_cast<float>(i) * 0.17f;
+        }
+
+        // 方向 N：玩家攻击动作计时、施法读条计时与魔法飞弹状态
+        float attackAnimTimer = 0.0f;
+        float castBarTimer    = 0.0f;
+        struct SpellProjectile {
+            bool      active    = false;
+            glm::vec3 pos{0.0f};
+            size_t    targetNpc = 0;
+        };
+        SpellProjectile activeProj{};
 
         bool running = true;
 
@@ -1069,6 +1150,29 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
                     // 方向 M：ESC 取消当前选中目标并移除脚下光环
                     currentPick = {};
+                } else if (ev.type == SDL_EVENT_KEY_DOWN &&
+                           (ev.key.scancode == SDL_SCANCODE_1 || ev.key.scancode == SDL_SCANCODE_2)) {
+                    // 方向 N：对着当前选中的 NPC 施放 1/2 号法术，触发攻击动作与魔法飞弹
+                    if (currentPick.hit && currentPick.uniqueId >= 1000) {
+                        const size_t idx = static_cast<size_t>(currentPick.uniqueId - 1000);
+                        if (idx < landmarkNpcs.size() && landmarkNpcs[idx].visible) {
+                            const glm::vec3& npcPos = landmarkNpcs[idx].worldPos;
+                            const glm::vec3  castFrom = walkMode ? playerPos : camPos;
+                            if (walkMode) {
+                                playerYaw = std::atan2(npcPos.y - playerPos.y, npcPos.x - playerPos.x);
+                            } else {
+                                camYaw = std::atan2(npcPos.y - camPos.y, npcPos.x - camPos.x);
+                            }
+                            attackAnimTimer = 0.65f;
+                            castBarTimer    = 0.45f;
+                            activeProj.active    = true;
+                            activeProj.pos       = castFrom + glm::vec3(0.0f, 0.0f, 1.3f);
+                            activeProj.targetNpc = idx;
+                            std::printf("[Spell] Cast %s at NPC #%zu (hp:%.0f)\n",
+                                        (ev.key.scancode == SDL_SCANCODE_1) ? "Firebolt" : "Frostbolt",
+                                        idx, landmarkNpcs[idx].hp);
+                        }
+                    }
                 } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT) {
                     // 方向 M：鼠标左键发射世界空间射线，仅精确拾取场景 NPC 实体
                     // (背景树木 / 建筑不参与拾取，避免选中光环错位到树冠或整栋建筑)
@@ -1097,7 +1201,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     currentPick = {};
 
                     // 地标 NPC 拾取：局部盒 [-0.8,-0.8,0] ~ [0.8,0.8,2.1]，取沿射线最近的命中
-                    for (const auto& npc : landmarkNpcs) {
+                    for (size_t npcIdx = 0; npcIdx < landmarkNpcs.size(); ++npcIdx) {
+                        const auto& npc = landmarkNpcs[npcIdx];
                         if (!npc.visible) continue;
                         const glm::vec3 bmin = npc.worldPos + glm::vec3(-0.8f, -0.8f, 0.0f);
                         const glm::vec3 bmax = npc.worldPos + glm::vec3( 0.8f,  0.8f, 2.1f);
@@ -1123,7 +1228,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         currentPick.hit       = true;
                         currentPick.isWmo     = false;
                         currentPick.distance  = tNear;
-                        currentPick.uniqueId  = 0;
+                        currentPick.uniqueId  = static_cast<uint32_t>(npcIdx + 1000);
                         currentPick.center    = npc.worldPos + glm::vec3(0.0f, 0.0f, 1.05f);
                         currentPick.groundPos = npc.worldPos;
                         currentPick.radius    = 2.0f;
@@ -1315,6 +1420,15 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 if (keys[SDL_SCANCODE_A]) camPos -= right * moveSpeed;
                 if (keys[SDL_SCANCODE_SPACE]) camPos += worldUp * moveSpeed;
                 if (keys[SDL_SCANCODE_LCTRL]) camPos -= worldUp * moveSpeed;
+            }
+
+            // 方向 N：攻击动作与施法读条计时，攻击期间强制覆盖骨骼动作为 Attack/Spell(6)
+            if (attackAnimTimer > 0.0f) {
+                attackAnimTimer -= dt;
+                if (walkMode) playerAnimAction = 6;
+            }
+            if (castBarTimer > 0.0f) {
+                castBarTimer -= dt;
             }
 
             // ---- 方向 I：基于真实距离的 ADT 流式加载与卸载 ----
@@ -1920,12 +2034,17 @@ int main(int /*argc*/, char* /*argv*/[]) {
                 }
             }
 
-            // 2.6 方向 M：地标 NPC 实体 (复用第三人称角色模型，统一 Stand(0) 待机姿态)
+            // 2.6 方向 M/N：地标 NPC 实体 (自主巡逻 + 面向玩家驻足 + 独立动作姿态 + 生命值)
             if (playerModel && !playerModel->submeshes.empty()) {
-                bool needNpcBones = false;
-                for (auto& npc : landmarkNpcs) {
+                const glm::vec3 viewerPos = walkMode ? playerPos : camPos;
+                std::vector<glm::mat4> npcMats(landmarkNpcs.size(), glm::mat4(1.0f));
+                std::vector<uint32_t>  npcBoneBases(landmarkNpcs.size(), 0u);
+
+                for (size_t i = 0; i < landmarkNpcs.size(); ++i) {
+                    auto& npc = landmarkNpcs[i];
                     npc.visible = false;
                     if (glm::distance(npc.spawn, camPos) > 180.0f) continue;
+
                     // 以 NPC 出生海拔作为射线起点高度：使 WMO 桥面 (暴风城大桥约 95 码)
                     // 能被射线命中，而不再穿透到桥下护城河地形
                     float groundZ = npc.spawn.z;
@@ -1933,19 +2052,56 @@ int main(int /*argc*/, char* /*argv*/[]) {
                                                                  npc.spawn.z, groundZ)) {
                         groundZ = npc.spawn.z;
                     }
-                    npc.worldPos = glm::vec3(npc.spawn.x, npc.spawn.y, groundZ);
+
+                    // 巡逻：0 -> +10 码 -> 0 的三角波，两端由 smoothstep 自然减速形成停顿
+                    npc.patrolPhase = std::fmod(npc.patrolPhase + dt / 10.0f, 1.0f);
+                    float tri = npc.patrolPhase * 2.0f;
+                    if (tri > 1.0f) tri = 2.0f - tri;
+                    const float patrolT   = glm::smoothstep(0.0f, 1.0f, tri);
+                    const float patrolOff = 10.0f * patrolT;
+                    const bool  walking   = (patrolT > 0.02f && patrolT < 0.98f);
+
+                    const glm::vec3 walkPos(npc.spawn.x + patrolOff, npc.spawn.y, groundZ);
+                    float footZ = groundZ;
+                    if (!coa::assets::AdtLoader::SampleGroundHeight(adtTiles, walkPos.x, walkPos.y,
+                                                                   groundZ, footZ)) {
+                        footZ = groundZ;
+                    }
+                    const glm::vec3 npcPos(walkPos.x, walkPos.y, footZ);
+
+                    const bool selected = currentPick.hit &&
+                                          currentPick.uniqueId == static_cast<uint32_t>(i + 1000);
+                    if (selected && glm::distance(npcPos, viewerPos) < 12.0f) {
+                        // 被选中且玩家已靠近：原地驻足并转身面向玩家
+                        npc.animAction = 0;
+                        npc.yaw = std::atan2(viewerPos.y - npcPos.y, viewerPos.x - npcPos.x);
+                    } else if (walking) {
+                        npc.animAction = 1; // Walk
+                        npc.yaw = (npc.patrolPhase < 0.5f) ? 0.0f : 3.14159265f;
+                    } else {
+                        npc.animAction = 0; // Stand
+                    }
+
+                    npc.worldPos = npcPos;
                     npc.visible  = true;
-                    needNpcBones = true;
+
+                    // 每个 NPC 动作不同，必须独立评估一次骨骼栈，不能共用同一 baseIndex
+                    npcBoneBases[i] = playerModel->EvaluateBones(animTimeSec, visibleBoneMatrices,
+                                                                 npc.animAction);
+                    npcMats[i] = glm::translate(glm::mat4(1.0f), npcPos) *
+                                 glm::rotate(glm::mat4(1.0f), npc.yaw, glm::vec3(0.0f, 0.0f, 1.0f));
+
+                    // 选中目标脚下的绿圈实时跟随移动中的 NPC
+                    if (selected) {
+                        currentPick.groundPos = npcPos;
+                    }
                 }
 
-                const uint32_t npcBoneBase = needNpcBones
-                    ? playerModel->EvaluateBones(animTimeSec, visibleBoneMatrices, 0)
-                    : 0u;
-
-                for (const auto& npc : landmarkNpcs) {
+                for (size_t i = 0; i < landmarkNpcs.size(); ++i) {
+                    const auto& npc = landmarkNpcs[i];
                     if (!npc.visible) continue;
                     const uint32_t npcInstIdx = static_cast<uint32_t>(visibleMatrices.size());
-                    visibleMatrices.push_back(glm::translate(glm::mat4(1.0f), npc.worldPos));
+                    visibleMatrices.push_back(npcMats[i]);
 
                     for (const auto& sub : playerModel->submeshes) {
                         glm::vec4 batchColor(1.0f);
@@ -1983,7 +2139,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         cmd.baseVertex    = 0;
                         cmd.instanceCount = 1;
                         cmd.baseInstance  = npcInstIdx;
-                        cmd.boneBaseIndex = npcBoneBase;
+                        cmd.boneBaseIndex = npcBoneBases[i];
                         cmd.isTwoSided    = ((sub.materialFlags & 0x04u) != 0) ? 1 : 0;
                         cmd.isUnlit       = ((sub.materialFlags & 0x01u) != 0 || pass >= 6) ? 1 : 0;
                         cmd.uvOffset      = glm::vec2(0.0f);
@@ -1995,6 +2151,42 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         }
                     }
                 }
+            }
+
+            // 2.7 方向 N：魔法飞弹飞行、发光尾迹与命中判定
+            if (activeProj.active && activeProj.targetNpc < landmarkNpcs.size()) {
+                auto& tgt = landmarkNpcs[activeProj.targetNpc];
+                const glm::vec3 aimPos = tgt.worldPos + glm::vec3(0.0f, 0.0f, 1.35f);
+                const glm::vec3 toAim  = aimPos - activeProj.pos;
+                const float     dist   = glm::length(toAim);
+                const glm::vec3 dir    = (dist > 1e-4f) ? (toAim / dist) : glm::vec3(0.0f, 0.0f, 1.0f);
+                const float     step   = 28.0f * dt;
+
+                if (dist <= std::max(step, 0.9f)) {
+                    // 命中：扣血并在归零后重置为满血，随后销毁飞弹
+                    tgt.hp -= 25.0f;
+                    if (tgt.hp <= 0.0f) tgt.hp = tgt.maxHp;
+                    activeProj.active = false;
+                } else {
+                    activeProj.pos += dir * step;
+                }
+
+                // 发光尾迹：沿飞行路径压入叠加混合的球状光点
+                const uint32_t trailFirst = static_cast<uint32_t>(visibleParticles.size());
+                for (int k = 0; k < 3; ++k) {
+                    const float back = static_cast<float>(k) * 0.42f;
+                    const float fade = static_cast<float>(k) / 3.0f;
+                    GpuParticleQuad trail{};
+                    trail.worldPosAndSize = glm::vec4(activeProj.pos - dir * back,
+                                                     std::max(0.55f - 0.14f * static_cast<float>(k), 0.18f));
+                    trail.color           = glm::vec4(glm::mix(glm::vec3(1.0f, 0.72f, 0.28f),
+                                                               glm::vec3(0.45f, 0.72f, 1.0f), fade),
+                                                      0.85f - 0.2f * static_cast<float>(k));
+                    trail.uvRect          = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f);
+                    visibleParticles.push_back(trail);
+                }
+                particleBatches.push_back(ParticleBatchCmd{
+                    whiteFallbackTex.Handle(), 3, trailFirst, 3u });
             }
 
             // 3. WMO 两级层次化裁剪：先整栋建筑，再逐个子房间
@@ -2265,6 +2457,94 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
                 glDepthMask(GL_TRUE);
                 glDisable(GL_BLEND);
+            }
+
+            // ---- 方向 N：2D HUD 框体、施法条与 3D 头顶浮动血条 ----
+            uiQuads.clear();
+
+            // 1. 左上角玩家框体：深色底框 + 绿色生命条 + 蓝色法力条
+            uiQuads.push_back(GpuUiQuad{ glm::vec4(20.0f, 20.0f, 210.0f, 48.0f),
+                                         glm::vec4(0.03f, 0.05f, 0.07f, 0.85f) });
+            uiQuads.push_back(GpuUiQuad{ glm::vec4(26.0f, 26.0f, 198.0f, 16.0f),
+                                         glm::vec4(0.08f, 0.09f, 0.09f, 0.90f) });
+            uiQuads.push_back(GpuUiQuad{ glm::vec4(26.0f, 26.0f, 198.0f, 16.0f),
+                                         glm::vec4(0.18f, 0.78f, 0.26f, 0.95f) });
+            uiQuads.push_back(GpuUiQuad{ glm::vec4(26.0f, 46.0f, 198.0f, 14.0f),
+                                         glm::vec4(0.08f, 0.09f, 0.09f, 0.90f) });
+            uiQuads.push_back(GpuUiQuad{ glm::vec4(26.0f, 46.0f, 198.0f, 14.0f),
+                                         glm::vec4(0.22f, 0.42f, 0.95f, 0.95f) });
+
+            // 2. 目标框体：按 npc.hp / npc.maxHp 比例绘制红色血条
+            const bool hasNpcTarget = currentPick.hit && currentPick.uniqueId >= 1000 &&
+                                      static_cast<size_t>(currentPick.uniqueId - 1000) < landmarkNpcs.size();
+            if (hasNpcTarget) {
+                const auto& tgt    = landmarkNpcs[static_cast<size_t>(currentPick.uniqueId - 1000)];
+                const float hpFrac = (tgt.maxHp > 0.0f) ? glm::clamp(tgt.hp / tgt.maxHp, 0.0f, 1.0f) : 0.0f;
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(250.0f, 20.0f, 210.0f, 48.0f),
+                                             glm::vec4(0.03f, 0.05f, 0.07f, 0.85f) });
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(256.0f, 26.0f, 198.0f, 16.0f),
+                                             glm::vec4(0.09f, 0.08f, 0.08f, 0.90f) });
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(256.0f, 26.0f, 198.0f * hpFrac, 16.0f),
+                                             glm::vec4(0.85f, 0.18f, 0.16f, 0.95f) });
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(256.0f, 46.0f, 198.0f, 14.0f),
+                                             glm::vec4(0.05f, 0.06f, 0.07f, 0.90f) });
+            }
+
+            // 3. 施法读条：屏幕底部中央的金色进度条
+            if (castBarTimer > 0.0f) {
+                const float castFrac = glm::clamp(castBarTimer / 0.45f, 0.0f, 1.0f);
+                const float barW     = 320.0f;
+                const float barX     = (static_cast<float>(winW) - barW) * 0.5f;
+                const float barY     = static_cast<float>(winH) - 96.0f;
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(barX - 2.0f, barY - 2.0f, barW + 4.0f, 22.0f),
+                                             glm::vec4(0.02f, 0.03f, 0.04f, 0.90f) });
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(barX, barY, barW * castFrac, 18.0f),
+                                             glm::vec4(0.95f, 0.78f, 0.22f, 0.95f) });
+            }
+
+            // 4. NPC 头顶浮动血条：世界坐标投影到屏幕像素
+            for (const auto& npc : landmarkNpcs) {
+                if (!npc.visible) continue;
+                const glm::vec4 clip = uboData.viewProj *
+                    glm::vec4(npc.worldPos + glm::vec3(0.0f, 0.0f, 2.35f), 1.0f);
+                if (clip.w <= 0.0f) continue;
+
+                const float sx = (clip.x / clip.w * 0.5f + 0.5f) * static_cast<float>(winW);
+                const float sy = (1.0f - (clip.y / clip.w * 0.5f + 0.5f)) * static_cast<float>(winH);
+                if (sx < -90.0f || sx > static_cast<float>(winW) + 90.0f ||
+                    sy < -24.0f || sy > static_cast<float>(winH) + 24.0f) continue;
+
+                const float hpFrac = (npc.maxHp > 0.0f) ? glm::clamp(npc.hp / npc.maxHp, 0.0f, 1.0f) : 0.0f;
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(sx - 42.0f, sy - 8.0f, 84.0f, 14.0f),
+                                             glm::vec4(0.02f, 0.02f, 0.03f, 0.75f) });
+                uiQuads.push_back(GpuUiQuad{ glm::vec4(sx - 40.0f, sy - 6.0f, 80.0f * hpFrac, 10.0f),
+                                             glm::vec4(0.85f - 0.45f * hpFrac,
+                                                       0.22f + 0.50f * hpFrac, 0.18f, 0.90f) });
+            }
+
+            if (!uiQuads.empty()) {
+                const size_t uiBytes = uiQuads.size() * sizeof(GpuUiQuad);
+                if (uiBytes > uiSsbo.Size()) {
+                    uiSsbo = coa::rhi::GlBuffer(uiBytes, nullptr, GL_DYNAMIC_STORAGE_BIT);
+                    uiSsbo.BindAsStorageBuffer(3);
+                }
+                uiSsbo.UpdateSubData(0, uiBytes, uiQuads.data());
+
+                glDisable(GL_DEPTH_TEST);
+                glDepthMask(GL_FALSE);
+                glDisable(GL_CULL_FACE);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+                glUseProgram(uiShader.Handle());
+                glUniform2f(0, static_cast<float>(winW), static_cast<float>(winH));
+                glBindVertexArray(skyVao);
+                glDrawArraysInstancedBaseInstance(GL_TRIANGLES, 0, 6,
+                                                  static_cast<GLsizei>(uiQuads.size()), 0);
+
+                glDisable(GL_BLEND);
+                glDepthMask(GL_TRUE);
+                glEnable(GL_DEPTH_TEST);
             }
 
             SDL_GL_SwapWindow(window);
