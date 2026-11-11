@@ -286,6 +286,7 @@ layout(binding = 6) uniform sampler2DShadow uShadowMapFar; // 远景级联 1024x
 layout(location = 0) uniform int  uAlphaCutout;   // 0 = Opaque, 1 = Cutout, 2 = Blend, 3 = UV Scroll
 layout(location = 1) uniform int  uMaterialFlags; // bit 0 = TwoSided, bit 1 = Unlit
 layout(location = 4) uniform vec4 uBatchColor;    // M2Track 颜色与透明度调制
+layout(location = 2) uniform int  uBoneBaseIndex; // > 0 表示该批次为骨骼蒙皮角色
 
 layout(std140, binding = 0) uniform FrameBlock {
     mat4 uView;
@@ -427,16 +428,14 @@ void main() {
                  + sunColor * spec * shadowFactor;
     }
 
-    // 水下躯干遮挡与吃水线：低于水面 (uWaterShallow.w) 的像素混入水体色，交界处叠加白色泡沫带
-    float subDepth = uWaterShallow.w - vWorldPos.z;
-    if (subDepth > -0.04) {
-        float foam = smoothstep(0.04, 0.0, abs(subDepth));
+    // 水下躯干遮挡：仅对骨骼蒙皮角色生效，避免污染河床地形与岸边造成深色轮廓闪烁
+    if (uBoneBaseIndex > 0) {
+        float subDepth = uWaterShallow.w - vWorldPos.z;
         if (subDepth > 0.0) {
             float uwFade = exp(-subDepth * 1.45);
             vec3 uwTint = mix(uWaterDeep.rgb * 0.42, uWaterShallow.rgb * 0.72, uwFade);
-            litColor = mix(uwTint, litColor * vec3(0.52, 0.75, 0.85), uwFade * 0.65);
+            litColor = mix(uwTint, litColor * vec3(0.52, 0.75, 0.85), smoothstep(0.0, 0.25, subDepth) * (1.0 - uwFade * 0.35));
         }
-        litColor = mix(litColor, uWaterShallow.rgb + vec3(0.28), foam * 0.45);
     }
 
     float fogFactor = clamp(exp(-max(dist - uFogColorAndParams.w, 0.0) * uSkyTopAndDensity.w), 0.0, 1.0);
